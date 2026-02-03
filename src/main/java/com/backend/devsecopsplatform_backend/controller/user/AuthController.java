@@ -35,22 +35,26 @@ public class AuthController {
 
     @PostMapping("/register")
     public ResponseEntity<?> registerUser(@RequestBody User user) {
-
         if (userRepository.existsByUsername(user.getUsername())) {
-            return ResponseEntity.badRequest().body("Error: Username is already taken!");
+            Map<String, String> error = new HashMap<>();
+            error.put("message", "Username is already taken!");
+            return ResponseEntity.badRequest().body(error);
         }
 
         if (userRepository.existsByEmail(user.getEmail())) {
-            return ResponseEntity.badRequest().body("Error: Email is already in use!");
+            Map<String, String> error = new HashMap<>();
+            error.put("message", "Email is already in use!");
+            return ResponseEntity.badRequest().body(error);
         }
 
         user.setPassword(passwordEncoder.encode(user.getPassword()));
         user.setRoles(List.of(Role.ROLE_TESTER));
 
-
         userRepository.save(user);
 
-        return ResponseEntity.ok("User registered successfully!");
+        Map<String, String> response = new HashMap<>();
+        response.put("message", "User registered successfully!");
+        return ResponseEntity.ok(response);
     }
 
 
@@ -68,12 +72,15 @@ public class AuthController {
 
                 User user = userRepository.findByUsername(loginRequest.getUsername()).get();
 
-                Map<String, Object> authData = new HashMap<>();
-                jwtUtils.generateToken(user.getUsername(), user.getRoles());
-                authData.put("roles", user.getRoles());
+                String accessToken = jwtUtils.generateToken(user.getUsername(), user.getRoles());
 
-                authData.put("type", "Bearer");
+                Map<String, Object> authData = new HashMap<>();
+                authData.put("accessToken", accessToken);
+                authData.put("tokenType", "Bearer");
                 authData.put("username", user.getUsername());
+                authData.put("email", user.getEmail() != null ? user.getEmail() : "");
+                authData.put("id", user.getId());
+                authData.put("roles", user.getRoles().stream().map(Enum::name).toList());
 
                 return ResponseEntity.ok(authData);
             }
