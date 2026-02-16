@@ -1,4 +1,11 @@
 package com.backend.devsecopsplatform_backend.entity;
 
-public class Severity {
+/**
+ * Niveaux de sévérité des vulnérabilités de sécurité
+ */
+public enum Severity {
+    LOW,
+    MEDIUM,
+    HIGH,
+    CRITICAL
 }
