@@ -47,13 +47,15 @@ public class AuthController {
             return ResponseEntity.badRequest().body(error);
         }
 
+        // Nouvel utilisateur : compte en attente de validation admin
         user.setPassword(passwordEncoder.encode(user.getPassword()));
         user.setRoles(List.of(Role.ROLE_TESTER));
+        // accountStatus par défaut = PENDING dans l'entité User
 
         userRepository.save(user);
 
         Map<String, String> response = new HashMap<>();
-        response.put("message", "User registered successfully!");
+        response.put("message", "Compte créé avec succès. Merci de patienter pendant la validation par un administrateur.");
         return ResponseEntity.ok(response);
     }
 
@@ -61,17 +63,30 @@ public class AuthController {
     @PostMapping("/login")
     public ResponseEntity<?> login(@RequestBody User loginRequest) {
         try {
+            // Permet de se connecter avec username OU email
+            String identifier = loginRequest.getUsername();
+            User user = userRepository.findByUsername(identifier)
+                    .orElseGet(() -> userRepository.findByEmail(identifier).orElse(null));
+
+            if (user == null) {
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                        .body(Map.of("message", "Invalid username/email or password"));
+            }
+
+            // Bloquer si compte non approuvé, sauf pour les admins
+            if (!user.isAdmin() && !user.canLogin()) {
+                return ResponseEntity.status(HttpStatus.FORBIDDEN)
+                        .body(Map.of("message", "Votre compte est en attente de validation par un administrateur."));
+            }
+
             Authentication authentication = authenticationManager.authenticate(
                     new UsernamePasswordAuthenticationToken(
-                            loginRequest.getUsername(),
+                            user.getUsername(),
                             loginRequest.getPassword()
                     )
             );
 
             if (authentication.isAuthenticated()) {
-
-                User user = userRepository.findByUsername(loginRequest.getUsername()).get();
-
                 String accessToken = jwtUtils.generateToken(user.getUsername(), user.getRoles());
 
                 Map<String, Object> authData = new HashMap<>();
@@ -85,11 +100,13 @@ public class AuthController {
                 return ResponseEntity.ok(authData);
             }
 
-            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Invalid username or password");
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                    .body(Map.of("message", "Invalid username/email or password"));
 
         } catch (AuthenticationException e) {
             log.error("Login error: {}", e.getMessage());
-            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Invalid username or password");
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                    .body(Map.of("message", "Invalid username/email or password"));
         }
     }
 

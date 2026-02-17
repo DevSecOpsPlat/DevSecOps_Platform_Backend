@@ -65,10 +65,12 @@ public class SecurityConfig {
                         .requestMatchers("/auth/**", "/v3/api-docs/**", "/swagger-ui/**", "/swagger-ui.html").permitAll()
                         // DevSecOps scan : accès sans JWT pour déploiement et résultats de scan
                         .requestMatchers("/api/deploy/**").permitAll()
-                        .requestMatchers("/**").permitAll()
-                        .requestMatchers("/api/environments", "/api/environments/**").permitAll()
                         .requestMatchers("/api/scan-results/**").permitAll()
+                        .requestMatchers("/**").permitAll()
                         .requestMatchers("/api/pipeline/jobs/**/logs").permitAll()
+                        // Administration : réservé aux admins authentifiés
+                        .requestMatchers("/api/admin/**").hasAuthority("ROLE_ADMIN")
+                        // Reste de l'API : nécessite un JWT valide
                         .anyRequest().authenticated()
                 )
                 .addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class);
