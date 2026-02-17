@@ -150,8 +150,8 @@ public class EnvironmentService {
         PipelineExecution latest = pipelineExecutionRepository.findFirstByEnvironmentOrderByCreatedAtDesc(env)
                 .orElseThrow(() -> new RuntimeException("Aucun pipeline pour cet environnement"));
         Integer pipelineId = latest.getGitlabPipelineId();
-        if (pipelineId == null) {
-            throw new RuntimeException("ID pipeline GitLab manquant");
+        if (pipelineId == null || pipelineId <= 0) {
+            throw new RuntimeException("ID pipeline GitLab invalide");
         }
         Map<String, Object> summary = gitLabService.getPipelineSummary(pipelineId.longValue());
         Map<String, JsonNode> reports = gitLabService.getAllSecurityReports(pipelineId.longValue());

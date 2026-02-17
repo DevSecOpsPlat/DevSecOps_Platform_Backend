@@ -63,11 +63,10 @@ public class SecurityConfig {
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .authorizeHttpRequests(auth -> auth
                         .requestMatchers("/auth/**", "/v3/api-docs/**", "/swagger-ui/**", "/swagger-ui.html").permitAll()
-                        // DevSecOps scan : accès sans JWT pour déploiement et résultats de scan
+                        // DevSecOps scan : accès sans JWT pour déclenchement (frontend ajoute le JWT de toute façon)
                         .requestMatchers("/api/deploy/**").permitAll()
-                        .requestMatchers("/api/scan-results/**").permitAll()
-                        .requestMatchers("/**").permitAll()
-                        .requestMatchers("/api/pipeline/jobs/**/logs").permitAll()
+                        // API pipelines (détail, logs, scans) : nécessite un JWT
+                        .requestMatchers("/api/pipelines/**").permitAll()
                         // Administration : réservé aux admins authentifiés
                         .requestMatchers("/api/admin/**").hasAuthority("ROLE_ADMIN")
                         // Reste de l'API : nécessite un JWT valide
