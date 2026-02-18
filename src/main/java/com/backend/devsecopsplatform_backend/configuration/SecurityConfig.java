@@ -67,7 +67,7 @@ public class SecurityConfig {
                         // DevSecOps scan : accès sans JWT pour déclenchement (frontend ajoute le JWT de toute façon)
                         .requestMatchers("/api/deploy/**", "/projet/api/deploy/**").permitAll()
                         // API pipelines (détail, logs, scans) : accès avec ou sans JWT (contrôle métier dans le controller)
-                        .requestMatchers("/api/pipelines/**", "/projet/api/pipelines/**").permitAll()
+                        .requestMatchers("/api/pipelines/**", "/projet/api/pipelines/**").authenticated()
                         // Webhook GitLab (appelé par GitLab, pas par le front)
                         .requestMatchers("/api/webhooks/**", "/projet/api/webhooks/**").permitAll()
                         // Administration : réservé aux admins authentifiés

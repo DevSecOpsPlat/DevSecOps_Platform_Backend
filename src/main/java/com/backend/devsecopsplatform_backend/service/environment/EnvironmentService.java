@@ -96,7 +96,7 @@ public class EnvironmentService {
         // 5. Enregistrer l'exécution du pipeline
         PipelineExecution execution = new PipelineExecution();
         execution.setEnvironment(env);
-        execution.setGitlabPipelineId(pipeline.getId().intValue());
+        execution.setGitlabPipelineId(pipeline.getId()); // Long au lieu de intValue()
         execution.setStatus(com.backend.devsecopsplatform_backend.entity.PipelineStatus
                 .fromGitLabStatus(pipeline.getStatus() != null ? pipeline.getStatus().toString() : "running"));
         execution.setStartedAt(LocalDateTime.now());
@@ -108,7 +108,7 @@ public class EnvironmentService {
         return DeployResponse.builder()
                 .environmentId(env.getId())
                 .environmentName(env.getEnvironmentName())
-                .gitlabPipelineId(pipeline.getId().intValue())
+                .gitlabPipelineId(pipeline.getId())
                 .pipelineStatus(pipeline.getStatus().toString())
                 .pipelineWebUrl(pipeline.getWebUrl())
                 .message("Pipeline déclenché. Consultez le statut et les scans via l'API.")
@@ -149,14 +149,14 @@ public class EnvironmentService {
                 .orElseThrow(() -> new RuntimeException("Environnement non trouvé"));
         PipelineExecution latest = pipelineExecutionRepository.findFirstByEnvironmentOrderByCreatedAtDesc(env)
                 .orElseThrow(() -> new RuntimeException("Aucun pipeline pour cet environnement"));
-        Integer pipelineId = latest.getGitlabPipelineId();
+        Long pipelineId = latest.getGitlabPipelineId();
         if (pipelineId == null || pipelineId <= 0) {
             throw new RuntimeException("ID pipeline GitLab invalide");
         }
-        Map<String, Object> summary = gitLabService.getPipelineSummary(pipelineId.longValue());
-        Map<String, JsonNode> reports = gitLabService.getAllSecurityReports(pipelineId.longValue());
+        Map<String, Object> summary = gitLabService.getPipelineSummary(pipelineId);
+        Map<String, JsonNode> reports = gitLabService.getAllSecurityReports(pipelineId);
         return PipelineScanResponse.builder()
-                .pipelineId(pipelineId)
+                .pipelineId(pipelineId) // Long directement
                 .status((String) summary.get("status"))
                 .webUrl((String) summary.get("webUrl"))
                 .jobStatusCount(summary.get("jobStatusCount"))
@@ -176,7 +176,7 @@ public class EnvironmentService {
                 .status(e.getStatus().name())
                 .createdAt(e.getCreatedAt())
                 .expiresAt(e.getExpiresAt())
-                .latestPipelineId(latest != null ? latest.getGitlabPipelineId() : null)
+                    .latestPipelineId(latest != null ? latest.getGitlabPipelineId() : null)
                 .latestPipelineStatus(latest != null ? latest.getStatus().name() : null)
                 .build();
     }

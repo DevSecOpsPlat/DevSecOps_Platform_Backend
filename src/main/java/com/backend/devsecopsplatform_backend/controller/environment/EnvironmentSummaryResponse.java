@@ -18,6 +18,6 @@ public class EnvironmentSummaryResponse {
     private String status;
     private LocalDateTime createdAt;
     private LocalDateTime expiresAt;
-    private Integer latestPipelineId;
+    private Long latestPipelineId;
     private String latestPipelineStatus;
 }

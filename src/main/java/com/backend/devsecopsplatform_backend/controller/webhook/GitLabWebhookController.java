@@ -51,7 +51,7 @@ public class GitLabWebhookController {
 
             if ("pipeline".equals(objectKind)) {
                 JsonNode attrs = root.path("object_attributes");
-                int pipelineId = attrs.path("id").asInt(0);
+                long pipelineId = attrs.path("id").asLong(0);
                 String statusStr = attrs.path("status").asText(null);
                 if (pipelineId > 0 && statusStr != null) {
                     Optional<PipelineExecution> opt = pipelineExecutionRepository.findByGitlabPipelineId(pipelineId);

@@ -10,7 +10,7 @@ import java.util.Map;
 @Builder
 public class PipelineScanResponse {
 
-    private Integer pipelineId;
+    private Long pipelineId;
     private String status;
     private String webUrl;
     private Object jobStatusCount;

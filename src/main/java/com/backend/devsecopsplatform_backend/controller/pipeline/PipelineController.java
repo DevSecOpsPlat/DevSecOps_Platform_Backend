@@ -68,10 +68,10 @@ public class PipelineController {
             map.put("finishedAt", execution.getFinishedAt());
             map.put("createdByUsername", env.getRequestedBy() != null ? env.getRequestedBy().getUsername() : null);
 
-            Integer pipelineId = execution.getGitlabPipelineId();
+            Long pipelineId = execution.getGitlabPipelineId();
             if (pipelineId != null && pipelineId > 0) {
                 try {
-                    Map<String, Object> summary = gitLabService.getPipelineSummary(pipelineId.longValue());
+                    Map<String, Object> summary = gitLabService.getPipelineSummary(pipelineId);
                     map.put("status", summary.get("status"));
                     map.put("webUrl", summary.get("webUrl"));
                     map.put("ref", summary.get("ref"));
@@ -105,21 +105,47 @@ public class PipelineController {
                 .orElseThrow(() -> new RuntimeException("Environnement non trouvé"));
         PipelineExecution latest = pipelineExecutionRepository.findFirstByEnvironmentOrderByCreatedAtDesc(env)
                 .orElseThrow(() -> new RuntimeException("Aucun pipeline pour cet environnement"));
-        Integer pipelineId = latest.getGitlabPipelineId();
+        Long pipelineId = latest.getGitlabPipelineId();
+        
+        // Si pas d'ID GitLab valide, retourner les infos de base depuis la BDD
         if (pipelineId == null || pipelineId <= 0) {
-            throw new RuntimeException("ID pipeline GitLab invalide");
+            log.warn("Pipeline execution {} n'a pas d'ID GitLab valide (gitlabPipelineId={}). Retour des infos de base depuis la BDD.", latest.getId(), pipelineId);
+            PipelineScanResponse response = PipelineScanResponse.builder()
+                    .pipelineId(pipelineId) // Long directement
+                    .status(latest.getStatus().name())
+                    .webUrl(null)
+                    .jobStatusCount(Map.of(latest.getStatus().name(), 1L))
+                    .jobs(List.of())
+                    .securityReports(Map.of())
+                    .build();
+            return ResponseEntity.ok(response);
         }
-        Map<String, Object> summary = gitLabService.getPipelineSummary(pipelineId.longValue());
-        Map<String, JsonNode> reports = gitLabService.getAllSecurityReports(pipelineId.longValue());
-        PipelineScanResponse response = PipelineScanResponse.builder()
-                .pipelineId(pipelineId)
-                .status((String) summary.get("status"))
-                .webUrl((String) summary.get("webUrl"))
-                .jobStatusCount(summary.get("jobStatusCount"))
-                .jobs(summary.get("jobs"))
-                .securityReports(reports)
-                .build();
-        return ResponseEntity.ok(response);
+        
+        try {
+            Map<String, Object> summary = gitLabService.getPipelineSummary(pipelineId);
+            Map<String, JsonNode> reports = gitLabService.getAllSecurityReports(pipelineId);
+            PipelineScanResponse response = PipelineScanResponse.builder()
+                    .pipelineId(pipelineId)
+                    .status((String) summary.get("status"))
+                    .webUrl((String) summary.get("webUrl"))
+                    .jobStatusCount(summary.get("jobStatusCount"))
+                    .jobs(summary.get("jobs"))
+                    .securityReports(reports)
+                    .build();
+            return ResponseEntity.ok(response);
+        } catch (Exception e) {
+            log.error("Erreur récupération pipeline GitLab {}: {}", pipelineId, e.getMessage());
+            // Fallback : retourner les infos de base depuis la BDD
+            PipelineScanResponse response = PipelineScanResponse.builder()
+                    .pipelineId(pipelineId) // Long directement
+                    .status(latest.getStatus().name())
+                    .webUrl(null)
+                    .jobStatusCount(Map.of(latest.getStatus().name(), 1L))
+                    .jobs(List.of())
+                    .securityReports(Map.of())
+                    .build();
+            return ResponseEntity.ok(response);
+        }
     }
 
     /**
@@ -127,7 +153,7 @@ public class PipelineController {
      * Détail d'un pipeline + scans à partir de son ID GitLab.
      */
     @GetMapping("/{pipelineId}")
-    public ResponseEntity<PipelineScanResponse> getByPipelineId(@PathVariable Integer pipelineId) {
+    public ResponseEntity<PipelineScanResponse> getByPipelineId(@PathVariable Long pipelineId) {
         var user = getCurrentUser();
         PipelineExecution execution = pipelineExecutionRepository.findByGitlabPipelineId(pipelineId)
                 .orElseThrow(() -> new RuntimeException("Pipeline inconnu"));
@@ -137,10 +163,10 @@ public class PipelineController {
         if (pipelineId == null || pipelineId <= 0) {
             throw new RuntimeException("ID pipeline GitLab invalide");
         }
-        Map<String, Object> summary = gitLabService.getPipelineSummary(pipelineId.longValue());
-        Map<String, JsonNode> reports = gitLabService.getAllSecurityReports(pipelineId.longValue());
+        Map<String, Object> summary = gitLabService.getPipelineSummary(pipelineId);
+        Map<String, JsonNode> reports = gitLabService.getAllSecurityReports(pipelineId);
         PipelineScanResponse response = PipelineScanResponse.builder()
-                .pipelineId(pipelineId)
+                .pipelineId(pipelineId) // Long directement
                 .status((String) summary.get("status"))
                 .webUrl((String) summary.get("webUrl"))
                 .jobStatusCount(summary.get("jobStatusCount"))
@@ -188,7 +214,7 @@ public class PipelineController {
      * Annule un pipeline en cours (si l'utilisateur en est propriétaire).
      */
     @PostMapping("/{pipelineId}/cancel")
-    public ResponseEntity<Void> cancelPipeline(@PathVariable Integer pipelineId) {
+    public ResponseEntity<Void> cancelPipeline(@PathVariable Long pipelineId) {
         var user = getCurrentUser();
         PipelineExecution execution = pipelineExecutionRepository.findByGitlabPipelineId(pipelineId)
                 .orElseThrow(() -> new RuntimeException("Pipeline inconnu"));
@@ -196,7 +222,7 @@ public class PipelineController {
             return ResponseEntity.status(403).build();
         }
         try {
-            gitLabService.cancelPipeline(pipelineId.longValue());
+            gitLabService.cancelPipeline(pipelineId);
             return ResponseEntity.noContent().build();
         } catch (Exception e) {
             log.error("❌ Annulation pipeline {}: {}", pipelineId, e.getMessage());

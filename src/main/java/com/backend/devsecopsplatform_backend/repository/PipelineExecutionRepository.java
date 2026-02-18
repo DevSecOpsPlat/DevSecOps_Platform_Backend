@@ -18,7 +18,7 @@ public interface PipelineExecutionRepository extends JpaRepository<PipelineExecu
 
     List<PipelineExecution> findByEnvironmentOrderByCreatedAtDesc(EphemeralEnvironment environment);
 
-    Optional<PipelineExecution> findByGitlabPipelineId(Integer gitlabPipelineId);
+    Optional<PipelineExecution> findByGitlabPipelineId(Long gitlabPipelineId);
 
     Optional<PipelineExecution> findFirstByEnvironmentOrderByCreatedAtDesc(EphemeralEnvironment environment);
 
