@@ -14,6 +14,7 @@ import java.util.UUID;
 public class DeployResponse {
 
     private UUID environmentId;
+    private UUID applicationId;
     private String environmentName;
     private Long gitlabPipelineId;
     private String pipelineStatus;

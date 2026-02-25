@@ -36,7 +36,7 @@ public class AdminBootstrap {
             User admin = new User();
             admin.setUsername("admin");
             admin.setEmail("admin@devsecops.com");
-            admin.setPassword(passwordEncoder.encode("admin@123")); // à changer en prod
+            admin.setPassword(passwordEncoder.encode("Admin@123")); // à changer en prod
             admin.setRoles(List.of(Role.ROLE_ADMIN));
             admin.setAccountStatus(AccountStatus.APPROVED);
 

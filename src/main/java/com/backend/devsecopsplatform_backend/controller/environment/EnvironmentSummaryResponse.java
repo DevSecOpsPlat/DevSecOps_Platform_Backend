@@ -16,6 +16,7 @@ public class EnvironmentSummaryResponse {
     private String gitBranch;
     private Integer ttlHours;
     private String status;
+    private String previewUrl;
     private LocalDateTime createdAt;
     private LocalDateTime expiresAt;
     private Long latestPipelineId;

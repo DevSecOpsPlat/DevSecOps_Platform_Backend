@@ -2,6 +2,11 @@ package com.backend.devsecopsplatform_backend.controller.application;
 
 
 import com.backend.devsecopsplatform_backend.service.application.ApplicationService;
+import com.backend.devsecopsplatform_backend.service.GitLabService;
+import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
+import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
+import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
+import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -19,6 +24,9 @@ import java.util.UUID;
 public class ApplicationController {
 
     private final ApplicationService applicationService;
+    private final EphemeralEnvironmentRepository environmentRepository;
+    private final PipelineExecutionRepository pipelineExecutionRepository;
+    private final GitLabService gitLabService;
 
     /**
      * POST /api/applications
@@ -66,6 +74,54 @@ public class ApplicationController {
         } catch (Exception e) {
             log.error("❌ Application non trouvée: {}", id);
             return ResponseEntity.notFound().build();
+        }
+    }
+
+    /**
+     * GET /api/applications/{id}/deployments
+     * Historique des déploiements (pipelines) pour une application, optionnellement filtré par branche.
+     */
+    @GetMapping("/{id}/deployments")
+    public ResponseEntity<List<DeploymentHistoryItem>> getDeploymentHistory(
+            @PathVariable UUID id,
+            @RequestParam(name = "branch", required = false) String branch
+    ) {
+        try {
+            List<EphemeralEnvironment> envs = environmentRepository.findByApplication_Id(id);
+
+            List<DeploymentHistoryItem> history = envs.stream()
+                    .filter(env -> branch == null || branch.isBlank() || branch.equals(env.getGitBranch()))
+                    .flatMap(env -> pipelineExecutionRepository.findByEnvironmentOrderByCreatedAtDesc(env).stream()
+                            .map(exec -> {
+                                String shortSha = null;
+                                String commitMessage = null;
+                                if (exec.getGitlabPipelineId() != null) {
+                                    try {
+                                        var p = gitLabService.getPipeline(exec.getGitlabPipelineId());
+                                        if (p.getSha() != null) shortSha = p.getSha().length() >= 8 ? p.getSha().substring(0, 8) : p.getSha();
+                                    } catch (Exception ignored) {}
+                                }
+                                return DeploymentHistoryItem.builder()
+                                        .environmentId(env.getId())
+                                        .environmentName(env.getEnvironmentName())
+                                        .gitBranch(env.getGitBranch())
+                                        .pipelineId(exec.getGitlabPipelineId())
+                                        .pipelineStatus(exec.getStatus().name())
+                                        .shortSha(shortSha)
+                                        .commitMessage(commitMessage)
+                                        .createdAt(exec.getCreatedAt())
+                                        .finishedAt(exec.getFinishedAt())
+                                        .triggeredByUsername(env.getRequestedBy() != null ? env.getRequestedBy().getUsername() : null)
+                                        .build();
+                            })
+                    )
+                    .sorted((a, b) -> b.getCreatedAt().compareTo(a.getCreatedAt()))
+                    .toList();
+
+            return ResponseEntity.ok(history);
+        } catch (Exception e) {
+            log.error("❌ Erreur récupération historique déploiements pour application {}: {}", id, e.getMessage());
+            return ResponseEntity.internalServerError().build();
         }
     }
 }
