@@ -28,7 +28,7 @@ public class ApplicationService {
     private final ApplicationRepository applicationRepository;
     private final UserRepository userRepository;
     private final EncryptionService encryptionService;
-    private final GitHubValidationService gitHubValidationService; // À créer
+    private final GitHubValidationService gitHubValidationService;
 
     /**
      * Crée une nouvelle application avec token GitHub chiffré

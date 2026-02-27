@@ -96,7 +96,7 @@ public class EnvironmentService {
         // 5. Enregistrer l'exécution du pipeline
         PipelineExecution execution = new PipelineExecution();
         execution.setEnvironment(env);
-        execution.setGitlabPipelineId(pipeline.getId().intValue());
+        execution.setGitlabPipelineId(pipeline.getId()); // Long au lieu de intValue()
         execution.setStatus(com.backend.devsecopsplatform_backend.entity.PipelineStatus
                 .fromGitLabStatus(pipeline.getStatus() != null ? pipeline.getStatus().toString() : "running"));
         execution.setStartedAt(LocalDateTime.now());
@@ -107,8 +107,9 @@ public class EnvironmentService {
 
         return DeployResponse.builder()
                 .environmentId(env.getId())
+                .applicationId(app.getId())
                 .environmentName(env.getEnvironmentName())
-                .gitlabPipelineId(pipeline.getId().intValue())
+                .gitlabPipelineId(pipeline.getId())
                 .pipelineStatus(pipeline.getStatus().toString())
                 .pipelineWebUrl(pipeline.getWebUrl())
                 .message("Pipeline déclenché. Consultez le statut et les scans via l'API.")
@@ -128,6 +129,7 @@ public class EnvironmentService {
                     .gitBranch(e.getGitBranch())
                     .ttlHours(e.getTtlHours())
                     .status(e.getStatus().name())
+                    .previewUrl(e.getUrl())
                     .createdAt(e.getCreatedAt())
                     .expiresAt(e.getExpiresAt())
                     .latestPipelineId(latest != null ? latest.getGitlabPipelineId() : null)
@@ -149,20 +151,101 @@ public class EnvironmentService {
                 .orElseThrow(() -> new RuntimeException("Environnement non trouvé"));
         PipelineExecution latest = pipelineExecutionRepository.findFirstByEnvironmentOrderByCreatedAtDesc(env)
                 .orElseThrow(() -> new RuntimeException("Aucun pipeline pour cet environnement"));
-        Integer pipelineId = latest.getGitlabPipelineId();
-        if (pipelineId == null) {
-            throw new RuntimeException("ID pipeline GitLab manquant");
+        Long pipelineId = latest.getGitlabPipelineId();
+        if (pipelineId == null || pipelineId <= 0) {
+            throw new RuntimeException("ID pipeline GitLab invalide");
         }
-        Map<String, Object> summary = gitLabService.getPipelineSummary(pipelineId.longValue());
-        Map<String, JsonNode> reports = gitLabService.getAllSecurityReports(pipelineId.longValue());
+        Map<String, Object> summary = gitLabService.getPipelineSummary(pipelineId);
+        Map<String, JsonNode> reports = gitLabService.getAllSecurityReports(pipelineId);
         return PipelineScanResponse.builder()
-                .pipelineId(pipelineId)
+                .pipelineId(pipelineId) // Long directement
                 .status((String) summary.get("status"))
                 .webUrl((String) summary.get("webUrl"))
                 .jobStatusCount(summary.get("jobStatusCount"))
                 .jobs(summary.get("jobs"))
                 .securityReports(reports)
                 .build();
+    }
+
+    /**
+     * Résumé de sécurité agrégé (nombre de vulnérabilités par niveau) pour un environnement.
+     */
+    public SecuritySummaryResponse getSecuritySummary(UUID envId) {
+        User user = getCurrentUser();
+        EphemeralEnvironment env = environmentRepository.findByIdAndRequestedBy(envId, user)
+                .orElseThrow(() -> new RuntimeException("Environnement non trouvé"));
+
+        PipelineExecution latest = pipelineExecutionRepository.findFirstByEnvironmentOrderByCreatedAtDesc(env)
+                .orElseThrow(() -> new RuntimeException("Aucun pipeline pour cet environnement"));
+
+        Long pipelineId = latest.getGitlabPipelineId();
+        if (pipelineId == null || pipelineId <= 0) {
+            throw new RuntimeException("ID pipeline GitLab invalide");
+        }
+
+        Map<String, JsonNode> reports = gitLabService.getAllSecurityReports(pipelineId);
+
+        int[] counters = new int[5]; // 0=CRITICAL,1=HIGH,2=MEDIUM,3=LOW,4=INFO
+        for (JsonNode report : reports.values()) {
+            accumulateVulnerabilities(report, counters);
+        }
+
+        return SecuritySummaryResponse.builder()
+                .environmentId(env.getId())
+                .environmentName(env.getEnvironmentName())
+                .pipelineId(pipelineId)
+                .pipelineStatus(latest.getStatus().name())
+                .critical(counters[0])
+                .high(counters[1])
+                .medium(counters[2])
+                .low(counters[3])
+                .info(counters[4])
+                .build();
+    }
+
+    /**
+     * Agrège les vulnérabilités par niveau à partir de différents formats de rapports possibles
+     * (GitLab security report, Trivy, etc.).
+     */
+    private void accumulateVulnerabilities(JsonNode report, int[] counters) {
+        if (report == null || report.isNull()) {
+            return;
+        }
+
+        // Format GitLab / standard : vulnerabilities[]
+        if (report.has("vulnerabilities") && report.get("vulnerabilities").isArray()) {
+            addFromArray(report.get("vulnerabilities"), "severity", counters);
+        }
+
+        // Certains outils (Trivy) utilisent "Vulnerabilities"
+        if (report.has("Vulnerabilities") && report.get("Vulnerabilities").isArray()) {
+            addFromArray(report.get("Vulnerabilities"), "Severity", counters);
+        }
+
+        // Format Trivy SARIF-like : results[].Vulnerabilities[]
+        if (report.has("results") && report.get("results").isArray()) {
+            for (JsonNode result : report.get("results")) {
+                if (result.has("Vulnerabilities") && result.get("Vulnerabilities").isArray()) {
+                    addFromArray(result.get("Vulnerabilities"), "Severity", counters);
+                }
+            }
+        }
+    }
+
+    private void addFromArray(JsonNode arrayNode, String severityField, int[] counters) {
+        for (JsonNode v : arrayNode) {
+            String sev = v.path(severityField).asText(null);
+            if (sev == null) continue;
+            switch (sev.toUpperCase()) {
+                case "CRITICAL" -> counters[0]++;
+                case "HIGH" -> counters[1]++;
+                case "MEDIUM" -> counters[2]++;
+                case "LOW" -> counters[3]++;
+                case "INFO" -> counters[4]++;
+                default -> {
+                }
+            }
+        }
     }
 
     private EnvironmentSummaryResponse toSummary(EphemeralEnvironment e) {
@@ -174,9 +257,10 @@ public class EnvironmentService {
                 .gitBranch(e.getGitBranch())
                 .ttlHours(e.getTtlHours())
                 .status(e.getStatus().name())
+                .previewUrl(e.getUrl())
                 .createdAt(e.getCreatedAt())
                 .expiresAt(e.getExpiresAt())
-                .latestPipelineId(latest != null ? latest.getGitlabPipelineId() : null)
+                    .latestPipelineId(latest != null ? latest.getGitlabPipelineId() : null)
                 .latestPipelineStatus(latest != null ? latest.getStatus().name() : null)
                 .build();
     }

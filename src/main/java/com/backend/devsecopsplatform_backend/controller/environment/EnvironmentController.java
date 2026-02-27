@@ -77,6 +77,21 @@ public class EnvironmentController {
     }
 
     /**
+     * GET /api/environments/{id}/security-summary
+     * Résumé de sécurité (nombre de vulnérabilités par niveau) pour l'environnement.
+     */
+    @GetMapping("/environments/{id}/security-summary")
+    public ResponseEntity<SecuritySummaryResponse> getSecuritySummary(@PathVariable UUID id) {
+        try {
+            SecuritySummaryResponse response = environmentService.getSecuritySummary(id);
+            return ResponseEntity.ok(response);
+        } catch (RuntimeException e) {
+            log.error("❌ Résumé de sécurité: {}", e.getMessage());
+            return ResponseEntity.notFound().build();
+        }
+    }
+
+    /**
      * Récupère le résultat du scan (JSON) d'un job GitLab une fois le pipeline terminé.
      * Utilise RestTemplate côté backend pour télécharger l'artefact .json (Trivy, SonarQube, etc.).
      */

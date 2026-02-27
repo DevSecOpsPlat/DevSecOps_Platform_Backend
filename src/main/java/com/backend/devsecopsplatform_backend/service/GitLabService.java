@@ -621,6 +621,10 @@ public class GitLabService {
             summary.put("createdAt", pipeline.getCreatedAt());
             summary.put("finishedAt", pipeline.getFinishedAt());
             summary.put("isFinished", isPipelineFinished(pipelineId));
+            String sha = pipeline.getSha();
+            summary.put("ref", pipeline.getRef());
+            summary.put("sha", sha);
+            summary.put("shortSha", sha != null && !sha.isEmpty() ? sha.substring(0, Math.min(8, sha.length())) : null);
 
             // Compter les jobs par statut
             Map<String, Long> jobStatusCount = new HashMap<>();

@@ -63,12 +63,16 @@ public class SecurityConfig {
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .authorizeHttpRequests(auth -> auth
                         .requestMatchers("/auth/**", "/v3/api-docs/**", "/swagger-ui/**", "/swagger-ui.html").permitAll()
-                        // DevSecOps scan : accès sans JWT pour déploiement et résultats de scan
-                        .requestMatchers("/api/deploy/**").permitAll()
-                        .requestMatchers("/**").permitAll()
-                        .requestMatchers("/api/environments", "/api/environments/**").permitAll()
-                        .requestMatchers("/api/scan-results/**").permitAll()
-                        .requestMatchers("/api/pipeline/jobs/**/logs").permitAll()
+                        .requestMatchers("/projet/auth/**", "/projet/v3/api-docs/**", "/projet/swagger-ui/**", "/projet/swagger-ui.html").permitAll()
+                        // DevSecOps scan : accès sans JWT pour déclenchement (frontend ajoute le JWT de toute façon)
+                        .requestMatchers("/api/deploy/**", "/projet/api/deploy/**").permitAll()
+                        // API pipelines (détail, logs, scans) : accès avec ou sans JWT (contrôle métier dans le controller)
+                        .requestMatchers("/api/pipelines/**", "/projet/api/pipelines/**").authenticated()
+                        // Webhook GitLab (appelé par GitLab, pas par le front)
+                        .requestMatchers("/api/webhooks/**", "/projet/api/webhooks/**").permitAll()
+                        // Administration : réservé aux admins authentifiés
+                        .requestMatchers("/api/admin/**", "/projet/api/admin/**").hasAuthority("ROLE_ADMIN")
+                        // Reste de l'API : nécessite un JWT valide
                         .anyRequest().authenticated()
                 )
                 .addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class);

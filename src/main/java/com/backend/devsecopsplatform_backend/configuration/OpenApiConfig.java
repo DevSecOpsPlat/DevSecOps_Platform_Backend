@@ -10,7 +10,7 @@ import org.springframework.context.annotation.Configuration;
 
 /**
  * Configure Swagger/OpenAPI pour afficher le bouton "Authorize" et envoyer le JWT
- * sur les appels /api/* (ex: POST /api/deploy).
+ * sur les appels /api/* .
  */
 @Configuration
 public class OpenApiConfig {
