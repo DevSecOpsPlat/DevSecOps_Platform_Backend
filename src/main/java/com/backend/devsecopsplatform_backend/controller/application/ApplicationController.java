@@ -107,6 +107,7 @@ public class ApplicationController {
                                         .gitBranch(env.getGitBranch())
                                         .pipelineId(exec.getGitlabPipelineId())
                                         .pipelineStatus(exec.getStatus().name())
+                                        .environmentStatus(env.getStatus().name())
                                         .shortSha(shortSha)
                                         .commitMessage(commitMessage)
                                         .createdAt(exec.getCreatedAt())

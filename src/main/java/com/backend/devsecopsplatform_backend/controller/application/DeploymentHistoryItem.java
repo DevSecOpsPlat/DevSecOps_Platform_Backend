@@ -16,6 +16,7 @@ public class DeploymentHistoryItem {
 
     private Long pipelineId;
     private String pipelineStatus;
+    private String environmentStatus;
 
     private String shortSha;
     private String commitMessage;
