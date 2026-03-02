@@ -22,6 +22,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 @RestController
 @RequestMapping("/api/pipelines")
@@ -45,57 +46,56 @@ public class PipelineController {
     }
 
 
-
     /**
      * GET /api/pipelines
      * Liste tous les pipelines lancés par l'utilisateur (tous environnements), avec détails type GitLab.
      */
     @GetMapping
-    public ResponseEntity<List<Map<String, Object>>> listPipelines() {
+    public ResponseEntity<List<Map<String, Object>>> listPipelines(
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "10") int size) {  // ← LIMITER À 10
+
         var user = getCurrentUser();
         List<EphemeralEnvironment> envs = environmentRepository.findMyEnvironments(user);
+
+        // Ne prendre que les 10 plus récents
         List<PipelineExecution> executions = pipelineExecutionRepository
-                .findByEnvironmentInOrderByCreatedAtDesc(envs, PageRequest.of(0, 50));
+                .findByEnvironmentInOrderByCreatedAtDesc(envs, PageRequest.of(page, Math.min(size, 20)));
 
-        List<Map<String, Object>> result = new ArrayList<>();
-        for (PipelineExecution execution : executions) {
-            EphemeralEnvironment env = execution.getEnvironment();
-            Map<String, Object> map = new HashMap<>();
-            map.put("environmentId", env.getId());
-            map.put("environmentName", env.getEnvironmentName());
-            map.put("gitBranch", env.getGitBranch());
-            map.put("pipelineId", execution.getGitlabPipelineId());
-            map.put("pipelineStatus", execution.getStatus().name());
-            map.put("createdAt", execution.getCreatedAt());
-            map.put("finishedAt", execution.getFinishedAt());
-            map.put("createdByUsername", env.getRequestedBy() != null ? env.getRequestedBy().getUsername() : null);
+        // Récupérer en parallèle
+        List<Map<String, Object>> result = executions.parallelStream()
+                .map(this::buildPipelineResponse)
+                .collect(Collectors.toList());
 
-            Long pipelineId = execution.getGitlabPipelineId();
-            if (pipelineId != null && pipelineId > 0) {
-                try {
-                    Map<String, Object> summary = gitLabService.getPipelineSummary(pipelineId);
-                    map.put("status", summary.get("status"));
-                    map.put("webUrl", summary.get("webUrl"));
-                    map.put("ref", summary.get("ref"));
-                    map.put("shortSha", summary.get("shortSha"));
-                    map.put("duration", summary.get("duration"));
-                    @SuppressWarnings("unchecked")
-                    List<Map<String, Object>> jobs = (List<Map<String, Object>>) summary.get("jobs");
-                    map.put("jobs", jobs != null ? jobs : List.of());
-                } catch (Exception e) {
-                    log.warn("Enrichissement pipeline {} ignoré: {}", pipelineId, e.getMessage());
-                    map.put("status", execution.getStatus().name());
-                    map.put("jobs", List.<Map<String, Object>>of());
-                }
-            } else {
-                map.put("status", execution.getStatus().name());
-                map.put("jobs", List.<Map<String, Object>>of());
-            }
-            result.add(map);
-        }
         return ResponseEntity.ok(result);
     }
 
+    private Map<String, Object> buildPipelineResponse(PipelineExecution execution) {
+        Map<String, Object> map = new HashMap<>();
+        EphemeralEnvironment env = execution.getEnvironment();
+
+        map.put("environmentId", env.getId());
+        map.put("environmentName", env.getEnvironmentName());
+        map.put("gitBranch", env.getGitBranch());
+        map.put("pipelineId", execution.getGitlabPipelineId());
+        map.put("pipelineStatus", execution.getStatus().name());
+        map.put("createdAt", execution.getCreatedAt());
+        map.put("finishedAt", execution.getFinishedAt());
+
+        Long pipelineId = execution.getGitlabPipelineId();
+        if (pipelineId != null && pipelineId > 0) {
+            try {
+                // Essayer GitLab avec timeout
+                Map<String, Object> summary = gitLabService.getPipelineSummary(pipelineId);
+                map.putAll(summary);
+            } catch (Exception e) {
+                log.debug("GitLab non disponible pour pipeline {}, utilisation cache", pipelineId);
+                map.put("status", execution.getStatus().name());
+                map.put("jobs", List.of());
+            }
+        }
+        return map;
+    }
     /**
      * GET /api/pipelines/by-environment/{envId}
      * Détail d'un pipeline + scans pour un environnement.

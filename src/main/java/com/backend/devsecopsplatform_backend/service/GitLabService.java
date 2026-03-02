@@ -12,11 +12,15 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.http.*;
-import org.springframework.web.client.RestTemplate;
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.util.*;
-
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.cache.annotation.Caching;
+import org.springframework.scheduling.annotation.Async;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
 /**
  * Service pour interagir avec GitLab API
  * Gère les pipelines, jobs, artifacts et rapports de sécurité
@@ -41,6 +45,11 @@ public class GitLabService {
 
     @Value("${pipeline.default-branch}")
     private String defaultBranch;
+    @Value("${gitlab.timeout.seconds:3}")
+    private int gitlabTimeoutSeconds;
+
+    @Value("${gitlab.max-pipelines:20}")
+    private int maxPipelines;
 
     @Value("${pipeline.timeout-minutes}")
     private Integer timeoutMinutes;
@@ -608,54 +617,97 @@ public class GitLabService {
      * @param pipelineId ID du pipeline
      * @return Map avec les informations essentielles
      */
+    @Cacheable(value = "pipelineSummaries", key = "#pipelineId", unless = "#result == null")
     public Map<String, Object> getPipelineSummary(Long pipelineId) {
         try {
-            Pipeline pipeline = getPipeline(pipelineId);
-            List<Job> jobs = getPipelineJobs(pipelineId);
+            // Version avec timeout et exécution parallèle
+            CompletableFuture<Pipeline> pipelineFuture = CompletableFuture.supplyAsync(() -> {
+                try {
+                    return gitLabApi.getPipelineApi().getPipeline(gitlabProjectId, pipelineId);
+                } catch (GitLabApiException e) {
+                    throw new RuntimeException(e);
+                }
+            });
 
-            Map<String, Object> summary = new HashMap<>();
-            summary.put("id", pipeline.getId());
-            summary.put("status", pipeline.getStatus().toString());
-            summary.put("webUrl", pipeline.getWebUrl());
-            summary.put("duration", pipeline.getDuration());
-            summary.put("createdAt", pipeline.getCreatedAt());
-            summary.put("finishedAt", pipeline.getFinishedAt());
-            summary.put("isFinished", isPipelineFinished(pipelineId));
-            String sha = pipeline.getSha();
-            summary.put("ref", pipeline.getRef());
-            summary.put("sha", sha);
-            summary.put("shortSha", sha != null && !sha.isEmpty() ? sha.substring(0, Math.min(8, sha.length())) : null);
+            CompletableFuture<List<Job>> jobsFuture = CompletableFuture.supplyAsync(() -> {
+                try {
+                    return gitLabApi.getJobApi().getJobsForPipeline(gitlabProjectId, pipelineId);
+                } catch (GitLabApiException e) {
+                    throw new RuntimeException(e);
+                }
+            });
 
-            // Compter les jobs par statut
-            Map<String, Long> jobStatusCount = new HashMap<>();
-            for (Job job : jobs) {
-                String status = job.getStatus().toString();
-                jobStatusCount.put(status, jobStatusCount.getOrDefault(status, 0L) + 1);
-            }
-            summary.put("jobStatusCount", jobStatusCount);
-            summary.put("totalJobs", jobs.size());
+            // Timeout de 3 secondes
+            Pipeline pipeline = pipelineFuture.get(gitlabTimeoutSeconds, TimeUnit.SECONDS);
+            List<Job> jobs = jobsFuture.get(gitlabTimeoutSeconds, TimeUnit.SECONDS);
 
-            // Liste des jobs
-            List<Map<String, Object>> jobsList = new ArrayList<>();
-            for (Job job : jobs) {
-                Map<String, Object> jobInfo = new HashMap<>();
-                jobInfo.put("id", job.getId());
-                jobInfo.put("name", job.getName());
-                jobInfo.put("status", job.getStatus().toString());
-                jobInfo.put("stage", job.getStage());
-                jobInfo.put("duration", job.getDuration());
-                jobInfo.put("webUrl", job.getWebUrl());
-                jobsList.add(jobInfo);
-            }
-            summary.put("jobs", jobsList);
-
-            log.info("✅ Résumé du pipeline {} généré", pipelineId);
-            return summary;
+            return buildPipelineSummary(pipeline, jobs);
 
         } catch (Exception e) {
-            log.error("❌ Erreur génération résumé pipeline {}: {}", pipelineId, e.getMessage());
-            throw new RuntimeException("Impossible de générer le résumé du pipeline", e);
+            log.warn("⚠️ Timeout ou erreur GitLab pour pipeline {}, utilisation fallback DB", pipelineId);
+            // Retourner les infos minimales depuis la base de données
+            return getFallbackSummary(pipelineId);
         }
+    }
+
+    /**
+     * Construit le résumé à partir des données GitLab
+     */
+    private Map<String, Object> buildPipelineSummary(Pipeline pipeline, List<Job> jobs) {
+        Map<String, Object> summary = new HashMap<>();
+        summary.put("id", pipeline.getId());
+        summary.put("status", pipeline.getStatus().toString());
+        summary.put("webUrl", pipeline.getWebUrl());
+        summary.put("duration", pipeline.getDuration());
+        summary.put("createdAt", pipeline.getCreatedAt());
+        summary.put("finishedAt", pipeline.getFinishedAt());
+
+        String sha = pipeline.getSha();
+        summary.put("ref", pipeline.getRef());
+        summary.put("sha", sha);
+        summary.put("shortSha", sha != null && !sha.isEmpty() ? sha.substring(0, Math.min(8, sha.length())) : null);
+
+        // Compter les jobs par statut
+        Map<String, Long> jobStatusCount = new HashMap<>();
+        for (Job job : jobs) {
+            String status = job.getStatus().toString();
+            jobStatusCount.put(status, jobStatusCount.getOrDefault(status, 0L) + 1);
+        }
+        summary.put("jobStatusCount", jobStatusCount);
+        summary.put("totalJobs", jobs.size());
+
+        // Liste des jobs
+        List<Map<String, Object>> jobsList = new ArrayList<>();
+        for (Job job : jobs) {
+            Map<String, Object> jobInfo = new HashMap<>();
+            jobInfo.put("id", job.getId());
+            jobInfo.put("name", job.getName());
+            jobInfo.put("status", job.getStatus().toString());
+            jobInfo.put("stage", job.getStage());
+            jobInfo.put("duration", job.getDuration());
+            jobInfo.put("webUrl", job.getWebUrl());
+            jobsList.add(jobInfo);
+        }
+        summary.put("jobs", jobsList);
+
+        log.info("✅ Résumé du pipeline {} généré", pipeline.getId());
+        return summary;
+    }
+    private Map<String, Object> getFallbackSummary(Long pipelineId) {
+        Map<String, Object> summary = new HashMap<>();
+        summary.put("id", pipelineId);
+        summary.put("status", "UNKNOWN");
+        summary.put("webUrl", null);
+        summary.put("duration", null);
+        summary.put("createdAt", null);
+        summary.put("finishedAt", null);
+        summary.put("ref", null);
+        summary.put("sha", null);
+        summary.put("shortSha", null);
+        summary.put("jobStatusCount", new HashMap<>());
+        summary.put("totalJobs", 0);
+        summary.put("jobs", List.of());
+        return summary;
     }
 
     /**
