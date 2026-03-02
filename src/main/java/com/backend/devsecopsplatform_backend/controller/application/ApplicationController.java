@@ -13,8 +13,11 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 @RestController
 @RequestMapping("/api/applications")
@@ -95,33 +98,65 @@ public class ApplicationController {
                             .map(exec -> {
                                 String shortSha = null;
                                 String commitMessage = null;
+                                List<Map<String, Object>> jobs = null; // ← AJOUTER
+
                                 if (exec.getGitlabPipelineId() != null) {
                                     try {
                                         var p = gitLabService.getPipeline(exec.getGitlabPipelineId());
-                                        if (p.getSha() != null) shortSha = p.getSha().length() >= 8 ? p.getSha().substring(0, 8) : p.getSha();
-                                    } catch (Exception ignored) {}
+                                        if (p.getSha() != null) {
+                                            shortSha = p.getSha().length() >= 8 ? p.getSha().substring(0, 8) : p.getSha();
+                                        }
+
+                                        // 🔥 RÉCUPÉRER LES JOBS DEPUIS GITLAB
+                                        jobs = gitLabService.getPipelineJobs(exec.getGitlabPipelineId())
+                                                .stream()
+                                                .map(job -> {
+                                                    Map<String, Object> jobMap = new HashMap<>();
+                                                    jobMap.put("id", job.getId());
+                                                    jobMap.put("name", job.getName());
+                                                    jobMap.put("status", job.getStatus() != null ? job.getStatus().toString() : "unknown");
+                                                    jobMap.put("stage", job.getStage());
+                                                    jobMap.put("duration", job.getDuration());
+                                                    jobMap.put("webUrl", job.getWebUrl());
+                                                    return jobMap;
+                                                })
+                                                .collect(Collectors.toList());
+
+                                    } catch (Exception e) {
+                                        log.warn("Impossible de récupérer les jobs pour le pipeline {}: {}",
+                                                exec.getGitlabPipelineId(), e.getMessage());
+                                    }
                                 }
-                                return DeploymentHistoryItem.builder()
-                                        .environmentId(env.getId())
-                                        .environmentName(env.getEnvironmentName())
-                                        .gitBranch(env.getGitBranch())
-                                        .pipelineId(exec.getGitlabPipelineId())
-                                        .pipelineStatus(exec.getStatus().name())
-                                        .environmentStatus(env.getStatus().name())
-                                        .shortSha(shortSha)
-                                        .commitMessage(commitMessage)
-                                        .createdAt(exec.getCreatedAt())
-                                        .finishedAt(exec.getFinishedAt())
-                                        .triggeredByUsername(env.getRequestedBy() != null ? env.getRequestedBy().getUsername() : null)
-                                        .build();
+
+                                // Construction avec tous les champs
+                                DeploymentHistoryItem item = new DeploymentHistoryItem();
+                                item.setEnvironmentId(env.getId());
+                                item.setEnvironmentName(env.getEnvironmentName());
+                                item.setGitBranch(env.getGitBranch());
+                                item.setPipelineId(exec.getGitlabPipelineId());
+                                item.setPipelineStatus(exec.getStatus() != null ? exec.getStatus().name() : null);
+                                item.setEnvironmentStatus(env.getStatus() != null ? env.getStatus().name() : null);
+                                item.setShortSha(shortSha);
+                                item.setCommitMessage(commitMessage);
+                                item.setCreatedAt(exec.getCreatedAt());
+                                item.setFinishedAt(exec.getFinishedAt());
+                                item.setTriggeredByUsername(env.getRequestedBy() != null ? env.getRequestedBy().getUsername() : null);
+                                item.setJobs(jobs);
+
+                                return item;
                             })
                     )
-                    .sorted((a, b) -> b.getCreatedAt().compareTo(a.getCreatedAt()))
-                    .toList();
+                    .sorted((a, b) -> {
+                        if (a.getCreatedAt() == null && b.getCreatedAt() == null) return 0;
+                        if (a.getCreatedAt() == null) return 1;
+                        if (b.getCreatedAt() == null) return -1;
+                        return b.getCreatedAt().compareTo(a.getCreatedAt());
+                    })
+                    .collect(Collectors.toList());
 
             return ResponseEntity.ok(history);
         } catch (Exception e) {
-            log.error("❌ Erreur récupération historique déploiements pour application {}: {}", id, e.getMessage());
+            log.error("❌ Erreur récupération historique déploiements: {}", e.getMessage());
             return ResponseEntity.internalServerError().build();
         }
     }

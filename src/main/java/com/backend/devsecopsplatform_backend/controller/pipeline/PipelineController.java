@@ -44,6 +44,8 @@ public class PipelineController {
                 .orElseThrow(() -> new RuntimeException("Utilisateur non trouvé"));
     }
 
+
+
     /**
      * GET /api/pipelines
      * Liste tous les pipelines lancés par l'utilisateur (tous environnements), avec détails type GitLab.
