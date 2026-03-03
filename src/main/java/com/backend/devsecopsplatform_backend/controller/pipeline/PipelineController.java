@@ -46,6 +46,29 @@ public class PipelineController {
     }
 
 
+    @GetMapping("/latest")
+    public ResponseEntity<Map<String, Object>> getLatestPipeline() {
+        var user = getCurrentUser();
+
+        // Trouver le pipeline le plus récent de l'utilisateur
+        PipelineExecution latest = pipelineExecutionRepository
+                .findFirstByUserOrderByCreatedAtDesc(user);
+
+        if (latest == null) {
+            return ResponseEntity.notFound().build();
+        }
+
+        Map<String, Object> response = new HashMap<>();
+        response.put("type", "pipeline");
+        response.put("id", latest.getGitlabPipelineId());
+        response.put("environmentId", latest.getEnvironment().getId());
+        response.put("createdAt", latest.getCreatedAt());
+
+        return ResponseEntity.ok(response);
+    }
+
+
+
     /**
      * GET /api/pipelines
      * Liste tous les pipelines lancés par l'utilisateur (tous environnements), avec détails type GitLab.
@@ -96,6 +119,7 @@ public class PipelineController {
         }
         return map;
     }
+
     /**
      * GET /api/pipelines/by-environment/{envId}
      * Détail d'un pipeline + scans pour un environnement.
@@ -108,7 +132,7 @@ public class PipelineController {
         PipelineExecution latest = pipelineExecutionRepository.findFirstByEnvironmentOrderByCreatedAtDesc(env)
                 .orElseThrow(() -> new RuntimeException("Aucun pipeline pour cet environnement"));
         Long pipelineId = latest.getGitlabPipelineId();
-        
+
         // Si pas d'ID GitLab valide, retourner les infos de base depuis la BDD
         if (pipelineId == null || pipelineId <= 0) {
             log.warn("Pipeline execution {} n'a pas d'ID GitLab valide (gitlabPipelineId={}). Retour des infos de base depuis la BDD.", latest.getId(), pipelineId);
@@ -122,7 +146,7 @@ public class PipelineController {
                     .build();
             return ResponseEntity.ok(response);
         }
-        
+
         try {
             Map<String, Object> summary = gitLabService.getPipelineSummary(pipelineId);
             Map<String, JsonNode> reports = gitLabService.getAllSecurityReports(pipelineId);
@@ -154,30 +178,28 @@ public class PipelineController {
      * GET /api/pipelines/{pipelineId}
      * Détail d'un pipeline + scans à partir de son ID GitLab.
      */
-    @GetMapping("/{pipelineId}")
+    @GetMapping("/by-id/{pipelineId}")
     public ResponseEntity<PipelineScanResponse> getByPipelineId(@PathVariable Long pipelineId) {
         var user = getCurrentUser();
         PipelineExecution execution = pipelineExecutionRepository.findByGitlabPipelineId(pipelineId)
                 .orElseThrow(() -> new RuntimeException("Pipeline inconnu"));
+
         if (!execution.getEnvironment().getRequestedBy().getId().equals(user.getId())) {
             return ResponseEntity.status(403).build();
         }
-        if (pipelineId == null || pipelineId <= 0) {
-            throw new RuntimeException("ID pipeline GitLab invalide");
-        }
+
         Map<String, Object> summary = gitLabService.getPipelineSummary(pipelineId);
         Map<String, JsonNode> reports = gitLabService.getAllSecurityReports(pipelineId);
-        PipelineScanResponse response = PipelineScanResponse.builder()
-                .pipelineId(pipelineId) // Long directement
+
+        return ResponseEntity.ok(PipelineScanResponse.builder()
+                .pipelineId(pipelineId)
                 .status((String) summary.get("status"))
                 .webUrl((String) summary.get("webUrl"))
                 .jobStatusCount(summary.get("jobStatusCount"))
                 .jobs(summary.get("jobs"))
                 .securityReports(reports)
-                .build();
-        return ResponseEntity.ok(response);
+                .build());
     }
-
     /**
      * GET /api/pipelines/jobs/{jobId}/logs
      * Récupère les logs d'un job GitLab (équivalent à l’onglet Logs de GitLab).
@@ -229,6 +251,47 @@ public class PipelineController {
         } catch (Exception e) {
             log.error("❌ Annulation pipeline {}: {}", pipelineId, e.getMessage());
             return ResponseEntity.notFound().build();
+        }
+
+    }
+
+    // Dans PipelineController.java
+
+    /**
+     * DELETE /api/pipelines/{pipelineId}
+     * Supprime un pipeline (dans GitLab et en base)
+     */
+    // Dans PipelineController.java - Méthode deletePipeline
+    // Dans PipelineController.java - Méthode deletePipeline
+    // Dans PipelineController.java - Méthode deletePipeline CORRIGÉE
+    @DeleteMapping("/{pipelineId}")
+    public ResponseEntity<Void> deletePipeline(@PathVariable Long pipelineId) {
+        var user = getCurrentUser();
+
+        PipelineExecution execution = pipelineExecutionRepository.findByGitlabPipelineId(pipelineId)
+                .orElseThrow(() -> new RuntimeException("Pipeline inconnu"));
+
+        if (!execution.getEnvironment().getRequestedBy().getId().equals(user.getId())) {
+            return ResponseEntity.status(403).build();
+        }
+
+        EphemeralEnvironment env = execution.getEnvironment();
+
+        try {
+            // Supprimer le pipeline
+            pipelineExecutionRepository.delete(execution);
+            log.info("✅ Pipeline {} supprimé", pipelineId);
+
+            // 🔥 CORRECTION: Un environnement = Un pipeline
+            // Donc on supprime TOUJOURS l'environnement quand on supprime son pipeline
+            environmentRepository.delete(env);
+            log.info("✅ Environnement {} supprimé (associé au pipeline)", env.getId());
+
+            return ResponseEntity.noContent().build();
+
+        } catch (Exception e) {
+            log.error("❌ Erreur suppression pipeline: {}", e.getMessage());
+            return ResponseEntity.internalServerError().build();
         }
     }
 }

@@ -770,4 +770,23 @@ public class GitLabService {
             return reports; // Retourner ce qui a été récupéré
         }
     }
+
+    // Dans GitLabService.java
+
+    /**
+     * Supprime un pipeline dans GitLab
+     */
+    public void deletePipeline(Long pipelineId) {
+        try {
+            gitLabApi.getPipelineApi().deletePipeline(gitlabProjectId, pipelineId);
+            log.info("✅ Pipeline {} supprimé de GitLab", pipelineId);
+        } catch (GitLabApiException e) {
+            if (e.getHttpStatus() == 404) {
+                log.warn("Pipeline {} déjà supprimé ou inexistant dans GitLab", pipelineId);
+            } else {
+                log.error("❌ Erreur suppression pipeline {} dans GitLab: {}", pipelineId, e.getMessage());
+                throw new RuntimeException("Impossible de supprimer le pipeline dans GitLab", e);
+            }
+        }
+    }
 }

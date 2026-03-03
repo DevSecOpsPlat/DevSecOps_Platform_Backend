@@ -36,9 +36,9 @@ public class PipelineExecution {
     @Column(name = "id", updatable = false, nullable = false)
     private UUID id;
 
-    @ManyToOne(fetch = FetchType.LAZY, optional = false)
-    @JoinColumn(name = "environment_id", nullable = false)
-    @JsonBackReference("env-pipeline") // Enfant de Environment
+    @OneToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(name = "environment_id", nullable = false, unique = true)
+    @JsonBackReference("env-pipeline")
     private EphemeralEnvironment environment;
 
     @Column(name = "gitlab_pipeline_id")
