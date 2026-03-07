@@ -3,6 +3,7 @@ package com.backend.devsecopsplatform_backend.controller.webhook;
 import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
 import com.backend.devsecopsplatform_backend.entity.PipelineStatus;
 import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
+import com.backend.devsecopsplatform_backend.service.PipelineStageSyncService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
@@ -25,6 +26,7 @@ import java.util.Optional;
 public class GitLabWebhookController {
 
     private final PipelineExecutionRepository pipelineExecutionRepository;
+    private final PipelineStageSyncService pipelineStageSyncService;
     private final ObjectMapper objectMapper;
 
     @Value("${gitlab.webhook.secret:}")
@@ -117,6 +119,12 @@ public class GitLabWebhookController {
 
             log.info("✅ Pipeline #{} mis à jour: {} → {}",
                     pipelineId, oldStatus, newStatus);
+
+            // 4. Quand le pipeline est terminé, synchroniser les stages en BDD (stages_json)
+            if (newStatus == PipelineStatus.SUCCESS || newStatus == PipelineStatus.FAILED
+                    || newStatus == PipelineStatus.CANCELED || newStatus == PipelineStatus.SKIPPED) {
+                pipelineStageSyncService.syncStagesForPipeline(pipelineId);
+            }
         } else {
             log.warn("⚠️ Pipeline #{} non trouvé en base!", pipelineId);
         }

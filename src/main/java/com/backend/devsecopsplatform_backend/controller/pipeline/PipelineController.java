@@ -7,6 +7,7 @@ import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepo
 import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
 import com.backend.devsecopsplatform_backend.repository.UserRepository;
 import com.backend.devsecopsplatform_backend.service.GitLabService;
+import com.backend.devsecopsplatform_backend.service.PipelineStageSyncService;
 import com.fasterxml.jackson.databind.JsonNode;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -35,6 +36,7 @@ public class PipelineController {
     private final PipelineExecutionRepository pipelineExecutionRepository;
     private final UserRepository userRepository;
     private final GitLabService gitLabService;
+    private final PipelineStageSyncService pipelineStageSyncService;
 
     private com.backend.devsecopsplatform_backend.entity.User getCurrentUser() {
         Authentication auth = SecurityContextHolder.getContext().getAuthentication();
@@ -108,13 +110,19 @@ public class PipelineController {
         Long pipelineId = execution.getGitlabPipelineId();
         if (pipelineId != null && pipelineId > 0) {
             try {
-                // Essayer GitLab avec timeout
                 Map<String, Object> summary = gitLabService.getPipelineSummary(pipelineId);
                 map.putAll(summary);
+                pipelineStageSyncService.syncStagesForPipeline(pipelineId);
             } catch (Exception e) {
-                log.debug("GitLab non disponible pour pipeline {}, utilisation cache", pipelineId);
+                log.debug("GitLab non disponible pour pipeline {}, utilisation stages en BDD", pipelineId);
                 map.put("status", execution.getStatus().name());
-                map.put("jobs", List.of());
+                if (execution.getStagesJson() != null) {
+                    map.put("jobs", pipelineStageSyncService.getJobsFromStagesJson(execution));
+                    map.put("jobStatusCount", pipelineStageSyncService.getJobStatusCountFromStagesJson(execution));
+                } else {
+                    map.put("jobs", List.of());
+                    map.put("jobStatusCount", Map.of(execution.getStatus().name(), 1L));
+                }
             }
         }
         return map;
@@ -149,6 +157,7 @@ public class PipelineController {
 
         try {
             Map<String, Object> summary = gitLabService.getPipelineSummary(pipelineId);
+            pipelineStageSyncService.syncStagesForPipeline(pipelineId);
             Map<String, JsonNode> reports = gitLabService.getAllSecurityReports(pipelineId);
             PipelineScanResponse response = PipelineScanResponse.builder()
                     .pipelineId(pipelineId)
@@ -160,14 +169,22 @@ public class PipelineController {
                     .build();
             return ResponseEntity.ok(response);
         } catch (Exception e) {
-            log.error("Erreur récupération pipeline GitLab {}: {}", pipelineId, e.getMessage());
-            // Fallback : retourner les infos de base depuis la BDD
+            log.error("Erreur récupération pipeline GitLab {}: {}, fallback BDD (stages_json)", pipelineId, e.getMessage());
+            Object jobs = latest.getStagesJson() != null
+                    ? pipelineStageSyncService.getJobsFromStagesJson(latest)
+                    : List.<Map<String, Object>>of();
+            Object jobStatusCount = latest.getStagesJson() != null
+                    ? pipelineStageSyncService.getJobStatusCountFromStagesJson(latest)
+                    : Map.of(latest.getStatus().name(), 1L);
+            if (jobStatusCount instanceof Map && ((Map<?, ?>) jobStatusCount).isEmpty()) {
+                jobStatusCount = Map.of(latest.getStatus().name(), 1L);
+            }
             PipelineScanResponse response = PipelineScanResponse.builder()
-                    .pipelineId(pipelineId) // Long directement
+                    .pipelineId(pipelineId)
                     .status(latest.getStatus().name())
-                    .webUrl(null)
-                    .jobStatusCount(Map.of(latest.getStatus().name(), 1L))
-                    .jobs(List.of())
+                    .webUrl(latest.getStagesJson() != null ? (String) latest.getStagesJson().get("webUrl") : null)
+                    .jobStatusCount(jobStatusCount)
+                    .jobs(jobs)
                     .securityReports(Map.of())
                     .build();
             return ResponseEntity.ok(response);
@@ -188,17 +205,38 @@ public class PipelineController {
             return ResponseEntity.status(403).build();
         }
 
-        Map<String, Object> summary = gitLabService.getPipelineSummary(pipelineId);
-        Map<String, JsonNode> reports = gitLabService.getAllSecurityReports(pipelineId);
-
-        return ResponseEntity.ok(PipelineScanResponse.builder()
-                .pipelineId(pipelineId)
-                .status((String) summary.get("status"))
-                .webUrl((String) summary.get("webUrl"))
-                .jobStatusCount(summary.get("jobStatusCount"))
-                .jobs(summary.get("jobs"))
-                .securityReports(reports)
-                .build());
+        try {
+            Map<String, Object> summary = gitLabService.getPipelineSummary(pipelineId);
+            pipelineStageSyncService.syncStagesForPipeline(pipelineId);
+            Map<String, JsonNode> reports = gitLabService.getAllSecurityReports(pipelineId);
+            return ResponseEntity.ok(PipelineScanResponse.builder()
+                    .pipelineId(pipelineId)
+                    .status((String) summary.get("status"))
+                    .webUrl((String) summary.get("webUrl"))
+                    .jobStatusCount(summary.get("jobStatusCount"))
+                    .jobs(summary.get("jobs"))
+                    .securityReports(reports)
+                    .build());
+        } catch (Exception e) {
+            log.error("Erreur récupération pipeline GitLab {}: {}, fallback BDD (stages_json)", pipelineId, e.getMessage());
+            Object jobs = execution.getStagesJson() != null
+                    ? pipelineStageSyncService.getJobsFromStagesJson(execution)
+                    : List.<Map<String, Object>>of();
+            Object jobStatusCount = execution.getStagesJson() != null
+                    ? pipelineStageSyncService.getJobStatusCountFromStagesJson(execution)
+                    : Map.of(execution.getStatus().name(), 1L);
+            if (jobStatusCount instanceof Map && ((Map<?, ?>) jobStatusCount).isEmpty()) {
+                jobStatusCount = Map.of(execution.getStatus().name(), 1L);
+            }
+            return ResponseEntity.ok(PipelineScanResponse.builder()
+                    .pipelineId(pipelineId)
+                    .status(execution.getStatus().name())
+                    .webUrl(execution.getStagesJson() != null ? (String) execution.getStagesJson().get("webUrl") : null)
+                    .jobStatusCount(jobStatusCount)
+                    .jobs(jobs)
+                    .securityReports(Map.of())
+                    .build());
+        }
     }
     /**
      * GET /api/pipelines/jobs/{jobId}/logs

@@ -9,6 +9,7 @@ import com.backend.devsecopsplatform_backend.service.application.ApplicationServ
 import com.backend.devsecopsplatform_backend.service.EncryptionService;
 import com.backend.devsecopsplatform_backend.service.GitHubValidationService;
 import com.backend.devsecopsplatform_backend.service.GitLabService;
+import com.backend.devsecopsplatform_backend.service.PipelineStageSyncService;
 import com.fasterxml.jackson.databind.JsonNode;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -31,6 +32,7 @@ public class EnvironmentService {
     private final UserRepository userRepository;
     private final EphemeralEnvironmentRepository environmentRepository;
     private final PipelineExecutionRepository pipelineExecutionRepository;
+    private final PipelineStageSyncService pipelineStageSyncService;
 
     /**
      * Déploiement : crée ou réutilise une application, crée l'environnement, déclenche le pipeline.
@@ -169,16 +171,38 @@ public class EnvironmentService {
         if (pipelineId == null || pipelineId <= 0) {
             throw new RuntimeException("ID pipeline GitLab invalide");
         }
-        Map<String, Object> summary = gitLabService.getPipelineSummary(pipelineId);
-        Map<String, JsonNode> reports = gitLabService.getAllSecurityReports(pipelineId);
-        return PipelineScanResponse.builder()
-                .pipelineId(pipelineId)
-                .status((String) summary.get("status"))
-                .webUrl((String) summary.get("webUrl"))
-                .jobStatusCount(summary.get("jobStatusCount"))
-                .jobs(summary.get("jobs"))
-                .securityReports(reports)
-                .build();
+        try {
+            Map<String, Object> summary = gitLabService.getPipelineSummary(pipelineId);
+            pipelineStageSyncService.syncStagesForPipeline(pipelineId);
+            Map<String, JsonNode> reports = gitLabService.getAllSecurityReports(pipelineId);
+            return PipelineScanResponse.builder()
+                    .pipelineId(pipelineId)
+                    .status((String) summary.get("status"))
+                    .webUrl((String) summary.get("webUrl"))
+                    .jobStatusCount(summary.get("jobStatusCount"))
+                    .jobs(summary.get("jobs"))
+                    .securityReports(reports)
+                    .build();
+        } catch (Exception e) {
+            log.warn("Erreur récupération pipeline GitLab {}: {}, fallback BDD (stages_json)", pipelineId, e.getMessage());
+            Object jobs = latest.getStagesJson() != null
+                    ? pipelineStageSyncService.getJobsFromStagesJson(latest)
+                    : List.<Map<String, Object>>of();
+            Object jobStatusCount = latest.getStagesJson() != null
+                    ? pipelineStageSyncService.getJobStatusCountFromStagesJson(latest)
+                    : Map.of(latest.getStatus().name(), 1L);
+            if (jobStatusCount instanceof Map && ((Map<?, ?>) jobStatusCount).isEmpty()) {
+                jobStatusCount = Map.of(latest.getStatus().name(), 1L);
+            }
+            return PipelineScanResponse.builder()
+                    .pipelineId(pipelineId)
+                    .status(latest.getStatus().name())
+                    .webUrl(latest.getStagesJson() != null ? (String) latest.getStagesJson().get("webUrl") : null)
+                    .jobStatusCount(jobStatusCount)
+                    .jobs(jobs)
+                    .securityReports(Map.of())
+                    .build();
+        }
     }
 
     public SecuritySummaryResponse getSecuritySummary(UUID envId) {
