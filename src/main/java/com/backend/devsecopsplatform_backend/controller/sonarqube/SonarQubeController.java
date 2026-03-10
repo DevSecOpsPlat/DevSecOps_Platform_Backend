@@ -7,6 +7,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.CrossOrigin;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.Map;
@@ -29,6 +30,20 @@ public class SonarQubeController {
             log.error("❌ Impossible de récupérer les résultats SonarQube", e);
             return ResponseEntity.status(500).body(Map.of(
                     "error", "Impossible de récupérer les résultats SonarQube",
+                    "message", e.getMessage()
+            ));
+        }
+    }
+
+    @GetMapping("/results-by-branch")
+    public ResponseEntity<?> getSonarQubeResultsByBranch(@RequestParam("branch") String branch) {
+        try {
+            Map<String, Object> results = gitLabService.getSonarQubeResultsForBranch(branch);
+            return ResponseEntity.ok(results);
+        } catch (Exception e) {
+            log.error("❌ Impossible de récupérer les résultats SonarQube pour la branche {}", branch, e);
+            return ResponseEntity.status(500).body(Map.of(
+                    "error", "Impossible de récupérer les résultats SonarQube pour la branche",
                     "message", e.getMessage()
             ));
         }

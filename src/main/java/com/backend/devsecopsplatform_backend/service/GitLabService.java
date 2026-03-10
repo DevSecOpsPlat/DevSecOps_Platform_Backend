@@ -641,6 +641,28 @@ public class GitLabService {
                 result.put("hotspots", hotspotsResponse.getBody().path("hotspots"));
             }
 
+            // Duplication par fichier (component tree, fichiers uniquement)
+            try {
+                String dupUrl = String.format(
+                        "%s/api/measures/component_tree?component=%s&metricKeys=duplicated_lines_density&qualifiers=FIL&ps=100",
+                        sonarHostUrl,
+                        sonarProjectKey
+                );
+
+                ResponseEntity<JsonNode> dupResponse = restTemplate.exchange(
+                        dupUrl,
+                        HttpMethod.GET,
+                        entity,
+                        JsonNode.class
+                );
+
+                if (dupResponse.getBody() != null) {
+                    result.put("duplication_components", dupResponse.getBody().path("components"));
+                }
+            } catch (Exception e) {
+                log.warn("⚠️ Impossible de récupérer le détail de duplication par fichier: {}", e.getMessage());
+            }
+
             // Quality Gate
             String qualityGateUrl = String.format(
                     "%s/api/qualitygates/project_status?projectKey=%s",
