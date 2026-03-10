@@ -123,6 +123,7 @@ public class PipelineController {
                     map.put("jobs", List.of());
                     map.put("jobStatusCount", Map.of(execution.getStatus().name(), 1L));
                 }
+                map.put("dataSource", "database");
             }
         }
         return map;
@@ -145,12 +146,13 @@ public class PipelineController {
         if (pipelineId == null || pipelineId <= 0) {
             log.warn("Pipeline execution {} n'a pas d'ID GitLab valide (gitlabPipelineId={}). Retour des infos de base depuis la BDD.", latest.getId(), pipelineId);
             PipelineScanResponse response = PipelineScanResponse.builder()
-                    .pipelineId(pipelineId) // Long directement
+                    .pipelineId(pipelineId)
                     .status(latest.getStatus().name())
                     .webUrl(null)
                     .jobStatusCount(Map.of(latest.getStatus().name(), 1L))
                     .jobs(List.of())
                     .securityReports(Map.of())
+                    .dataSource("database")
                     .build();
             return ResponseEntity.ok(response);
         }
@@ -166,6 +168,7 @@ public class PipelineController {
                     .jobStatusCount(summary.get("jobStatusCount"))
                     .jobs(summary.get("jobs"))
                     .securityReports(reports)
+                    .dataSource("gitlab")
                     .build();
             return ResponseEntity.ok(response);
         } catch (Exception e) {
@@ -186,6 +189,7 @@ public class PipelineController {
                     .jobStatusCount(jobStatusCount)
                     .jobs(jobs)
                     .securityReports(Map.of())
+                    .dataSource("database")
                     .build();
             return ResponseEntity.ok(response);
         }
@@ -216,6 +220,7 @@ public class PipelineController {
                     .jobStatusCount(summary.get("jobStatusCount"))
                     .jobs(summary.get("jobs"))
                     .securityReports(reports)
+                    .dataSource("gitlab")
                     .build());
         } catch (Exception e) {
             log.error("Erreur récupération pipeline GitLab {}: {}, fallback BDD (stages_json)", pipelineId, e.getMessage());
@@ -235,6 +240,7 @@ public class PipelineController {
                     .jobStatusCount(jobStatusCount)
                     .jobs(jobs)
                     .securityReports(Map.of())
+                    .dataSource("database")
                     .build());
         }
     }

@@ -182,6 +182,7 @@ public class EnvironmentService {
                     .jobStatusCount(summary.get("jobStatusCount"))
                     .jobs(summary.get("jobs"))
                     .securityReports(reports)
+                    .dataSource("gitlab")
                     .build();
         } catch (Exception e) {
             log.warn("Erreur récupération pipeline GitLab {}: {}, fallback BDD (stages_json)", pipelineId, e.getMessage());
@@ -201,6 +202,7 @@ public class EnvironmentService {
                     .jobStatusCount(jobStatusCount)
                     .jobs(jobs)
                     .securityReports(Map.of())
+                    .dataSource("database")
                     .build();
         }
     }

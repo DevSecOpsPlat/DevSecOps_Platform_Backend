@@ -16,4 +16,6 @@ public class PipelineScanResponse {
     private Object jobStatusCount;
     private Object jobs;
     private Map<String, JsonNode> securityReports;
+    /** "gitlab" = données en direct depuis l'API GitLab, "database" = fallback depuis la BDD (GitLab indisponible) */
+    private String dataSource;
 }
