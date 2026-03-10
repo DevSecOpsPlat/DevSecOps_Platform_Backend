@@ -13,6 +13,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.http.*;
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.util.*;
 import org.springframework.cache.annotation.Cacheable;
@@ -20,6 +21,9 @@ import org.springframework.cache.annotation.Caching;
 import org.springframework.scheduling.annotation.Async;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
+
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 /**
  * Service pour interagir avec GitLab API
@@ -447,8 +451,9 @@ public class GitLabService {
 
     /**
      * Récupère le résultat du scan (JSON) d'un job une fois le pipeline terminé.
-     * Utilise RestTemplate pour télécharger l'artefact .json du job (Trivy, SonarQube, etc.).
-     * Essaie plusieurs chemins d'artefacts courants.
+     * 1) Essaie quelques chemins d'artefacts connus en accès direct (rapide).
+     * 2) Si rien n'est trouvé, télécharge le ZIP d'artifacts du job et cherche
+     *    un fichier .json à l'intérieur (peu importe le dossier).
      *
      * @param jobId ID du job GitLab (ex: job de stage Scan)
      * @return Rapport de scan en JSON (JsonNode), ou null si aucun artefact trouvé
@@ -458,7 +463,7 @@ public class GitLabService {
         HttpHeaders headers = new HttpHeaders();
         headers.set("PRIVATE-TOKEN", gitlabToken);
 
-        // Chemins d'artefacts courants selon .gitlab-ci.yml (Trivy, SonarQube, rapport générique)
+        // Chemins d'artefacts courants selon .gitlab-ci.yml (Trivy, SonarQube, rapports GitLab natifs)
         String[] artifactPaths = {
                 "report.json",
                 "trivy-report.json",
@@ -466,7 +471,12 @@ public class GitLabService {
                 "gl-dependency-scanning-report.json",
                 "gl-sast-report.json",
                 "sonarqube-report.json",
-                "scan-report.json"
+                "scan-report.json",
+                // Variantes quand le projet est empaqueté dans un sous-répertoire (ex: user-repo/)
+                "user-repo/report.json",
+                "user-repo/trivy-report.json",
+                "user-repo/trivy-dependencies-report.json",
+                "user-repo/scan-report.json"
         };
 
         for (String path : artifactPaths) {
@@ -481,13 +491,55 @@ public class GitLabService {
                 );
                 if (response.getStatusCode() == HttpStatus.OK && response.getBody() != null && response.getBody().length > 0) {
                     JsonNode report = objectMapper.readTree(response.getBody());
-                    log.info("✅ Scan results récupérés pour job {} (artefact: {})", jobId, path);
+                    log.info("✅ Scan results récupérés pour job {} (artefact direct: {})", jobId, path);
                     return report;
                 }
             } catch (Exception e) {
-                log.debug("Artefact {} non trouvé pour job {}: {}", path, jobId, e.getMessage());
+                log.debug("Artefact direct {} non trouvé pour job {}: {}", path, jobId, e.getMessage());
             }
         }
+
+        // Fallback générique : télécharger le ZIP de tous les artifacts et chercher un .json
+        try (InputStream zipStream = gitLabApi.getJobApi().downloadArtifactsFile(gitlabProjectId, jobId);
+             ZipInputStream zis = new ZipInputStream(zipStream)) {
+
+            ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
+                String name = entry.getName();
+                if (entry.isDirectory()) {
+                    continue;
+                }
+                // On cherche un JSON de scan : d'abord ceux contenant des mots-clés, sinon le premier .json
+                if (name.toLowerCase().endsWith(".json")) {
+                    boolean looksLikeScan =
+                            name.contains("trivy") ||
+                                    name.contains("sast") ||
+                                    name.contains("scan") ||
+                                    name.contains("report") ||
+                                    name.contains("sonar");
+
+                    ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+                    byte[] tmp = new byte[4096];
+                    int read;
+                    while ((read = zis.read(tmp)) != -1) {
+                        buffer.write(tmp, 0, read);
+                    }
+
+                    if (looksLikeScan) {
+                        JsonNode report = objectMapper.readTree(buffer.toByteArray());
+                        log.info("✅ Scan results récupérés pour job {} depuis le ZIP (fichier: {})", jobId, name);
+                        return report;
+                    } else if (log.isDebugEnabled()) {
+                        log.debug("JSON trouvé dans les artifacts mais ignoré (nom: {})", name);
+                    }
+                }
+            }
+        } catch (GitLabApiException e) {
+            log.warn("⚠️ Impossible de télécharger le ZIP d'artifacts pour le job {}: {}", jobId, e.getMessage());
+        } catch (Exception e) {
+            log.error("❌ Erreur lors de l'analyse du ZIP d'artifacts pour le job {}: {}", jobId, e.getMessage());
+        }
+
         log.warn("⚠️ Aucun artefact JSON de scan trouvé pour le job {}", jobId);
         return null;
     }
