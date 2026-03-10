@@ -58,6 +58,16 @@ public class GitLabService {
     @Value("${pipeline.timeout-minutes}")
     private Integer timeoutMinutes;
 
+    // SonarQube / SonarCloud
+    @Value("${sonarqube.host-url}")
+    private String sonarHostUrl;
+
+    @Value("${sonarqube.token}")
+    private String sonarToken;
+
+    @Value("${sonarqube.project-key}")
+    private String sonarProjectKey;
+
     // ============================================
     // PIPELINE - CRÉATION ET DÉCLENCHEMENT
     // ============================================
@@ -542,6 +552,211 @@ public class GitLabService {
 
         log.warn("⚠️ Aucun artefact JSON de scan trouvé pour le job {}", jobId);
         return null;
+    }
+
+    // ============================================
+    // SONARQUBE - RÉCUPÉRATION DES RÉSULTATS
+    // ============================================
+
+    /**
+     * Récupère les résultats SonarQube pour un projet (métriques globales, issues, hotspots, quality gate).
+     */
+    public Map<String, Object> getSonarQubeResults() {
+        try {
+            log.info("🔍 Récupération des résultats SonarQube pour le projet: {}", sonarProjectKey);
+
+            RestTemplate restTemplate = new RestTemplate();
+            HttpHeaders headers = new HttpHeaders();
+            headers.set("Authorization", "Bearer " + sonarToken);
+
+            HttpEntity<String> entity = new HttpEntity<>(headers);
+
+            // 1. Métriques principales
+            String measuresUrl = String.format(
+                    "%s/api/measures/component?component=%s&metricKeys=bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density,ncloc,security_hotspots,security_rating",
+                    sonarHostUrl,
+                    sonarProjectKey
+            );
+
+            ResponseEntity<JsonNode> measuresResponse = restTemplate.exchange(
+                    measuresUrl,
+                    HttpMethod.GET,
+                    entity,
+                    JsonNode.class
+            );
+
+            // 2. Issues
+            String issuesUrl = String.format(
+                    "%s/api/issues/search?componentKeys=%s&ps=100&facets=severities&types=BUG,VULNERABILITY,CODE_SMELL",
+                    sonarHostUrl,
+                    sonarProjectKey
+            );
+
+            ResponseEntity<JsonNode> issuesResponse = restTemplate.exchange(
+                    issuesUrl,
+                    HttpMethod.GET,
+                    entity,
+                    JsonNode.class
+            );
+
+            // 3. Hotspots de sécurité
+            String hotspotsUrl = String.format(
+                    "%s/api/hotspots/search?projectKey=%s&ps=100",
+                    sonarHostUrl,
+                    sonarProjectKey
+            );
+
+            ResponseEntity<JsonNode> hotspotsResponse = restTemplate.exchange(
+                    hotspotsUrl,
+                    HttpMethod.GET,
+                    entity,
+                    JsonNode.class
+            );
+
+            Map<String, Object> result = new HashMap<>();
+
+            // Métriques
+            if (measuresResponse.getBody() != null && measuresResponse.getBody().has("component")) {
+                JsonNode component = measuresResponse.getBody().get("component");
+                JsonNode measures = component.get("measures");
+
+                Map<String, Object> metrics = new HashMap<>();
+                for (JsonNode measure : measures) {
+                    String metric = measure.get("metric").asText();
+                    String value = measure.get("value").asText();
+                    metrics.put(metric, value);
+                }
+                result.put("metrics", metrics);
+            }
+
+            // Issues
+            if (issuesResponse.getBody() != null) {
+                result.put("total_issues", issuesResponse.getBody().path("total").asInt(0));
+                result.put("issues", issuesResponse.getBody().path("issues"));
+            }
+
+            // Hotspots
+            if (hotspotsResponse.getBody() != null) {
+                result.put("total_hotspots", hotspotsResponse.getBody().path("total").asInt(0));
+                result.put("hotspots", hotspotsResponse.getBody().path("hotspots"));
+            }
+
+            // Quality Gate
+            String qualityGateUrl = String.format(
+                    "%s/api/qualitygates/project_status?projectKey=%s",
+                    sonarHostUrl,
+                    sonarProjectKey
+            );
+
+            ResponseEntity<JsonNode> qualityGateResponse = restTemplate.exchange(
+                    qualityGateUrl,
+                    HttpMethod.GET,
+                    entity,
+                    JsonNode.class
+            );
+
+            if (qualityGateResponse.getBody() != null && qualityGateResponse.getBody().has("projectStatus")) {
+                result.put("quality_gate", qualityGateResponse.getBody().get("projectStatus"));
+            }
+
+            log.info("✅ Résultats SonarQube récupérés avec succès");
+            return result;
+
+        } catch (Exception e) {
+            log.error("❌ Erreur récupération résultats SonarQube: {}", e.getMessage());
+            throw new RuntimeException("Impossible de récupérer les résultats SonarQube", e);
+        }
+    }
+
+    /**
+     * Récupère les résultats SonarQube pour une branche spécifique.
+     */
+    public Map<String, Object> getSonarQubeResultsForBranch(String branch) {
+        try {
+            log.info("🔍 Récupération des résultats SonarQube pour la branche: {}", branch);
+
+            RestTemplate restTemplate = new RestTemplate();
+            HttpHeaders headers = new HttpHeaders();
+            headers.set("Authorization", "Bearer " + sonarToken);
+
+            HttpEntity<String> entity = new HttpEntity<>(headers);
+
+            String url = String.format(
+                    "%s/api/measures/component?component=%s&branch=%s&metricKeys=bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density,security_hotspots,quality_gate_details",
+                    sonarHostUrl,
+                    sonarProjectKey,
+                    branch
+            );
+
+            ResponseEntity<JsonNode> response = restTemplate.exchange(
+                    url,
+                    HttpMethod.GET,
+                    entity,
+                    JsonNode.class
+            );
+
+            Map<String, Object> result = new HashMap<>();
+            result.put("branch", branch);
+
+            if (response.getBody() != null && response.getBody().has("component")) {
+                JsonNode component = response.getBody().get("component");
+                JsonNode measures = component.get("measures");
+
+                Map<String, Object> metrics = new HashMap<>();
+                for (JsonNode measure : measures) {
+                    String metric = measure.get("metric").asText();
+                    String value = measure.get("value").asText();
+                    metrics.put(metric, value);
+                }
+                result.put("metrics", metrics);
+            }
+
+            return result;
+
+        } catch (Exception e) {
+            log.error("❌ Erreur récupération résultats SonarQube pour branche {}: {}", branch, e.getMessage());
+            return Collections.emptyMap();
+        }
+    }
+
+    /**
+     * Récupère le statut du Quality Gate global.
+     */
+    public Map<String, Object> getQualityGateStatus() {
+        try {
+            String url = String.format(
+                    "%s/api/qualitygates/project_status?projectKey=%s",
+                    sonarHostUrl,
+                    sonarProjectKey
+            );
+
+            RestTemplate restTemplate = new RestTemplate();
+            HttpHeaders headers = new HttpHeaders();
+            headers.set("Authorization", "Bearer " + sonarToken);
+
+            HttpEntity<String> entity = new HttpEntity<>(headers);
+
+            ResponseEntity<JsonNode> response = restTemplate.exchange(
+                    url,
+                    HttpMethod.GET,
+                    entity,
+                    JsonNode.class
+            );
+
+            Map<String, Object> result = new HashMap<>();
+
+            if (response.getBody() != null && response.getBody().has("projectStatus")) {
+                JsonNode status = response.getBody().get("projectStatus");
+                result.put("status", status.path("status").asText());
+                result.put("conditions", status.path("conditions"));
+            }
+
+            return result;
+
+        } catch (Exception e) {
+            log.error("❌ Erreur récupération Quality Gate: {}", e.getMessage());
+            return Collections.emptyMap();
+        }
     }
 
     // ============================================
