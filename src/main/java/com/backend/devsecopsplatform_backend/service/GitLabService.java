@@ -628,6 +628,9 @@ public class GitLabService {
                 }
                 result.put("metrics", metrics);
             }
+            // Exposer host & project pour permettre des liens directs dans le front
+            result.put("sonar_host_url", sonarHostUrl);
+            result.put("sonar_project_key", sonarProjectKey);
 
             // Issues
             if (issuesResponse.getBody() != null) {
@@ -778,6 +781,53 @@ public class GitLabService {
         } catch (Exception e) {
             log.error("❌ Erreur récupération Quality Gate: {}", e.getMessage());
             return Collections.emptyMap();
+        }
+    }
+
+    /**
+     * Récupère le code source brut et les métadonnées de duplication SonarQube pour un composant (fichier).
+     */
+    public Map<String, Object> getSonarFileDuplications(String componentKey) {
+        try {
+            RestTemplate restTemplate = new RestTemplate();
+            HttpHeaders headers = new HttpHeaders();
+            headers.set("Authorization", "Bearer " + sonarToken);
+            HttpEntity<String> entity = new HttpEntity<>(headers);
+
+            // Source brute
+            String srcUrl = String.format(
+                    "%s/api/sources/raw?key=%s",
+                    sonarHostUrl,
+                    componentKey
+            );
+            ResponseEntity<String> srcResponse = restTemplate.exchange(
+                    srcUrl,
+                    HttpMethod.GET,
+                    entity,
+                    String.class
+            );
+
+            // Métadonnées de duplication (blocs)
+            String dupUrl = String.format(
+                    "%s/api/duplications/show?key=%s",
+                    sonarHostUrl,
+                    componentKey
+            );
+            ResponseEntity<JsonNode> dupResponse = restTemplate.exchange(
+                    dupUrl,
+                    HttpMethod.GET,
+                    entity,
+                    JsonNode.class
+            );
+
+            Map<String, Object> result = new HashMap<>();
+            result.put("componentKey", componentKey);
+            result.put("source", srcResponse.getBody() != null ? srcResponse.getBody() : "");
+            result.put("duplications", dupResponse.getBody());
+            return result;
+        } catch (Exception e) {
+            log.error("❌ Erreur récupération duplications SonarQube pour {}: {}", componentKey, e.getMessage());
+            throw new RuntimeException("Impossible de récupérer les duplications pour " + componentKey, e);
         }
     }
 

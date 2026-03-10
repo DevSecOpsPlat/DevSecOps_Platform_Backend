@@ -62,5 +62,19 @@ public class SonarQubeController {
             ));
         }
     }
+
+    @GetMapping("/duplications")
+    public ResponseEntity<?> getDuplications(@RequestParam("componentKey") String componentKey) {
+        try {
+            Map<String, Object> details = gitLabService.getSonarFileDuplications(componentKey);
+            return ResponseEntity.ok(details);
+        } catch (Exception e) {
+            log.error("❌ Impossible de récupérer les duplications pour {}", componentKey, e);
+            return ResponseEntity.status(500).body(Map.of(
+                    "error", "Impossible de récupérer les duplications pour ce fichier",
+                    "message", e.getMessage()
+            ));
+        }
+    }
 }
 
