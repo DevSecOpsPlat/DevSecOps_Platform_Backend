@@ -666,6 +666,28 @@ public class GitLabService {
                 log.warn("⚠️ Impossible de récupérer le détail de duplication par fichier: {}", e.getMessage());
             }
 
+            // Couverture par fichier (pour Quality Gate Coverage)
+            try {
+                String covUrl = String.format(
+                        "%s/api/measures/component_tree?component=%s&metricKeys=coverage,uncovered_lines,uncovered_conditions&qualifiers=FIL&ps=100",
+                        sonarHostUrl,
+                        sonarProjectKey
+                );
+
+                ResponseEntity<JsonNode> covResponse = restTemplate.exchange(
+                        covUrl,
+                        HttpMethod.GET,
+                        entity,
+                        JsonNode.class
+                );
+
+                if (covResponse.getBody() != null) {
+                    result.put("coverage_components", covResponse.getBody().path("components"));
+                }
+            } catch (Exception e) {
+                log.warn("⚠️ Impossible de récupérer le détail de couverture par fichier: {}", e.getMessage());
+            }
+
             // Quality Gate
             String qualityGateUrl = String.format(
                     "%s/api/qualitygates/project_status?projectKey=%s",
