@@ -17,14 +17,11 @@ import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.util.*;
 import org.springframework.cache.annotation.Cacheable;
-import org.springframework.cache.annotation.Caching;
-import org.springframework.scheduling.annotation.Async;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
-import org.springframework.http.client.SimpleClientHttpRequestFactory;
 /**
  * Service pour interagir avec GitLab API
  * Gère les pipelines, jobs, artifacts et rapports de sécurité
@@ -638,10 +635,14 @@ public class GitLabService {
                 result.put("issues", issuesResponse.getBody().path("issues"));
             }
 
-            // Hotspots
+            // Hotspots (total peut être absent ou 0 : utiliser la taille de la liste)
             if (hotspotsResponse.getBody() != null) {
-                result.put("total_hotspots", hotspotsResponse.getBody().path("total").asInt(0));
-                result.put("hotspots", hotspotsResponse.getBody().path("hotspots"));
+                JsonNode hotspotsBody = hotspotsResponse.getBody();
+                JsonNode hotspotsArray = hotspotsBody.path("hotspots");
+                int totalFromApi = hotspotsBody.path("total").asInt(0);
+                int count = hotspotsArray.isArray() ? hotspotsArray.size() : 0;
+                result.put("total_hotspots", Math.max(totalFromApi, count));
+                result.put("hotspots", hotspotsArray);
             }
 
             // Duplication par fichier (component tree, fichiers uniquement)
@@ -853,6 +854,109 @@ public class GitLabService {
         }
     }
 
+    /**
+     * Récupère tous les détails d'un Security Hotspot : hotspot (show), règle (risk/fix), extrait de code.
+     */
+    /**
+     * Récupère tous les détails d'un Security Hotspot : hotspot (show), règle (risk/fix), extrait de code.
+     */
+    public Map<String, Object> getHotspotDetails(String hotspotKey) {
+        try {
+            RestTemplate restTemplate = new RestTemplate();
+            HttpHeaders headers = new HttpHeaders();
+            headers.set("Authorization", "Bearer " + sonarToken);
+            HttpEntity<String> entity = new HttpEntity<>(headers);
+
+            // 1. Détail du hotspot
+            String showUrl = String.format("%s/api/hotspots/show?hotspot=%s", sonarHostUrl, hotspotKey);
+            ResponseEntity<JsonNode> showResponse = restTemplate.exchange(
+                    showUrl, HttpMethod.GET, entity, JsonNode.class);
+            if (showResponse.getBody() == null || !showResponse.getBody().has("key")) {
+                throw new RuntimeException("Hotspot non trouvé: " + hotspotKey);
+            }
+            JsonNode hotspot = showResponse.getBody();
+            String ruleKey = hotspot.has("ruleKey") ? hotspot.get("ruleKey").asText() : null;
+
+            // Logs détaillés pour vérifier ce que renvoie SonarQube
+            log.info("🔍 Hotspot récupéré (key={}): {}", hotspotKey, hotspot.toString());
+            log.info("🔍 Hotspot - ruleKey={}, component={}", ruleKey, hotspot.path("component").toString());
+
+            Map<String, Object> result = new HashMap<>();
+            result.put("hotspot", objectMapper.convertValue(hotspot, Map.class));
+
+            // 2. Détails de la règle (risk, fix, description)
+            if (ruleKey != null) {
+                try {
+                    // Appeler l'API des règles
+                    String ruleUrl = String.format("%s/api/rules/show?key=%s", sonarHostUrl, ruleKey);
+                    ResponseEntity<JsonNode> ruleResponse = restTemplate.exchange(
+                            ruleUrl, HttpMethod.GET, entity, JsonNode.class);
+
+                    if (ruleResponse.getBody() != null) {
+                        JsonNode rootRule = ruleResponse.getBody();
+                        JsonNode rule = rootRule.has("rule") ? rootRule.get("rule") : rootRule;
+
+                        // Log brut pour comparer avec l'interface SonarQube
+                        log.info("📋 Règle brute pour hotspot {} (ruleKey={}): {}", hotspotKey, ruleKey, rule.toString());
+
+                        // On renvoie la règle complète au front pour debug/affichage
+                        Map<String, Object> ruleMap = objectMapper.convertValue(rule, Map.class);
+                        result.put("rule", ruleMap);
+                    } else {
+                        log.warn("❓ Réponse vide de /api/rules/show pour ruleKey={}", ruleKey);
+                    }
+                } catch (Exception e) {
+                    log.warn("Règle non récupérée pour {}: {}", ruleKey, e.getMessage());
+                }
+            }
+
+            // 3. Extrait de code (où est le risque)
+            String componentKey = null;
+            JsonNode compNode = hotspot.get("component");
+            if (compNode != null && !compNode.isMissingNode()) {
+                if (compNode.isTextual()) {
+                    componentKey = compNode.asText();
+                } else if (compNode.has("key")) {
+                    componentKey = compNode.get("key").asText();
+                } else if (compNode.has("path")) {
+                    componentKey = compNode.get("path").asText();
+                }
+            }
+
+            int line = hotspot.has("line") ? hotspot.path("line").asInt(0) : 0;
+
+            if (componentKey != null && line > 0) {
+                try {
+                    String rawUrl = String.format("%s/api/sources/raw?key=%s", sonarHostUrl, componentKey);
+                    ResponseEntity<String> rawResponse = restTemplate.exchange(
+                            rawUrl, HttpMethod.GET, entity, String.class);
+                    if (rawResponse.getBody() != null) {
+                        String[] lines = rawResponse.getBody().split("\r?\n");
+                        int from = Math.max(0, line - 6);
+                        int to = Math.min(lines.length, line + 5);
+                        List<String> snippet = new ArrayList<>();
+                        for (int i = from; i < to; i++) {
+                            snippet.add(lines[i]);
+                        }
+                        result.put("sourceLines", snippet);
+                        result.put("sourceLineFrom", from + 1);
+                        result.put("highlightLine", line);
+                    }
+                } catch (Exception e) {
+                    log.warn("Source non récupérée pour {}: {}", componentKey, e.getMessage());
+                }
+            }
+
+            result.put("sonar_host_url", sonarHostUrl);
+            result.put("sonar_project_key", sonarProjectKey);
+            log.info("✅ Détail hotspot récupéré: {}", hotspotKey);
+            return result;
+
+        } catch (Exception e) {
+            log.error("❌ Erreur récupération détail hotspot {}: {}", hotspotKey, e.getMessage());
+            throw new RuntimeException("Impossible de récupérer le détail du hotspot", e);
+        }
+    }
     // ============================================
     // PIPELINE - GESTION AVANCÉE
     // ============================================

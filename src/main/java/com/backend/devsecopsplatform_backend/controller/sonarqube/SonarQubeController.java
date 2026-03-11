@@ -76,5 +76,19 @@ public class SonarQubeController {
             ));
         }
     }
+
+    @GetMapping("/hotspots/detail")
+    public ResponseEntity<?> getHotspotDetail(@RequestParam("hotspotKey") String hotspotKey) {
+        try {
+            Map<String, Object> details = gitLabService.getHotspotDetails(hotspotKey);
+            return ResponseEntity.ok(details);
+        } catch (Exception e) {
+            log.error("❌ Impossible de récupérer le détail du hotspot {}", hotspotKey, e);
+            return ResponseEntity.status(500).body(Map.of(
+                    "error", "Impossible de récupérer le détail du hotspot",
+                    "message", e.getMessage()
+            ));
+        }
+    }
 }
 
