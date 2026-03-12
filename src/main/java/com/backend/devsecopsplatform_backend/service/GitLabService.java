@@ -556,6 +556,77 @@ public class GitLabService {
     // ============================================
 
     /**
+     * Normalise le statut Quality Gate renvoyé par SonarQube pour un affichage frontend cohérent
+     * et ajoute un message de détail (errorDescription) pour chaque condition en échec.
+     */
+    private Map<String, Object> normalizeQualityGateStatus(JsonNode projectStatus) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        if (projectStatus == null || projectStatus.isMissingNode()) return out;
+
+        String status = projectStatus.has("status") ? projectStatus.get("status").asText("UNKNOWN")
+                : (projectStatus.has("level") ? projectStatus.get("level").asText("UNKNOWN") : "UNKNOWN");
+        out.put("status", status);
+
+        JsonNode conditionsNode = projectStatus.path("conditions");
+        if (!conditionsNode.isArray()) {
+            out.put("conditions", Collections.emptyList());
+            return out;
+        }
+
+        List<Map<String, Object>> conditions = new ArrayList<>();
+        for (JsonNode cond : conditionsNode) {
+            Map<String, Object> c = new LinkedHashMap<>();
+            String condStatus = cond.has("status") ? cond.get("status").asText("OK")
+                    : (cond.has("level") ? cond.get("level").asText("OK") : "OK");
+            String metricKey = cond.has("metricKey") ? cond.get("metricKey").asText("")
+                    : (cond.has("metric") ? cond.get("metric").asText("") : "");
+            String actual = cond.has("actualValue") ? cond.get("actualValue").asText("0")
+                    : (cond.has("actual") ? cond.get("actual").asText("0") : "0");
+            String errorThreshold = cond.has("errorThreshold") ? cond.get("errorThreshold").asText("")
+                    : (cond.has("error") ? cond.get("error").asText("") : "");
+            String comparator = cond.has("comparator") ? cond.get("comparator").asText("")
+                    : (cond.has("op") ? cond.get("op").asText("") : "");
+
+            c.put("status", condStatus);
+            c.put("metricKey", metricKey);
+            c.put("metric", metricKey);
+            c.put("actualValue", actual);
+            c.put("errorThreshold", errorThreshold);
+            c.put("comparator", comparator);
+
+            if ("ERROR".equalsIgnoreCase(condStatus) && (actual != null || errorThreshold != null)) {
+                String desc = buildQualityGateConditionErrorDescription(
+                        metricKey, actual, errorThreshold, comparator);
+                if (desc != null) c.put("errorDescription", desc);
+            }
+            conditions.add(c);
+        }
+        out.put("conditions", conditions);
+        return out;
+    }
+
+    /**
+     * Construit un message lisible pour une condition Quality Gate en échec.
+     */
+    private String buildQualityGateConditionErrorDescription(String metricKey, String actualValue, String errorThreshold, String comparator) {
+        if (metricKey == null) metricKey = "";
+        String metricLabel = metricKey.toLowerCase().contains("coverage") ? "Couverture"
+                : metricKey.toLowerCase().contains("security_hotspots") ? "Security Hotspots à revoir"
+                : metricKey.toLowerCase().contains("duplicated") ? "Duplication"
+                : metricKey.toLowerCase().contains("reliability") ? "Fiabilité"
+                : metricKey.toLowerCase().contains("maintainability") ? "Maintenabilité"
+                : (metricKey.isEmpty() ? "Cette métrique" : metricKey);
+        String actual = actualValue != null ? actualValue : "0";
+        String required = errorThreshold != null ? errorThreshold : "–";
+        // Comparateur: LT = inférieur à, GT = supérieur à, EQ = égal
+        String opLabel = "LT".equalsIgnoreCase(comparator) ? "≥"
+                : "GT".equalsIgnoreCase(comparator) ? "≤"
+                : "≥";
+        return String.format("La valeur actuelle (%s) ne respecte pas le seuil requis (%s %s). Améliorez la métrique \"%s\" pour passer le Quality Gate.",
+                actual, opLabel, required, metricLabel);
+    }
+
+    /**
      * Récupère les résultats SonarQube pour un projet (métriques globales, issues, hotspots, quality gate).
      */
     public Map<String, Object> getSonarQubeResults() {
@@ -704,7 +775,8 @@ public class GitLabService {
             );
 
             if (qualityGateResponse.getBody() != null && qualityGateResponse.getBody().has("projectStatus")) {
-                result.put("quality_gate", qualityGateResponse.getBody().get("projectStatus"));
+                JsonNode projectStatus = qualityGateResponse.getBody().get("projectStatus");
+                result.put("quality_gate", normalizeQualityGateStatus(projectStatus));
             }
 
             log.info("✅ Résultats SonarQube récupérés avec succès");
