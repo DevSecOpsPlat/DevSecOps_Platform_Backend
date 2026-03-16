@@ -70,6 +70,8 @@ public class SecurityConfig {
                         .requestMatchers("/api/pipelines/**", "/projet/api/pipelines/**").authenticated()
                         // API SonarQube (résultats, hotspots, duplications, transition/assign issues) : authentifié
                         .requestMatchers("/api/sonarqube/**", "/projet/api/sonarqube/**").authenticated()
+                        // API IA (analyse d'artifacts : vulnérabilités + remédiations)
+                        .requestMatchers("/api/ai/**", "/projet/api/ai/**").authenticated()
                         // Webhook GitLab (appelé par GitLab, pas par le front)
                         .requestMatchers("/api/webhooks/**", "/projet/api/webhooks/**").permitAll()
                         // Administration : réservé aux admins authentifiés
