@@ -17,6 +17,9 @@ import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.util.*;
 import org.springframework.cache.annotation.Cacheable;
+import org.springframework.util.LinkedMultiValueMap;
+import org.springframework.util.MultiValueMap;
+
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.zip.ZipEntry;
@@ -64,6 +67,13 @@ public class GitLabService {
 
     @Value("${sonarqube.project-key}")
     private String sonarProjectKey;
+
+    /**
+     * Utilisateur SonarCloud par défaut pour \"Assign to me\" côté plateforme.
+     * (par exemple le mainteneur principal du projet).
+     */
+    @Value("${sonarqube.default-assignee:}")
+    private String sonarDefaultAssignee;
 
     // ============================================
     // PIPELINE - CRÉATION ET DÉCLENCHEMENT
@@ -653,9 +663,12 @@ public class GitLabService {
                     JsonNode.class
             );
 
-            // 2. Issues
+            // 2. Issues (avec facettes principales pour les filtres frontend)
+            // Facets supportés par l'API : severities, types, statuses, languages, tags, assignees, etc.
+            // On reste sur un sous-ensemble sûr pour éviter les erreurs 400 si un nom de facet change.
             String issuesUrl = String.format(
-                    "%s/api/issues/search?componentKeys=%s&ps=100&facets=severities&types=BUG,VULNERABILITY,CODE_SMELL",
+                    "%s/api/issues/search?componentKeys=%s&ps=100"
+                            + "&facets=severities,types,statuses,languages,tags,assignees",
                     sonarHostUrl,
                     sonarProjectKey
             );
@@ -700,10 +713,12 @@ public class GitLabService {
             result.put("sonar_host_url", sonarHostUrl);
             result.put("sonar_project_key", sonarProjectKey);
 
-            // Issues
+            // Issues (+ facettes pour les filtres frontend)
             if (issuesResponse.getBody() != null) {
-                result.put("total_issues", issuesResponse.getBody().path("total").asInt(0));
-                result.put("issues", issuesResponse.getBody().path("issues"));
+                JsonNode issuesBody = issuesResponse.getBody();
+                result.put("total_issues", issuesBody.path("total").asInt(0));
+                result.put("issues", issuesBody.path("issues"));
+                result.put("issue_facets", issuesBody.path("facets"));
             }
 
             // Hotspots (total peut être absent ou 0 : utiliser la taille de la liste)
@@ -786,6 +801,74 @@ public class GitLabService {
             log.error("❌ Erreur récupération résultats SonarQube: {}", e.getMessage());
             throw new RuntimeException("Impossible de récupérer les résultats SonarQube", e);
         }
+    }
+
+    /**
+     * Change le statut d'une issue SonarQube/SonarCloud (persisté côté SonarCloud).
+     * Transitions possibles: confirm, unconfirm, resolve, reopen, falsepositive, wontfix, accept.
+     */
+    public void sonarIssueDoTransition(String issueKey, String transition) {
+        if (issueKey == null || issueKey.isBlank() || transition == null || transition.isBlank()) {
+            throw new IllegalArgumentException("issueKey et transition sont requis");
+        }
+        String url = sonarHostUrl.replaceAll("/+$", "") + "/api/issues/do_transition";
+        RestTemplate restTemplate = new RestTemplate();
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(org.springframework.http.MediaType.APPLICATION_FORM_URLENCODED);
+        headers.set("Authorization", "Bearer " + sonarToken);
+        MultiValueMap<String, String> body = new LinkedMultiValueMap<>();
+        body.add("issue", issueKey);
+        body.add("transition", transition);
+        HttpEntity<MultiValueMap<String, String>> entity = new HttpEntity<>(body, headers);
+        ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.POST, entity, String.class);
+        if (!response.getStatusCode().is2xxSuccessful()) {
+            throw new RuntimeException("Transition échouée: " + response.getStatusCode());
+        }
+        log.info("✅ Issue {} transition vers {}", issueKey, transition);
+    }
+
+    /**
+     * Assigne ou désassigne une issue SonarQube/SonarCloud (persisté côté SonarCloud).
+     * @param issueKey clé de l'issue
+     * @param assignee login utilisateur SonarCloud, ou null/empty pour désassigner
+     */
+    public void sonarIssueAssign(String issueKey, String assignee) {
+        if (issueKey == null || issueKey.isBlank()) {
+            throw new IllegalArgumentException("issueKey est requis");
+        }
+        String url = sonarHostUrl.replaceAll("/+$", "") + "/api/issues/assign";
+        RestTemplate restTemplate = new RestTemplate();
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(org.springframework.http.MediaType.APPLICATION_FORM_URLENCODED);
+        headers.set("Authorization", "Bearer " + sonarToken);
+        MultiValueMap<String, String> body = new LinkedMultiValueMap<>();
+        body.add("issue", issueKey);
+        if (assignee != null && !assignee.isBlank()) {
+            body.add("assignee", assignee);
+        }
+        HttpEntity<MultiValueMap<String, String>> entity = new HttpEntity<>(body, headers);
+        ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.POST, entity, String.class);
+        if (!response.getStatusCode().is2xxSuccessful()) {
+            throw new RuntimeException("Assignation échouée: " + response.getStatusCode());
+        }
+        log.info("✅ Issue {} assignée à {}", issueKey, assignee != null ? assignee : "(désassignée)");
+    }
+
+    /**
+     * Assigne l'issue au compte SonarCloud par défaut (utilisé pour \"Assign to me\" côté plateforme).
+     */
+    public void sonarIssueAssignToDefault(String issueKey) {
+        if (sonarDefaultAssignee == null || sonarDefaultAssignee.isBlank()) {
+            throw new IllegalStateException("sonarqube.default-assignee n'est pas configuré côté backend");
+        }
+        sonarIssueAssign(issueKey, sonarDefaultAssignee);
+    }
+
+    /**
+     * Désassigne complètement l'issue (équivalent Not assigned).
+     */
+    public void sonarIssueUnassign(String issueKey) {
+        sonarIssueAssign(issueKey, null);
     }
 
     /**

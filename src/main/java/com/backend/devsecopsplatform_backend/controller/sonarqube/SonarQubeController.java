@@ -6,6 +6,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.CrossOrigin;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -86,6 +87,66 @@ public class SonarQubeController {
             log.error("❌ Impossible de récupérer le détail du hotspot {}", hotspotKey, e);
             return ResponseEntity.status(500).body(Map.of(
                     "error", "Impossible de récupérer le détail du hotspot",
+                    "message", e.getMessage()
+            ));
+        }
+    }
+
+    /**
+     * Change le statut d'une issue (persisté dans SonarCloud).
+     * Transitions: confirm, unconfirm, resolve, reopen, falsepositive, wontfix, accept.
+     */
+    @PostMapping("/issues/transition")
+    public ResponseEntity<?> issueTransition(
+            @RequestParam("issueKey") String issueKey,
+            @RequestParam("transition") String transition) {
+        try {
+            gitLabService.sonarIssueDoTransition(issueKey, transition);
+            return ResponseEntity.ok(Map.of("success", true, "issueKey", issueKey, "transition", transition));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        } catch (Exception e) {
+            log.error("❌ Transition issue {} vers {}: {}", issueKey, transition, e.getMessage());
+            return ResponseEntity.status(500).body(Map.of(
+                    "error", "Impossible de changer le statut de l'issue",
+                    "message", e.getMessage()
+            ));
+        }
+    }
+
+    /**
+     * Assigne une issue au compte SonarCloud par défaut (vue \"Assign to me\" dans la plateforme).
+     */
+    @PostMapping("/issues/assign/me")
+    public ResponseEntity<?> issueAssignMe(@RequestParam("issueKey") String issueKey) {
+        try {
+            gitLabService.sonarIssueAssignToDefault(issueKey);
+            return ResponseEntity.ok(Map.of("success", true, "issueKey", issueKey, "mode", "me"));
+        } catch (IllegalArgumentException | IllegalStateException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        } catch (Exception e) {
+            log.error("❌ Assignation (me) issue {}: {}", issueKey, e.getMessage());
+            return ResponseEntity.status(500).body(Map.of(
+                    "error", "Impossible d'assigner l'issue",
+                    "message", e.getMessage()
+            ));
+        }
+    }
+
+    /**
+     * Désassigne complètement une issue (équivalent Not assigned).
+     */
+    @PostMapping("/issues/assign/unassign")
+    public ResponseEntity<?> issueUnassign(@RequestParam("issueKey") String issueKey) {
+        try {
+            gitLabService.sonarIssueUnassign(issueKey);
+            return ResponseEntity.ok(Map.of("success", true, "issueKey", issueKey, "mode", "unassign"));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        } catch (Exception e) {
+            log.error("❌ Désassignation issue {}: {}", issueKey, e.getMessage());
+            return ResponseEntity.status(500).body(Map.of(
+                    "error", "Impossible de désassigner l'issue",
                     "message", e.getMessage()
             ));
         }

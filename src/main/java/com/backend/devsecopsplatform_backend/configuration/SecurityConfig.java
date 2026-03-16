@@ -68,6 +68,8 @@ public class SecurityConfig {
                         .requestMatchers("/api/deploy/**", "/projet/api/deploy/**").permitAll()
                         // API pipelines (détail, logs, scans) : accès avec ou sans JWT (contrôle métier dans le controller)
                         .requestMatchers("/api/pipelines/**", "/projet/api/pipelines/**").authenticated()
+                        // API SonarQube (résultats, hotspots, duplications, transition/assign issues) : authentifié
+                        .requestMatchers("/api/sonarqube/**", "/projet/api/sonarqube/**").authenticated()
                         // Webhook GitLab (appelé par GitLab, pas par le front)
                         .requestMatchers("/api/webhooks/**", "/projet/api/webhooks/**").permitAll()
                         // Administration : réservé aux admins authentifiés
