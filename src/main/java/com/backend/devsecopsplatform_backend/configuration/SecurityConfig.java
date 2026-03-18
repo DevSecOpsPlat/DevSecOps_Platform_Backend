@@ -64,8 +64,8 @@ public class SecurityConfig {
                 .authorizeHttpRequests(auth -> auth
                         .requestMatchers("/auth/**", "/v3/api-docs/**", "/swagger-ui/**", "/swagger-ui.html").permitAll()
                         .requestMatchers("/projet/auth/**", "/projet/v3/api-docs/**", "/projet/swagger-ui/**", "/projet/swagger-ui.html").permitAll()
-                        // DevSecOps scan : accès sans JWT pour déclenchement (frontend ajoute le JWT de toute façon)
-                        .requestMatchers("/api/deploy/**", "/projet/api/deploy/**").permitAll()
+                        // Déploiement : nécessite un JWT (on a besoin du user courant en service)
+                        .requestMatchers("/api/deploy/**", "/projet/api/deploy/**").authenticated()
                         // API pipelines (détail, logs, scans) : accès avec ou sans JWT (contrôle métier dans le controller)
                         .requestMatchers("/api/pipelines/**", "/projet/api/pipelines/**").authenticated()
                         // API SonarQube (résultats, hotspots, duplications, transition/assign issues) : authentifié
