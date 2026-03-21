@@ -674,12 +674,34 @@ public class GitLabService {
                     sonarProjectKey
             );
 
-            ResponseEntity<JsonNode> issuesResponse = restTemplate.exchange(
-                    issuesUrl,
-                    HttpMethod.GET,
-                    entity,
-                    JsonNode.class
-            );
+            // SonarCloud: le max renvoyé par requête est 500. On pagine donc pour avoir le bon total.
+            int pageIndex = 1;
+            int totalIssues = 0;
+            com.fasterxml.jackson.databind.node.ArrayNode allIssues = objectMapper.createArrayNode();
+            JsonNode firstIssuesBody = null;
+            while (true) {
+                ResponseEntity<JsonNode> issuesResponsePage = restTemplate.exchange(
+                        issuesUrl + "&p=" + pageIndex,
+                        HttpMethod.GET,
+                        entity,
+                        JsonNode.class
+                );
+                JsonNode issuesBodyPage = issuesResponsePage.getBody();
+                if (issuesBodyPage == null) break;
+                if (firstIssuesBody == null) firstIssuesBody = issuesBodyPage;
+                if (totalIssues == 0) totalIssues = issuesBodyPage.path("total").asInt(0);
+
+                JsonNode issuesPageArr = issuesBodyPage.path("issues");
+                if (!issuesPageArr.isArray() || issuesPageArr.size() == 0) break;
+                for (JsonNode item : issuesPageArr) {
+                    allIssues.add(item);
+                }
+
+                if (allIssues.size() >= totalIssues) break;
+                pageIndex++;
+                // Sécurité: le endpoint a une limite totale pratique (souvent 10000). On évite une boucle infinie.
+                if (pageIndex > 50) break;
+            }
 
             // 3. Hotspots de sécurité
             String hotspotsUrl = String.format(
@@ -715,11 +737,10 @@ public class GitLabService {
             result.put("sonar_project_key", sonarProjectKey);
 
             // Issues (+ facettes pour les filtres frontend)
-            if (issuesResponse.getBody() != null) {
-                JsonNode issuesBody = issuesResponse.getBody();
-                result.put("total_issues", issuesBody.path("total").asInt(0));
-                result.put("issues", issuesBody.path("issues"));
-                result.put("issue_facets", issuesBody.path("facets"));
+            if (firstIssuesBody != null) {
+                result.put("total_issues", totalIssues);
+                result.put("issues", allIssues);
+                result.put("issue_facets", firstIssuesBody.path("facets"));
             }
 
             // Hotspots (total peut être absent ou 0 : utiliser la taille de la liste)
@@ -925,12 +946,37 @@ public class GitLabService {
                     sonarProjectKey,
                     branch
             );
-            ResponseEntity<JsonNode> issuesResponse = restTemplate.exchange(issuesUrl, HttpMethod.GET, entity, JsonNode.class);
-            if (issuesResponse.getBody() != null) {
-                JsonNode issuesBody = issuesResponse.getBody();
-                result.put("total_issues", issuesBody.path("total").asInt(0));
-                result.put("issues", issuesBody.path("issues"));
-                result.put("issue_facets", issuesBody.path("facets"));
+            // SonarCloud: paginer pour éviter le plafond à 500.
+            int pageIndex = 1;
+            int totalIssues = 0;
+            com.fasterxml.jackson.databind.node.ArrayNode allIssues = objectMapper.createArrayNode();
+            JsonNode firstIssuesBody = null;
+            while (true) {
+                ResponseEntity<JsonNode> issuesResponsePage = restTemplate.exchange(
+                        issuesUrl + "&p=" + pageIndex,
+                        HttpMethod.GET,
+                        entity,
+                        JsonNode.class
+                );
+                JsonNode issuesBodyPage = issuesResponsePage.getBody();
+                if (issuesBodyPage == null) break;
+                if (firstIssuesBody == null) firstIssuesBody = issuesBodyPage;
+                if (totalIssues == 0) totalIssues = issuesBodyPage.path("total").asInt(0);
+
+                JsonNode issuesPageArr = issuesBodyPage.path("issues");
+                if (!issuesPageArr.isArray() || issuesPageArr.size() == 0) break;
+                for (JsonNode item : issuesPageArr) {
+                    allIssues.add(item);
+                }
+                if (allIssues.size() >= totalIssues) break;
+
+                pageIndex++;
+                if (pageIndex > 50) break;
+            }
+            if (firstIssuesBody != null) {
+                result.put("total_issues", totalIssues);
+                result.put("issues", allIssues);
+                result.put("issue_facets", firstIssuesBody.path("facets"));
             }
 
             // 3) Hotspots (pas de filtre branch fiable) : identique à /results
