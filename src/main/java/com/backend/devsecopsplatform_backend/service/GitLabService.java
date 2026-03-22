@@ -616,6 +616,29 @@ public class GitLabService {
     }
 
     /**
+     * SonarQube encode les notes A–E comme 1–5 dans l’API project_status ; on les affiche en lettres dans les messages.
+     */
+    private String formatSonarRatingForMessage(String metricKey, String raw) {
+        if (raw == null || metricKey == null) {
+            return raw != null ? raw : "0";
+        }
+        String k = metricKey.toLowerCase();
+        if (!k.contains("reliability_rating") && !k.contains("security_rating")
+                && !k.contains("maintainability_rating") && !k.contains("sqale_rating")) {
+            return raw;
+        }
+        try {
+            int n = Integer.parseInt(raw.trim());
+            if (n >= 1 && n <= 5) {
+                return String.valueOf("ABCDE".charAt(n - 1));
+            }
+        } catch (NumberFormatException ignored) {
+            // garder la valeur brute
+        }
+        return raw;
+    }
+
+    /**
      * Construit un message lisible pour une condition Quality Gate en échec.
      */
     private String buildQualityGateConditionErrorDescription(String metricKey, String actualValue, String errorThreshold, String comparator) {
@@ -623,11 +646,16 @@ public class GitLabService {
         String metricLabel = metricKey.toLowerCase().contains("coverage") ? "Couverture"
                 : metricKey.toLowerCase().contains("security_hotspots") ? "Security Hotspots à revoir"
                 : metricKey.toLowerCase().contains("duplicated") ? "Duplication"
+                : metricKey.toLowerCase().contains("reliability_rating") ? "Note de fiabilité (Reliability Rating)"
+                : metricKey.toLowerCase().contains("security_rating") ? "Note de sécurité (Security Rating)"
+                : metricKey.toLowerCase().contains("maintainability_rating")
+                        || metricKey.toLowerCase().contains("sqale_rating")
+                        ? "Note de maintenabilité (Maintainability Rating)"
                 : metricKey.toLowerCase().contains("reliability") ? "Fiabilité"
                 : metricKey.toLowerCase().contains("maintainability") ? "Maintenabilité"
                 : (metricKey.isEmpty() ? "Cette métrique" : metricKey);
-        String actual = actualValue != null ? actualValue : "0";
-        String required = errorThreshold != null ? errorThreshold : "–";
+        String actual = formatSonarRatingForMessage(metricKey, actualValue != null ? actualValue : "0");
+        String required = formatSonarRatingForMessage(metricKey, errorThreshold != null ? errorThreshold : "–");
         // Comparateur: LT = inférieur à, GT = supérieur à, EQ = égal
         String opLabel = "LT".equalsIgnoreCase(comparator) ? "≥"
                 : "GT".equalsIgnoreCase(comparator) ? "≤"
