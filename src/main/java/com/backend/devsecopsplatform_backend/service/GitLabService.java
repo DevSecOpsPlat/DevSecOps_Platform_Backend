@@ -1077,6 +1077,110 @@ public class GitLabService {
     }
 
     /**
+     * Variante: récupère les résultats SonarQube/SonarCloud pour un projectKey dynamique.
+     * Utilisé quand chaque environnement a son propre projectKey (ex: EnviroTest_{ENV_ID}).
+     *
+     * @param projectKey projectKey SonarCloud
+     * @param branch     branche (optionnelle)
+     */
+    public Map<String, Object> getSonarQubeResultsForProjectKey(String projectKey, String branch) {
+        if (projectKey == null || projectKey.isBlank()) {
+            return Collections.emptyMap();
+        }
+        try {
+            String pk = projectKey.trim();
+            String b = branch != null && !branch.isBlank() ? branch.trim() : null;
+            log.info("🔍 Récupération SonarQube results (projectKey={}, branch={})", pk, b);
+
+            RestTemplate restTemplate = new RestTemplate();
+            HttpHeaders headers = new HttpHeaders();
+            headers.set("Authorization", "Bearer " + sonarToken);
+            HttpEntity<String> entity = new HttpEntity<>(headers);
+
+            Map<String, Object> result = new HashMap<>();
+            result.put("sonar_host_url", sonarHostUrl);
+            result.put("sonar_project_key", pk);
+            if (b != null) result.put("branch", b);
+
+            String issuesUrl = String.format(
+                    "%s/api/issues/search?componentKeys=%s&ps=500"
+                            + "&additionalFields=_all"
+                            + "&facets=severities,types,statuses,languages,tags,assignees,resolutions",
+                    sonarHostUrl,
+                    pk
+            );
+            if (b != null) {
+                issuesUrl += "&branch=" + b;
+            }
+
+            int pageIndex = 1;
+            int totalIssues = 0;
+            com.fasterxml.jackson.databind.node.ArrayNode allIssues = objectMapper.createArrayNode();
+            JsonNode firstIssuesBody = null;
+            while (true) {
+                ResponseEntity<JsonNode> issuesResponsePage = restTemplate.exchange(
+                        issuesUrl + "&p=" + pageIndex,
+                        HttpMethod.GET,
+                        entity,
+                        JsonNode.class
+                );
+                JsonNode issuesBodyPage = issuesResponsePage.getBody();
+                if (issuesBodyPage == null) break;
+                if (firstIssuesBody == null) firstIssuesBody = issuesBodyPage;
+                if (totalIssues == 0) totalIssues = issuesBodyPage.path("total").asInt(0);
+
+                JsonNode issuesPageArr = issuesBodyPage.path("issues");
+                if (!issuesPageArr.isArray() || issuesPageArr.size() == 0) break;
+                for (JsonNode item : issuesPageArr) {
+                    allIssues.add(item);
+                }
+                if (allIssues.size() >= totalIssues) break;
+
+                pageIndex++;
+                if (pageIndex > 50) break;
+            }
+            if (firstIssuesBody != null) {
+                result.put("total_issues", totalIssues);
+                result.put("issues", allIssues);
+                result.put("issue_facets", firstIssuesBody.path("facets"));
+            }
+
+            // Hotspots (branch non fiable)
+            try {
+                String hotspotsUrl = String.format("%s/api/hotspots/search?projectKey=%s&ps=100", sonarHostUrl, pk);
+                ResponseEntity<JsonNode> hotspotsResponse = restTemplate.exchange(hotspotsUrl, HttpMethod.GET, entity, JsonNode.class);
+                if (hotspotsResponse.getBody() != null) {
+                    JsonNode hotspotsBody = hotspotsResponse.getBody();
+                    JsonNode hotspotsArray = hotspotsBody.path("hotspots");
+                    int totalFromApi = hotspotsBody.path("total").asInt(0);
+                    int count = hotspotsArray.isArray() ? hotspotsArray.size() : 0;
+                    result.put("total_hotspots", Math.max(totalFromApi, count));
+                    result.put("hotspots", hotspotsArray);
+                }
+            } catch (Exception e) {
+                log.warn("⚠️ Hotspots non récupérés (projectKey={}): {}", pk, e.getMessage());
+            }
+
+            // Quality Gate
+            try {
+                String qualityGateUrl = String.format("%s/api/qualitygates/project_status?projectKey=%s", sonarHostUrl, pk);
+                ResponseEntity<JsonNode> qualityGateResponse = restTemplate.exchange(qualityGateUrl, HttpMethod.GET, entity, JsonNode.class);
+                if (qualityGateResponse.getBody() != null && qualityGateResponse.getBody().has("projectStatus")) {
+                    JsonNode projectStatus = qualityGateResponse.getBody().get("projectStatus");
+                    result.put("quality_gate", normalizeQualityGateStatus(projectStatus));
+                }
+            } catch (Exception e) {
+                log.warn("⚠️ Quality Gate non récupéré (projectKey={}): {}", pk, e.getMessage());
+            }
+
+            return result;
+        } catch (Exception e) {
+            log.warn("⚠️ Erreur récupération SonarQube results (projectKey={}, branch={}): {}", projectKey, branch, e.getMessage());
+            return Collections.emptyMap();
+        }
+    }
+
+    /**
      * Récupère le statut du Quality Gate global.
      */
     public Map<String, Object> getQualityGateStatus() {

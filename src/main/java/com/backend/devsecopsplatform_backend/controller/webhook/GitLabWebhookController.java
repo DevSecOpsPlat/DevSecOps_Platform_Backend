@@ -4,6 +4,7 @@ import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
 import com.backend.devsecopsplatform_backend.entity.PipelineStatus;
 import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
 import com.backend.devsecopsplatform_backend.service.PipelineStageSyncService;
+import com.backend.devsecopsplatform_backend.service.finding.FindingIngestionService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
@@ -27,6 +28,7 @@ public class GitLabWebhookController {
 
     private final PipelineExecutionRepository pipelineExecutionRepository;
     private final PipelineStageSyncService pipelineStageSyncService;
+    private final FindingIngestionService findingIngestionService;
     private final ObjectMapper objectMapper;
 
     @Value("${gitlab.webhook.secret:}")
@@ -124,6 +126,16 @@ public class GitLabWebhookController {
             if (newStatus == PipelineStatus.SUCCESS || newStatus == PipelineStatus.FAILED
                     || newStatus == PipelineStatus.CANCELED || newStatus == PipelineStatus.SKIPPED) {
                 pipelineStageSyncService.syncStagesForPipeline(pipelineId);
+
+                // 5. Ingestion findings (asynchrone) depuis aggregate-report artifacts
+                // Important: le webhook doit rester rapide, on ne bloque pas la réponse.
+                java.util.concurrent.CompletableFuture.runAsync(() -> {
+                    try {
+                        findingIngestionService.ingestFromAggregateArtifacts(pipelineId);
+                    } catch (Exception e) {
+                        log.warn("⚠️ Ingestion findings échouée pour pipeline {}: {}", pipelineId, e.getMessage());
+                    }
+                });
             }
         } else {
             log.warn("⚠️ Pipeline #{} non trouvé en base!", pipelineId);

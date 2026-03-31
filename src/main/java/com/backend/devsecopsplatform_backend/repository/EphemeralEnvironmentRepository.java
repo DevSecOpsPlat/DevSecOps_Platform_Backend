@@ -42,4 +42,8 @@ public interface EphemeralEnvironmentRepository extends JpaRepository<EphemeralE
         List<EphemeralEnvironment> results = findByUserOrderByCreatedAtDesc(user, PageRequest.of(0, 1));
         return results.isEmpty() ? null : results.get(0);
     }
+
+    /** Pour fetch fichier source (join fetch application → gitRepositoryUrl + token). */
+    @Query("select distinct e from EphemeralEnvironment e join fetch e.application where e.id = :id")
+    Optional<EphemeralEnvironment> findByIdWithApplication(@Param("id") UUID id);
 }

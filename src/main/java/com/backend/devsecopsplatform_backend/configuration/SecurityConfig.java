@@ -14,6 +14,7 @@ import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+import org.springframework.http.HttpMethod;
 import org.springframework.web.cors.CorsConfiguration;
 import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
 import org.springframework.web.filter.CorsFilter;
@@ -27,6 +28,7 @@ import java.util.List;
 public class SecurityConfig {
     private final CustomUserDetailsService customUserDetailsService;
     private final JwtUtils jwtUtils;
+    private final SecurityExceptionHandlers securityExceptionHandlers;
 
     @Bean
     public PasswordEncoder passwordEncoder() {
@@ -61,7 +63,15 @@ public class SecurityConfig {
                 .cors(cors -> cors.configure(http))
                 .csrf(AbstractHttpConfigurer::disable)
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                .exceptionHandling(ex -> ex
+                        .authenticationEntryPoint(securityExceptionHandlers)
+                        .accessDeniedHandler(securityExceptionHandlers)
+                )
                 .authorizeHttpRequests(auth -> auth
+                        // CORS preflight (OPTIONS) doit toujours passer
+                        .requestMatchers(HttpMethod.OPTIONS, "/**").permitAll()
+                        // Endpoint error Spring (évite 401 sur /error en cas d'exception 500)
+                        .requestMatchers("/error", "/projet/error").permitAll()
                         .requestMatchers("/auth/**", "/v3/api-docs/**", "/swagger-ui/**", "/swagger-ui.html").permitAll()
                         .requestMatchers("/projet/auth/**", "/projet/v3/api-docs/**", "/projet/swagger-ui/**", "/projet/swagger-ui.html").permitAll()
                         // Déploiement : nécessite un JWT (on a besoin du user courant en service)
@@ -72,6 +82,8 @@ public class SecurityConfig {
                         .requestMatchers("/api/sonarqube/**", "/projet/api/sonarqube/**").authenticated()
                         // API IA (analyse d'artifacts : vulnérabilités + remédiations)
                         .requestMatchers("/api/ai/**", "/projet/api/ai/**").authenticated()
+                        // API Findings (dashboard vulnérabilités centralisé)
+                        .requestMatchers("/api/findings/**", "/projet/api/findings/**").authenticated()
                         // Webhook GitLab (appelé par GitLab, pas par le front)
                         .requestMatchers("/api/webhooks/**", "/projet/api/webhooks/**").permitAll()
                         // Administration : réservé aux admins authentifiés

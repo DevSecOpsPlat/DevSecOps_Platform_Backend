@@ -35,4 +35,13 @@ public interface PipelineExecutionRepository extends JpaRepository<PipelineExecu
 
     @Query("SELECT pe FROM PipelineExecution pe WHERE pe.environment IN :envs ORDER BY pe.createdAt DESC")
     List<PipelineExecution> findByEnvironmentInOrderByCreatedAtDesc(@Param("envs") List<EphemeralEnvironment> envs, Pageable pageable);
+
+    @Query("""
+            select pe.gitlabPipelineId
+            from PipelineExecution pe
+            where pe.environment.id = :envId
+              and pe.gitlabPipelineId is not null
+            order by pe.createdAt desc
+            """)
+    List<Long> findGitlabPipelineIdsByEnvironmentIdOrderByCreatedAtDesc(@Param("envId") UUID envId, Pageable pageable);
 }
