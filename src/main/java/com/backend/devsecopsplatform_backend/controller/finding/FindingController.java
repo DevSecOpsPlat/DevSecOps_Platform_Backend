@@ -202,6 +202,7 @@ public class FindingController {
         sb.append("installedVersion: ").append(nullSafe(f.getInstalledVersion())).append("\n");
         sb.append("fixedVersion: ").append(nullSafe(f.getFixedVersion())).append("\n");
         if (occ != null) {
+            sb.append("jobName: ").append(nullSafe(occ.getJobName())).append("\n");
             sb.append("artifactPath: ").append(nullSafe(occ.getArtifactPath())).append("\n");
             if (occ.getEvidenceJson() != null && !occ.getEvidenceJson().isEmpty()) {
                 try {

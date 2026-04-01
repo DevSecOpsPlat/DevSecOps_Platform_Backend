@@ -46,6 +46,7 @@ public class AiAnalysisService {
     private static final int MAX_CHAT_MESSAGE_CHARS = 10_000;
 
     private final ObjectMapper objectMapper;
+    private final PlaybookRagService playbookRagService;
 
     public record ChatTurn(String role, String content) {}
 
@@ -209,6 +210,7 @@ public class AiAnalysisService {
 
     private String buildFindingRemediationPrompt(String findingContext, String codeSnippet, boolean secretOrCredentialFinding) {
         String secretRules = remediationSecretRulesAppendix(secretOrCredentialFinding);
+        String playbooksBlock = buildPlaybooksBlockForPrompt(findingContext, codeSnippet);
 
         if (useDeepSeekStyleRemediationPrompt()) {
             String snippetSection = codeSnippet.isBlank()
@@ -216,6 +218,8 @@ public class AiAnalysisService {
                     : "\nCode concerné :\n```\n%s\n```\n".formatted(codeSnippet);
             return """
                     Tu es un expert en sécurité. Analyse ce problème et donne une solution précise.
+
+                    %s
 
                     %s
 
@@ -234,7 +238,7 @@ public class AiAnalysisService {
                     Réponds UNIQUEMENT avec un JSON valide UTF-8, sans texte avant ou après, sans markdown, exactement aux clés :
                     {"problemSummary":"...","impact":"...","location":"...","remediationSteps":["..."],"suggestedPatch":"...","fullFileRewrite":"","verificationHints":["..."],"verificationCommands":["..."]}
                     (verificationCommands = commandes shell sur machine locale si pertinent ; sinon [].)
-                    """.formatted(REMEDIATION_PLATFORM_AUDIENCE, secretRules, findingContext, snippetSection);
+                    """.formatted(REMEDIATION_PLATFORM_AUDIENCE, secretRules, playbooksBlock, findingContext, snippetSection);
         }
 
         String snippetSection = codeSnippet.isBlank()
@@ -253,8 +257,11 @@ public class AiAnalysisService {
 
                 %s
 
+                %s
+
                 Tâche :
-                1) Expliquer clairement le problème et l'impact (ce qu'un attaquant pourrait faire).
+                1) Expliquer clairement le problème et l'impact.
+                   - Si scanType=LICENSE : parler conformité/licence (pas d'attaquant, pas de sécurité), et dire explicitement si la licence est permissive (MIT/Apache/BSD) donc souvent OK selon politique.
                 2) Préciser où ça se situe (fichier/ligne si présents, sinon package/CVE).
                 3) Donner des étapes de remédiation que l'utilisateur peut faire sans accès pipeline : édition des fichiers du dépôt, commandes en local. Pour les findings SECRETS uniquement : rappeler variables d'environnement / secrets manager / fichiers .env non commités — pas pour SRI/HTML.
                 4) Proposer une correction sous forme de patch : pour SCA = commande de mise à jour locale ; pour code/markup = extrait corrigé ; pour secrets = placeholders + où stocker la valeur (hors dépôt).
@@ -263,6 +270,7 @@ public class AiAnalysisService {
                 7) verificationCommands : commandes sur la machine du développeur (npm, mvn, openssl, grep, build…). Ne pas imposer Semgrep/pipeline CI comme seule voie.
 
                 Exigences de détail (obligatoire — le développeur doit pouvoir corriger sans deviner) :
+                - Pour scanType=LICENSE : ne jamais inventer un scénario d'attaque. L'impact est légal/compliance. Si la licence est MIT/Apache/BSD et aucune politique n'interdit, proposer "documenter / accepter" plutôt que "remplacer".
                 - remediationSteps : tableau de 4 à 8 chaînes ; chaque chaîne = UNE étape précise (quoi modifier, avec quel outil ou quelle syntaxe). Interdit : une seule phrase vague du type « inclure le hash en base64 dans integrity » sans expliquer comment obtenir le hash et comment rédiger l'attribut. Interdit : « mettre integrity dans les variables d'environnement ».
                 - Exemples concrets : au moins une commande OU un fragment de code/HTML/config réel dans suggestedPatch ou réparti dans les étapes (ex. SRI : `openssl dgst -sha384 -binary fichier.css | openssl enc -base64` ou équivalent + ligne `<link rel="stylesheet" href="..." integrity="sha384-..." crossorigin="anonymous">`).
                 - suggestedPatch : si le finding concerne du code ou du markup, fournir un extrait corrigé copiable (même court) plutôt que de le laisser vide.
@@ -275,7 +283,22 @@ public class AiAnalysisService {
                 %s
 
                 %s
-                """.formatted(REMEDIATION_PLATFORM_AUDIENCE, secretRules, findingContext, snippetSection);
+                """.formatted(REMEDIATION_PLATFORM_AUDIENCE, secretRules, playbooksBlock, findingContext, snippetSection);
+    }
+
+    private String buildPlaybooksBlockForPrompt(String findingContext, String codeSnippet) {
+        String combined = (findingContext == null ? "" : findingContext) + "\n\n" + (codeSnippet == null ? "" : codeSnippet);
+        List<String> hits = playbookRagService.retrievePlaybooks(combined, 2);
+        if (hits.isEmpty()) {
+            return "Playbooks (références) : (aucun playbook spécifique sélectionné)\n";
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("Playbooks (références — appliquer en priorité si pertinent) :\n");
+        for (int i = 0; i < hits.size(); i++) {
+            sb.append("\n--- PLAYBOOK ").append(i + 1).append(" ---\n");
+            sb.append(hits.get(i)).append("\n");
+        }
+        return sb.toString();
     }
 
     /**
@@ -417,11 +440,14 @@ public class AiAnalysisService {
 
                 """ : "";
 
+        String playbooks = buildPlaybooksBlockForChat(findingContext, codeSnippetSection);
         return """
                 Tu es un assistant pédagogique sécurité / DevSecOps. Tu aides un développeur qui consulte un finding dans une application (tableau de bord sécurité) : il voit les résultats de scan sur son projet. N'invente pas de CVE ni de chemins absents du contexte.
 
                 Contexte utilisateur : en général il n'a pas accès pour modifier les pipelines CI/CD depuis cet écran ; il peut éditer son code en local, pousser, et relancer une analyse depuis l'application. Ne lui impose pas « modifie ton pipeline GitLab », « ajoute une étape Semgrep au CI » ou des hypothèses d'accès qu'il n'a peut-être pas. Pour SRI (integrity sur link/script), ne dis pas de passer par des variables d'environnement : c'est dans le HTML ou les templates du dépôt.
                 Le bloc « TECHNOLOGIES_DEDUITES » en tête du contexte résume la stack probable du projet testé : tiens-en compte pour les commandes et exemples (npm vs mvn vs pip…).
+
+                %s
 
                 Contexte du finding (métadonnées + evidence tronquée) :
                 %s
@@ -439,7 +465,16 @@ public class AiAnalysisService {
                 - Formate toujours tes réponses en Markdown lisible : titres courts avec ## si plusieurs parties, listes à puces ou numérotées, paragraphes séparés par une ligne vide.
                 - Pour toute commande shell (openssl, npm, git, curl, docker, etc.) ou sortie terminal : mets-la dans un bloc de code avec le langage bash, par exemple trois backticks puis bash puis la commande puis trois backticks — ne colle pas les commandes dans le corps du texte sans bloc.
                 - Réponses concises ; ne pas répéter tout le contexte à chaque tour.
-                """.formatted(findingContext, remediationBlock, codeSnippetSection, secretChat);
+                """.formatted(playbooks, findingContext, remediationBlock, codeSnippetSection, secretChat);
+    }
+
+    private String buildPlaybooksBlockForChat(String findingContext, String codeSnippetSection) {
+        String combined = (findingContext == null ? "" : findingContext) + "\n\n" + (codeSnippetSection == null ? "" : codeSnippetSection);
+        List<String> hits = playbookRagService.retrievePlaybooks(combined, 1);
+        if (hits.isEmpty()) {
+            return "";
+        }
+        return "Références (playbook sélectionné) :\n" + hits.get(0).trim() + "\n";
     }
 
     private List<java.util.Map<String, String>> buildChatMessagesForApi(String systemContent, List<ChatTurn> turns) {
@@ -505,7 +540,7 @@ public class AiAnalysisService {
             return callGroq(prompt);
         } catch (Exception e) {
             if (isGroqQuotaExceeded(e)) {
-                log.warn("Quota Groq dépassé (429) → fallback Ollama (model={})", ollamaModel);
+                log.warn("[AI][SWITCH] Groq quota (429) → Ollama (model={})", ollamaModel);
                 return callOllama(prompt);
             }
             throw e;
@@ -531,7 +566,7 @@ public class AiAnalysisService {
             return callGroqChat(messages);
         } catch (Exception e) {
             if (isGroqQuotaExceeded(e)) {
-                log.warn("Quota Groq chat dépassé (429) → fallback Ollama (model={})", ollamaModel);
+                log.warn("[AI][SWITCH] Groq chat quota (429) → Ollama (model={})", ollamaModel);
                 return callOllamaChat(messages);
             }
             throw e;
