@@ -84,6 +84,8 @@ public class SecurityConfig {
                         .requestMatchers("/api/ai/**", "/projet/api/ai/**").authenticated()
                         // API Findings (dashboard vulnérabilités centralisé)
                         .requestMatchers("/api/findings/**", "/projet/api/findings/**").authenticated()
+                        // API Reports (PDF export)
+                        .requestMatchers("/api/reports/**", "/projet/api/reports/**").authenticated()
                         // Webhook GitLab (appelé par GitLab, pas par le front)
                         .requestMatchers("/api/webhooks/**", "/projet/api/webhooks/**").permitAll()
                         // Administration : réservé aux admins authentifiés
