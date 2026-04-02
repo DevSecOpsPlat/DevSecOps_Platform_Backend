@@ -31,4 +31,19 @@ public class FindingAiRemediationResponse {
     private String rawModelOutput;
     /** MANUAL (collé par l'utilisateur), GITHUB, GITLAB, NONE — origine du contexte code envoyé au modèle. */
     private String codeContextSource;
+
+    /** Provider réellement utilisé pour cet appel (groq | ollama | gemini | huggingface | ...). */
+    private String aiProviderUsed;
+    /** Nom/id du modèle réellement utilisé (ex: llama3-70b, deepseek-coder, gemini-1.5-pro...). */
+    private String aiModelUsed;
+    /**
+     * Indique si un fallback automatique a été déclenché (ex: quota/429 Groq → Ollama).
+     * Sert à expliquer à l'utilisateur pourquoi le modèle affiché peut changer.
+     */
+    private Boolean quotaFallbackUsed;
+    /**
+     * Etiquette simple pour l'UI (ex: HIGH). Demandé pour expliciter le “nouveau modèle” en cas de quota atteint.
+     * Valeurs typiques : DEFAULT | HIGH.
+     */
+    private String aiModelTier;
 }

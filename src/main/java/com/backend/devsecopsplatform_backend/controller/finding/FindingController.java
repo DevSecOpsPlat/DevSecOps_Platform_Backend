@@ -55,10 +55,27 @@ public class FindingController {
     @GetMapping("/detail/{findingId}")
     public ResponseEntity<Map<String, Object>> getDetail(
             @PathVariable UUID findingId,
-            @RequestParam UUID envId
+            @RequestParam(required = false) UUID envId,
+            @RequestParam(required = false) UUID appId
     ) {
-        if (findingOccurrenceRepository.countByFinding_IdAndPipelineExecution_Environment_Id(findingId, envId) == 0) {
-            return ResponseEntity.notFound().build();
+        UUID effectiveEnvId = envId;
+        if (effectiveEnvId != null) {
+            if (findingOccurrenceRepository.countByFinding_IdAndPipelineExecution_Environment_Id(findingId, effectiveEnvId) == 0) {
+                // Fallback: si la liste vient du scope application (env différent), on accepte via appId.
+                effectiveEnvId = null;
+            }
+        }
+        if (effectiveEnvId == null && appId != null) {
+            if (findingOccurrenceRepository.countByFindingIdAndApplicationId(findingId, appId) == 0) {
+                return ResponseEntity.notFound().build();
+            }
+            var occs = findingOccurrenceRepository.findByFindingIdAndApplicationIdOrderByObservedAtDesc(findingId, appId);
+            if (!occs.isEmpty() && occs.get(0).getPipelineExecution() != null && occs.get(0).getPipelineExecution().getEnvironment() != null) {
+                effectiveEnvId = occs.get(0).getPipelineExecution().getEnvironment().getId();
+            }
+        }
+        if (effectiveEnvId == null) {
+            return ResponseEntity.badRequest().body(Map.of("error", "envId ou appId requis"));
         }
         Finding f = findingRepository.findById(findingId).orElse(null);
         if (f == null) {
@@ -92,7 +109,8 @@ public class FindingController {
             body.put("lastJobName", occ.getJobName());
             body.put("lastObservedAt", occ.getObservedAt());
         }
-        var snippetFetch = sourceSnippetFetcherService.tryFetchSnippet(envId, f.getFilePath(), f.getLineStart(), f.getLineEnd());
+        body.put("effectiveEnvId", effectiveEnvId);
+        var snippetFetch = sourceSnippetFetcherService.tryFetchSnippet(effectiveEnvId, f.getFilePath(), f.getLineStart(), f.getLineEnd());
         if (snippetFetch.isPresent()) {
             body.put("codeSnippet", snippetFetch.get().content());
             body.put("codeContextSource", snippetFetch.get().source());
@@ -109,18 +127,34 @@ public class FindingController {
     @PostMapping("/detail/{findingId}/ai-remediation")
     public ResponseEntity<FindingAiRemediationResponse> aiRemediation(
             @PathVariable UUID findingId,
-            @RequestParam UUID envId,
+            @RequestParam(required = false) UUID envId,
+            @RequestParam(required = false) UUID appId,
             @RequestBody(required = false) FindingAiRemediationRequest request
     ) {
-        if (findingOccurrenceRepository.countByFinding_IdAndPipelineExecution_Environment_Id(findingId, envId) == 0) {
-            return ResponseEntity.notFound().build();
+        UUID effectiveEnvId = envId;
+        if (effectiveEnvId != null) {
+            if (findingOccurrenceRepository.countByFinding_IdAndPipelineExecution_Environment_Id(findingId, effectiveEnvId) == 0) {
+                effectiveEnvId = null;
+            }
+        }
+        if (effectiveEnvId == null && appId != null) {
+            if (findingOccurrenceRepository.countByFindingIdAndApplicationId(findingId, appId) == 0) {
+                return ResponseEntity.notFound().build();
+            }
+            var occs = findingOccurrenceRepository.findByFindingIdAndApplicationIdOrderByObservedAtDesc(findingId, appId);
+            if (!occs.isEmpty() && occs.get(0).getPipelineExecution() != null && occs.get(0).getPipelineExecution().getEnvironment() != null) {
+                effectiveEnvId = occs.get(0).getPipelineExecution().getEnvironment().getId();
+            }
+        }
+        if (effectiveEnvId == null) {
+            return ResponseEntity.badRequest().build();
         }
         Finding f = findingRepository.findById(findingId).orElse(null);
         if (f == null) {
             return ResponseEntity.notFound().build();
         }
         FindingOccurrence occ = findingOccurrenceRepository.findFirstByFinding_IdOrderByObservedAtDesc(findingId).orElse(null);
-        Application app = resolveApplicationForEnv(envId);
+        Application app = resolveApplicationForEnv(effectiveEnvId);
 
         String snippet = "";
         String codeContextSource = "NONE";
@@ -128,7 +162,7 @@ public class FindingController {
             snippet = request.getCodeSnippet().strip();
             codeContextSource = "MANUAL";
         } else {
-            var fetched = sourceSnippetFetcherService.tryFetchSnippet(envId, f.getFilePath(), f.getLineStart(), f.getLineEnd());
+            var fetched = sourceSnippetFetcherService.tryFetchSnippet(effectiveEnvId, f.getFilePath(), f.getLineStart(), f.getLineEnd());
             if (fetched.isPresent()) {
                 snippet = fetched.get().content();
                 codeContextSource = fetched.get().source();
@@ -146,21 +180,37 @@ public class FindingController {
     @PostMapping("/detail/{findingId}/ai-chat")
     public ResponseEntity<Map<String, String>> findingChat(
             @PathVariable UUID findingId,
-            @RequestParam UUID envId,
+            @RequestParam(required = false) UUID envId,
+            @RequestParam(required = false) UUID appId,
             @Valid @RequestBody FindingChatRequest request
     ) {
-        if (findingOccurrenceRepository.countByFinding_IdAndPipelineExecution_Environment_Id(findingId, envId) == 0) {
-            return ResponseEntity.notFound().build();
+        UUID effectiveEnvId = envId;
+        if (effectiveEnvId != null) {
+            if (findingOccurrenceRepository.countByFinding_IdAndPipelineExecution_Environment_Id(findingId, effectiveEnvId) == 0) {
+                effectiveEnvId = null;
+            }
+        }
+        if (effectiveEnvId == null && appId != null) {
+            if (findingOccurrenceRepository.countByFindingIdAndApplicationId(findingId, appId) == 0) {
+                return ResponseEntity.notFound().build();
+            }
+            var occs = findingOccurrenceRepository.findByFindingIdAndApplicationIdOrderByObservedAtDesc(findingId, appId);
+            if (!occs.isEmpty() && occs.get(0).getPipelineExecution() != null && occs.get(0).getPipelineExecution().getEnvironment() != null) {
+                effectiveEnvId = occs.get(0).getPipelineExecution().getEnvironment().getId();
+            }
+        }
+        if (effectiveEnvId == null) {
+            return ResponseEntity.badRequest().build();
         }
         Finding f = findingRepository.findById(findingId).orElse(null);
         if (f == null) {
             return ResponseEntity.notFound().build();
         }
         FindingOccurrence occ = findingOccurrenceRepository.findFirstByFinding_IdOrderByObservedAtDesc(findingId).orElse(null);
-        Application app = resolveApplicationForEnv(envId);
+        Application app = resolveApplicationForEnv(effectiveEnvId);
 
         String snippetBlock = "";
-        var chatSnippet = sourceSnippetFetcherService.tryFetchSnippet(envId, f.getFilePath(), f.getLineStart(), f.getLineEnd());
+        var chatSnippet = sourceSnippetFetcherService.tryFetchSnippet(effectiveEnvId, f.getFilePath(), f.getLineStart(), f.getLineEnd());
         if (chatSnippet.isPresent()) {
             snippetBlock = chatSnippet.get().content();
         }
@@ -283,7 +333,9 @@ public class FindingController {
             @RequestParam(defaultValue = "0") int page,
             @RequestParam(defaultValue = "50") int size,
             @RequestParam(required = false) String tool,
-            @RequestParam(required = false) String severity
+            @RequestParam(required = false) String severity,
+            @RequestParam(required = false) String scanType,
+            @RequestParam(required = false) String status
     ) {
         String toolParam = (tool != null && !tool.isBlank()) ? tool.trim() : null;
         Severity severityEnum = null;
@@ -294,20 +346,146 @@ public class FindingController {
                 return ResponseEntity.badRequest().build();
             }
         }
-        if (toolParam == null && severityEnum == null) {
+        ScanType scanTypeEnum = null;
+        if (scanType != null && !scanType.isBlank()) {
+            try {
+                scanTypeEnum = ScanType.valueOf(scanType.trim().toUpperCase());
+            } catch (IllegalArgumentException e) {
+                return ResponseEntity.badRequest().build();
+            }
+        }
+        FindingStatus statusEnum = null;
+        if (status != null && !status.isBlank()) {
+            try {
+                statusEnum = FindingStatus.valueOf(status.trim().toUpperCase());
+            } catch (IllegalArgumentException e) {
+                return ResponseEntity.badRequest().build();
+            }
+        }
+        if (toolParam == null && severityEnum == null && scanTypeEnum == null && statusEnum == null) {
             return ResponseEntity.ok(findingRepository.findByEnvironmentId(envId, PageRequest.of(page, Math.min(size, 200))));
         }
+        // NOTE: on n’applique pas status ici (query env-filtered ne le supporte pas) → fallback : filtre "status"
+        // se fait via la vue "by-application" (recommandée quand envId change à chaque test).
         return ResponseEntity.ok(findingRepository.findByEnvironmentIdFiltered(
-                envId, toolParam, severityEnum, PageRequest.of(page, Math.min(size, 200))));
+                envId, toolParam, severityEnum, scanTypeEnum, PageRequest.of(page, Math.min(size, 200))));
+    }
+
+    /**
+     * Liste paginée au niveau application (utile si chaque test crée un nouvel environnement).
+     * Filtrage optionnel: branch/tool/severity/scanType/status.
+     */
+    @GetMapping("/by-application/{appId}")
+    public ResponseEntity<Page<?>> listByApplication(
+            @PathVariable UUID appId,
+            @RequestParam(required = false) String branch,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "50") int size,
+            @RequestParam(required = false) String tool,
+            @RequestParam(required = false) String severity,
+            @RequestParam(required = false) String scanType,
+            @RequestParam(required = false) String status
+    ) {
+        String branchParam = (branch != null && !branch.isBlank()) ? branch.trim() : null;
+        String toolParam = (tool != null && !tool.isBlank()) ? tool.trim() : null;
+
+        Severity severityEnum = null;
+        if (severity != null && !severity.isBlank()) {
+            try {
+                severityEnum = Severity.valueOf(severity.trim().toUpperCase());
+            } catch (IllegalArgumentException e) {
+                return ResponseEntity.badRequest().build();
+            }
+        }
+        ScanType scanTypeEnum = null;
+        if (scanType != null && !scanType.isBlank()) {
+            try {
+                scanTypeEnum = ScanType.valueOf(scanType.trim().toUpperCase());
+            } catch (IllegalArgumentException e) {
+                return ResponseEntity.badRequest().build();
+            }
+        }
+        FindingStatus statusEnum = null;
+        if (status != null && !status.isBlank()) {
+            try {
+                statusEnum = FindingStatus.valueOf(status.trim().toUpperCase());
+            } catch (IllegalArgumentException e) {
+                return ResponseEntity.badRequest().build();
+            }
+        }
+
+        return ResponseEntity.ok(findingRepository.findByApplicationFiltered(
+                appId,
+                branchParam,
+                toolParam,
+                severityEnum,
+                scanTypeEnum,
+                statusEnum,
+                PageRequest.of(page, Math.min(size, 200))
+        ));
     }
 
     @GetMapping("/by-pipeline/{pipelineId}")
     public ResponseEntity<Page<?>> listByPipeline(
             @PathVariable Long pipelineId,
             @RequestParam(defaultValue = "0") int page,
-            @RequestParam(defaultValue = "50") int size
+            @RequestParam(defaultValue = "50") int size,
+            @RequestParam(required = false) String tool,
+            @RequestParam(required = false) String severity,
+            @RequestParam(required = false) String scanType,
+            @RequestParam(required = false) String status
     ) {
-        return ResponseEntity.ok(findingRepository.findByGitlabPipelineId(pipelineId, PageRequest.of(page, Math.min(size, 200))));
+        String toolParam = (tool != null && !tool.isBlank()) ? tool.trim() : null;
+        Severity severityEnum = null;
+        if (severity != null && !severity.isBlank()) {
+            try {
+                severityEnum = Severity.valueOf(severity.trim().toUpperCase());
+            } catch (IllegalArgumentException e) {
+                return ResponseEntity.badRequest().build();
+            }
+        }
+        ScanType scanTypeEnum = null;
+        if (scanType != null && !scanType.isBlank()) {
+            try {
+                scanTypeEnum = ScanType.valueOf(scanType.trim().toUpperCase());
+            } catch (IllegalArgumentException e) {
+                return ResponseEntity.badRequest().build();
+            }
+        }
+        FindingStatus statusEnum = null;
+        if (status != null && !status.isBlank()) {
+            try {
+                statusEnum = FindingStatus.valueOf(status.trim().toUpperCase());
+            } catch (IllegalArgumentException e) {
+                return ResponseEntity.badRequest().build();
+            }
+        }
+        if (toolParam == null && severityEnum == null && scanTypeEnum == null && statusEnum == null) {
+            return ResponseEntity.ok(findingRepository.findByGitlabPipelineId(pipelineId, PageRequest.of(page, Math.min(size, 200))));
+        }
+        return ResponseEntity.ok(findingRepository.findByGitlabPipelineIdFiltered(
+                pipelineId, toolParam, severityEnum, scanTypeEnum, statusEnum, PageRequest.of(page, Math.min(size, 200))));
+    }
+
+    /**
+     * Résout des empreintes (ex. {@code trends.fixedFingerprints}) vers des findings du projet.
+     */
+    @GetMapping("/by-application/{appId}/fingerprints")
+    public ResponseEntity<List<Finding>> listByApplicationFingerprints(
+            @PathVariable UUID appId,
+            @RequestParam("fp") List<String> fp
+    ) {
+        if (fp == null || fp.isEmpty()) {
+            return ResponseEntity.ok(List.of());
+        }
+        if (fp.size() > 200) {
+            return ResponseEntity.badRequest().build();
+        }
+        List<String> cleaned = fp.stream().map(String::trim).filter(s -> !s.isEmpty()).distinct().toList();
+        if (cleaned.isEmpty()) {
+            return ResponseEntity.ok(List.of());
+        }
+        return ResponseEntity.ok(findingRepository.findDistinctByApplicationIdAndFingerprintIn(appId, cleaned));
     }
 
     /**
@@ -344,6 +522,42 @@ public class FindingController {
                 "byTool", byTool,
                 "byScanType", byScanType
         ));
+    }
+
+    /**
+     * Agrégats pour toute l’application (tous envs).
+     * Sans param {@code status} : tous les statuts. Sinon OPEN, FIXED, IGNORED, ACCEPTED_RISK.
+     */
+    @GetMapping("/stats/by-application/{appId}")
+    public ResponseEntity<Map<String, Object>> statsByApplication(
+            @PathVariable UUID appId,
+            @RequestParam(required = false) String status
+    ) {
+        FindingStatus st = null;
+        if (status != null && !status.isBlank() && !"ALL".equalsIgnoreCase(status.trim())) {
+            try {
+                st = FindingStatus.valueOf(status.trim().toUpperCase());
+            } catch (IllegalArgumentException e) {
+                return ResponseEntity.badRequest().build();
+            }
+        }
+        var bySeverity = toCountMap(
+                findingOccurrenceRepository.countDistinctFindingsBySeverityForApplication(appId, st));
+        var byTool = toCountMap(
+                findingOccurrenceRepository.countDistinctFindingsByToolForApplication(appId, st));
+        var byScanType = toCountMap(
+                findingOccurrenceRepository.countDistinctFindingsByScanTypeForApplication(appId, st));
+        long totalDistinct = bySeverity.values().stream().mapToLong(Long::longValue).sum();
+
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("applicationId", appId);
+        body.put("statusFilter", st == null ? "ALL" : st.name());
+        body.put("openDistinctTotal", totalDistinct);
+        body.put("distinctTotal", totalDistinct);
+        body.put("bySeverity", bySeverity);
+        body.put("byTool", byTool);
+        body.put("byScanType", byScanType);
+        return ResponseEntity.ok(body);
     }
 
     @GetMapping("/stats/by-pipeline/{pipelineId}")
@@ -396,6 +610,62 @@ public class FindingController {
         m.put("environmentId", envId);
         m.put("lastPipelineId", last);
         m.put("previousPipelineId", prev); // peut être null
+        m.put("newCount", newOnes.size());
+        m.put("fixedCount", fixed.size());
+        m.put("newFingerprints", newOnes);
+        m.put("fixedFingerprints", fixed);
+        return ResponseEntity.ok(m);
+    }
+
+    /**
+     * Compare les 2 derniers pipelines importés d'une application (en base) et renvoie:
+     * - new: fingerprints présents dans le dernier pipeline mais pas dans le précédent
+     * - fixed: fingerprints présents dans le précédent mais pas dans le dernier
+     *
+     * Utile quand chaque pipeline a son environnement (1:1), mais on veut l'évolution "projet".
+     * Optionnel: filtrer par branche Git (si env.gitBranch est renseignée).
+     */
+    @GetMapping("/trends/by-application/{appId}")
+    public ResponseEntity<Map<String, Object>> trendsByApplication(
+            @PathVariable UUID appId,
+            @RequestParam(required = false) String branch
+    ) {
+        String br = branch != null && !branch.isBlank() ? branch.trim() : null;
+        java.util.List<Long> ids = (br == null)
+                ? pipelineExecutionRepository.findGitlabPipelineIdsByApplicationIdOrderByCreatedAtDesc(
+                    appId, org.springframework.data.domain.PageRequest.of(0, 2))
+                : pipelineExecutionRepository.findGitlabPipelineIdsByApplicationIdAndBranchOrderByCreatedAtDesc(
+                    appId, br, org.springframework.data.domain.PageRequest.of(0, 2));
+
+        if (ids.isEmpty()) {
+            java.util.Map<String, Object> m = new java.util.HashMap<>();
+            m.put("applicationId", appId);
+            m.put("branch", br);
+            m.put("lastPipelineId", null);
+            m.put("previousPipelineId", null);
+            m.put("newCount", 0);
+            m.put("fixedCount", 0);
+            m.put("newFingerprints", java.util.List.of());
+            m.put("fixedFingerprints", java.util.List.of());
+            return ResponseEntity.ok(m);
+        }
+
+        Long last = ids.get(0);
+        Long prev = ids.size() > 1 ? ids.get(1) : null;
+
+        Set<String> lastSet = new HashSet<>(findingOccurrenceRepository.findDistinctFingerprintsByPipeline(last));
+        Set<String> prevSet = prev != null ? new HashSet<>(findingOccurrenceRepository.findDistinctFingerprintsByPipeline(prev)) : Set.of();
+
+        Set<String> newOnes = new HashSet<>(lastSet);
+        newOnes.removeAll(prevSet);
+        Set<String> fixed = new HashSet<>(prevSet);
+        fixed.removeAll(lastSet);
+
+        java.util.Map<String, Object> m = new java.util.HashMap<>();
+        m.put("applicationId", appId);
+        m.put("branch", br);
+        m.put("lastPipelineId", last);
+        m.put("previousPipelineId", prev);
         m.put("newCount", newOnes.size());
         m.put("fixedCount", fixed.size());
         m.put("newFingerprints", newOnes);

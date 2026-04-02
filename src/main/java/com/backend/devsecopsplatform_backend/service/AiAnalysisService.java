@@ -116,7 +116,7 @@ public class AiAnalysisService {
         String prompt = buildPrompt(content, sourceHint);
 
         try {
-            String jsonResponse = callAiProviderWithFallback(provider, prompt);
+            String jsonResponse = callAiProviderWithFallbackResult(provider, prompt).text();
             return parseGeminiResponse(jsonResponse);
         } catch (Exception e) {
             log.error("Erreur analyse IA ({}): {}", provider, e.getMessage());
@@ -136,12 +136,20 @@ public class AiAnalysisService {
         if (!aiEnabled) {
             return FindingAiRemediationResponse.builder()
                     .problemSummary("Analyse IA désactivée (ai.enabled=true).")
+                    .aiProviderUsed("disabled")
+                    .aiModelUsed(null)
+                    .quotaFallbackUsed(false)
+                    .aiModelTier("DEFAULT")
                     .build();
         }
         String provider = (aiProvider != null) ? aiProvider.strip().toLowerCase() : "groq";
         if (!isProviderConfigured(provider)) {
             return FindingAiRemediationResponse.builder()
                     .problemSummary("Provider '" + provider + "' non configuré. " + getConfigHint(provider))
+                    .aiProviderUsed(provider)
+                    .aiModelUsed(resolveModelName(provider))
+                    .quotaFallbackUsed(false)
+                    .aiModelTier("DEFAULT")
                     .build();
         }
 
@@ -156,14 +164,36 @@ public class AiAnalysisService {
 
         String prompt = buildFindingRemediationPrompt(ctx, snippet, isLikelySecretOrCredentialFinding(ctx));
         try {
-            String jsonResponse = callAiProviderWithFallback(provider, prompt);
-            return parseFindingRemediationResponse(jsonResponse);
+            AiCallResult r = callAiProviderWithFallbackResult(provider, prompt);
+            FindingAiRemediationResponse out = parseFindingRemediationResponse(r.text());
+            return out.toBuilder()
+                    .aiProviderUsed(r.providerUsed())
+                    .aiModelUsed(r.modelUsed())
+                    .quotaFallbackUsed(r.quotaFallbackUsed())
+                    .aiModelTier(r.quotaFallbackUsed() ? "HIGH" : "DEFAULT")
+                    .build();
         } catch (Exception e) {
             log.error("Erreur remédiation finding IA ({}): {}", provider, e.getMessage());
             return FindingAiRemediationResponse.builder()
                     .problemSummary(buildUserFriendlyErrorMessage(e, provider))
+                    .aiProviderUsed(provider)
+                    .aiModelUsed(resolveModelName(provider))
+                    .quotaFallbackUsed(false)
+                    .aiModelTier("DEFAULT")
                     .build();
         }
+    }
+
+    private record AiCallResult(String text, String providerUsed, String modelUsed, boolean quotaFallbackUsed) {}
+
+    private String resolveModelName(String provider) {
+        if (provider == null) return null;
+        return switch (provider) {
+            case "groq" -> groqModel;
+            case "ollama" -> ollamaModel;
+            case "gemini" -> geminiModel;
+            default -> null;
+        };
     }
 
     private String remediationSecretRulesAppendix(boolean secretOrCredentialFinding) {
@@ -532,16 +562,19 @@ public class AiAnalysisService {
     }
 
     /** Remédiation/artifact : Groq 429 → fallback Ollama pour cet appel. */
-    private String callAiProviderWithFallback(String provider, String prompt) throws Exception {
+    private AiCallResult callAiProviderWithFallbackResult(String provider, String prompt) throws Exception {
         if (!"groq".equals(provider)) {
-            return callAiProvider(provider, prompt);
+            String text = callAiProvider(provider, prompt);
+            return new AiCallResult(text, provider, resolveModelName(provider), false);
         }
         try {
-            return callGroq(prompt);
+            String text = callGroq(prompt);
+            return new AiCallResult(text, "groq", groqModel, false);
         } catch (Exception e) {
             if (isGroqQuotaExceeded(e)) {
                 log.warn("[AI][SWITCH] Groq quota (429) → Ollama (model={})", ollamaModel);
-                return callOllama(prompt);
+                String text = callOllama(prompt);
+                return new AiCallResult(text, "ollama", ollamaModel, true);
             }
             throw e;
         }

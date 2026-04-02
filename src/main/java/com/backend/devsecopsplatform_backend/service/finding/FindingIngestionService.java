@@ -61,6 +61,7 @@ public class FindingIngestionService {
         int parsedFiles = 0;
         int createdFindings = 0;
         int createdOccurrences = 0;
+        int autoFixedFindings = 0;
         List<String> parsed = new ArrayList<>();
 
         try (InputStream zipStream = gitLabService.downloadAllJobArtifacts(agg.getId());
@@ -154,14 +155,54 @@ public class FindingIngestionService {
             log.warn("⚠️ Ingestion Sonar ignorée (pipelineId={}): {}", pipelineId, e.getMessage());
         }
 
+        // Auto-FIX: si un finding (fingerprint) n’apparait plus dans ce pipeline,
+        // on le marque FIXED au niveau de l’application (même branche).
+        // Important: on ne peut pas comparer par envId car chaque test crée un env différent.
+        try {
+            if (createdOccurrences > 0 && execution.getEnvironment() != null && execution.getEnvironment().getApplication() != null) {
+                List<String> currentFingerprints = findingOccurrenceRepository.findDistinctFingerprintsByPipeline(pipelineId);
+                autoFixedFindings = autoFixFindingsForApplicationBranch(execution, currentFingerprints);
+            }
+        } catch (Exception e) {
+            log.warn("⚠️ Auto-FIX ignoré (pipelineId={}): {}", pipelineId, e.getMessage());
+        }
+
         return Map.of(
                 "pipelineId", pipelineId,
                 "job", AGGREGATE_JOB_NAME,
                 "parsedFiles", parsedFiles,
                 "parsed", parsed,
                 "createdFindings", createdFindings,
-                "createdOccurrences", createdOccurrences
+                "createdOccurrences", createdOccurrences,
+                "autoFixedFindings", autoFixedFindings
         );
+    }
+
+    private int autoFixFindingsForApplicationBranch(PipelineExecution execution, List<String> currentFingerprints) {
+        if (currentFingerprints == null || currentFingerprints.isEmpty()) return 0;
+        var env = execution.getEnvironment();
+        var app = env.getApplication();
+        if (env.getGitBranch() == null || env.getGitBranch().isBlank()) return 0;
+
+        List<Finding> toFix = findingRepository.findOpenFindingsForAppBranchNotInFingerprints(
+                app.getId(),
+                env.getGitBranch(),
+                FindingStatus.OPEN,
+                currentFingerprints
+        );
+        int fixed = 0;
+        for (Finding f : toFix) {
+            // Ne pas écraser les décisions manuelles.
+            if (f.getStatus() != FindingStatus.OPEN) continue;
+            f.setStatus(FindingStatus.FIXED);
+            findingRepository.save(f);
+            fixed++;
+        }
+        if (fixed > 0) {
+            log.info("[FINDINGS][AUTO-FIX] appId={} branch={} fixed={} (pipelineId={})",
+                    app.getId(), env.getGitBranch(), fixed, execution.getGitlabPipelineId());
+        }
+        return fixed;
     }
 
     private static byte[] readZipEntryBytes(ZipInputStream zis) throws Exception {

@@ -13,6 +13,7 @@ import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 @RestController
 @RequestMapping("/api/security/vulnerabilities")
@@ -24,27 +25,34 @@ public class SecurityVulnerabilitiesController {
     private final FindingOccurrenceRepository findingOccurrenceRepository;
 
     @GetMapping("/recent")
-    public ResponseEntity<List<Map<String, Object>>> recent(@RequestParam(defaultValue = "5") int limit) {
+    public ResponseEntity<List<Map<String, Object>>> recent(
+            @RequestParam(defaultValue = "5") int limit,
+            @RequestParam(required = false) UUID appId
+    ) {
         String username = currentUsername();
         int size = Math.max(1, Math.min(limit, 50));
 
-        List<FindingOccurrence> occs = findingOccurrenceRepository.findRecentForUsername(username, PageRequest.of(0, size));
+        List<FindingOccurrence> occs = appId == null
+                ? findingOccurrenceRepository.findRecentForUsername(username, PageRequest.of(0, size))
+                : findingOccurrenceRepository.findRecentForUsernameAndApplication(
+                        username, appId, PageRequest.of(0, size));
         List<Map<String, Object>> out = occs.stream().map(this::toDashboardItem).toList();
         return ResponseEntity.ok(out);
     }
 
     private Map<String, Object> toDashboardItem(FindingOccurrence occ) {
         Finding f = occ.getFinding();
-        return Map.of(
-                "id", f.getId(),
-                "title", f.getTitle() != null ? f.getTitle() : (f.getRuleId() != null ? f.getRuleId() : f.getFingerprint()),
-                "severity", f.getSeverity() != null ? f.getSeverity().name() : "MEDIUM",
-                "component", f.getPackageName() != null ? f.getPackageName() : (f.getFilePath() != null ? f.getFilePath() : "N/A"),
-                "version", f.getInstalledVersion() != null ? f.getInstalledVersion() : "",
-                "fixedVersion", f.getFixedVersion(),
-                "description", f.getDescription(),
-                "createdAt", occ.getObservedAt()
-        );
+        // Map.of(...) n'accepte pas les valeurs null -> utiliser une map mutable.
+        Map<String, Object> m = new java.util.LinkedHashMap<>();
+        m.put("id", f.getId());
+        m.put("title", f.getTitle() != null ? f.getTitle() : (f.getRuleId() != null ? f.getRuleId() : f.getFingerprint()));
+        m.put("severity", f.getSeverity() != null ? f.getSeverity().name() : "MEDIUM");
+        m.put("component", f.getPackageName() != null ? f.getPackageName() : (f.getFilePath() != null ? f.getFilePath() : "N/A"));
+        m.put("version", f.getInstalledVersion() != null ? f.getInstalledVersion() : "");
+        m.put("fixedVersion", f.getFixedVersion());
+        m.put("description", f.getDescription());
+        m.put("createdAt", occ.getObservedAt());
+        return m;
     }
 
     private String currentUsername() {

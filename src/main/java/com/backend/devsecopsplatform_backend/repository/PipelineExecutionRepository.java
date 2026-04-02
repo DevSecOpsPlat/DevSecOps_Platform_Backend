@@ -44,4 +44,32 @@ public interface PipelineExecutionRepository extends JpaRepository<PipelineExecu
             order by pe.createdAt desc
             """)
     List<Long> findGitlabPipelineIdsByEnvironmentIdOrderByCreatedAtDesc(@Param("envId") UUID envId, Pageable pageable);
+
+    @Query("""
+            select pe.gitlabPipelineId
+            from PipelineExecution pe
+            join pe.environment env
+            where env.application.id = :appId
+              and pe.gitlabPipelineId is not null
+            order by pe.createdAt desc
+            """)
+    List<Long> findGitlabPipelineIdsByApplicationIdOrderByCreatedAtDesc(
+            @Param("appId") UUID appId,
+            Pageable pageable
+    );
+
+    @Query("""
+            select pe.gitlabPipelineId
+            from PipelineExecution pe
+            join pe.environment env
+            where env.application.id = :appId
+              and (:branch is null or env.gitBranch = :branch)
+              and pe.gitlabPipelineId is not null
+            order by pe.createdAt desc
+            """)
+    List<Long> findGitlabPipelineIdsByApplicationIdAndBranchOrderByCreatedAtDesc(
+            @Param("appId") UUID appId,
+            @Param("branch") String branch,
+            Pageable pageable
+    );
 }
