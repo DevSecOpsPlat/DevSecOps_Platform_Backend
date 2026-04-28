@@ -2,6 +2,7 @@ package com.backend.devsecopsplatform_backend.controller.admin;
 
 import com.backend.devsecopsplatform_backend.entity.User;
 import com.backend.devsecopsplatform_backend.service.admin.AdminUserService;
+import com.backend.devsecopsplatform_backend.service.admin.dto.AdminUserMetricsResponse;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
@@ -65,6 +66,15 @@ public class AdminController {
         String reason = request != null ? request.reason() : null;
         adminUserService.rejectUser(id, reason);
         return ResponseEntity.ok().build();
+    }
+
+    /**
+     * GET /api/admin/users
+     * Utilisateurs sans rôle admin : profil, agrégats pipelines / environnements, détail applications et historique des envs.
+     */
+    @GetMapping("/users")
+    public ResponseEntity<java.util.List<AdminUserMetricsResponse>> getAllUsersWithMetrics() {
+        return ResponseEntity.ok(adminUserService.getAllUsersWithMetrics());
     }
 }
 

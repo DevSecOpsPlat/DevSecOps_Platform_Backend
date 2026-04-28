@@ -27,6 +27,23 @@ public interface PipelineExecutionRepository extends JpaRepository<PipelineExecu
             "ORDER BY p.createdAt DESC")
     List<PipelineExecution> findByUserOrderByCreatedAtDesc(User user, Pageable pageable);
 
+    @Query("select count(pe) from PipelineExecution pe where pe.environment.requestedBy = :user")
+    long countByUser(@Param("user") User user);
+
+    @Query("select count(pe) from PipelineExecution pe where pe.environment.requestedBy = :user and pe.status = :status")
+    long countByUserAndStatus(@Param("user") User user, @Param("status") PipelineStatus status);
+
+    @Query("select pe.status, count(pe) from PipelineExecution pe where pe.environment.requestedBy = :user group by pe.status")
+    List<Object[]> countByUserGroupByStatus(@Param("user") User user);
+
+    @Query("""
+            select pe.environment.application.id, pe.status, count(pe)
+            from PipelineExecution pe
+            where pe.environment.requestedBy = :user
+            group by pe.environment.application.id, pe.status
+            """)
+    List<Object[]> countByUserGroupByApplicationAndStatus(@Param("user") User user);
+
     default PipelineExecution findFirstByUserOrderByCreatedAtDesc(User user) {
         List<PipelineExecution> results = findByUserOrderByCreatedAtDesc(user, PageRequest.of(0, 1));
         return results.isEmpty() ? null : results.get(0);

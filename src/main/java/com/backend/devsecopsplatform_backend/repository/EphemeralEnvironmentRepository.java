@@ -23,6 +23,8 @@ public interface EphemeralEnvironmentRepository extends JpaRepository<EphemeralE
 
     List<EphemeralEnvironment> findByRequestedByAndStatus(User user, EnvironmentStatus status);
 
+    long countByRequestedByAndStatus(User user, EnvironmentStatus status);
+
     Optional<EphemeralEnvironment> findByIdAndRequestedBy(UUID id, User user);
 
     @Query("SELECT e FROM EphemeralEnvironment e WHERE e.requestedBy = :user ORDER BY e.createdAt DESC")
@@ -46,4 +48,17 @@ public interface EphemeralEnvironmentRepository extends JpaRepository<EphemeralE
     /** Pour fetch fichier source (join fetch application → gitRepositoryUrl + token). */
     @Query("select distinct e from EphemeralEnvironment e join fetch e.application where e.id = :id")
     Optional<EphemeralEnvironment> findByIdWithApplication(@Param("id") UUID id);
+
+    /**
+     * Environnements d'un utilisateur avec application et pipeline (évite N+1 pour l'admin).
+     */
+    @Query("""
+            select distinct e from EphemeralEnvironment e
+            join fetch e.application a
+            left join fetch e.pipelineExecution p
+            where e.requestedBy = :user
+            order by e.createdAt desc
+            """)
+    List<EphemeralEnvironment> findByRequestedByWithApplicationAndPipelineOrderByCreatedAtDesc(
+            @Param("user") User user);
 }
