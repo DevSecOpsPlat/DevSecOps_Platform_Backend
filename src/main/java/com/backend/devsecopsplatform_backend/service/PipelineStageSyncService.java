@@ -1,13 +1,19 @@
 package com.backend.devsecopsplatform_backend.service;
 
 import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
+import com.backend.devsecopsplatform_backend.entity.PipelineStatus;
+import com.backend.devsecopsplatform_backend.entity.EnvironmentStatus;
 import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
+import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -33,6 +39,7 @@ public class PipelineStageSyncService {
      * @param pipelineId ID du pipeline GitLab
      * @return true si la synchro a réussi, false sinon
      */
+    @Transactional
     public boolean syncStagesForPipeline(Long pipelineId) {
         if (pipelineId == null || pipelineId <= 0) {
             return false;
@@ -96,6 +103,38 @@ public class PipelineStageSyncService {
             Map<String, Object> summary = gitLabService.getPipelineSummary(pipelineId);
             Map<String, Object> stagesJson = buildStagesJsonFromSummary(summary);
             execution.setStagesJson(stagesJson);
+
+            // Mettre à jour le status de l’exécution à partir du status GitLab,
+            // même si le webhook n’est pas configuré (cas courant en local).
+            PipelineStatus newStatus = PipelineStatus.fromGitLabStatus((String) summary.get("status"));
+            PipelineStatus oldStatus = execution.getStatus();
+            if (newStatus != null && oldStatus != newStatus) {
+                execution.setStatus(newStatus);
+            }
+
+            // Harmoniser les dates si GitLab les fournit.
+            LocalDateTime createdAt = toLocalDateTime(summary.get("createdAt"));
+            LocalDateTime finishedAt = toLocalDateTime(summary.get("finishedAt"));
+            if (execution.getStartedAt() == null && createdAt != null) {
+                execution.setStartedAt(createdAt);
+            }
+            if (newStatus != null && newStatus.isFinished()) {
+                if (execution.getFinishedAt() == null && finishedAt != null) {
+                    execution.setFinishedAt(finishedAt);
+                } else if (execution.getFinishedAt() == null) {
+                    execution.setFinishedAt(LocalDateTime.now());
+                }
+
+                // Quand le pipeline est terminé avec succès, considérer l’environnement comme RUNNING
+                // (l’URL est résolue via nip.io ou callback).
+                if (newStatus == PipelineStatus.SUCCESS && execution.getEnvironment() != null) {
+                    var env = execution.getEnvironment();
+                    if (env.getStatus() == EnvironmentStatus.PENDING || env.getStatus() == EnvironmentStatus.BUILDING) {
+                        env.setStatus(EnvironmentStatus.RUNNING);
+                    }
+                }
+            }
+
             pipelineExecutionRepository.save(execution);
             log.info("✅ Stages synchronisés en BDD pour le pipeline #{} ({} jobs)", pipelineId, stagesJson.get("totalJobs"));
             return true;
@@ -103,5 +142,29 @@ public class PipelineStageSyncService {
             log.warn("⚠️ Impossible de synchroniser les stages pour le pipeline #{}: {}", pipelineId, e.getMessage());
             return false;
         }
+    }
+
+    private LocalDateTime toLocalDateTime(Object v) {
+        if (v == null) {
+            return null;
+        }
+        if (v instanceof LocalDateTime ldt) {
+            return ldt;
+        }
+        if (v instanceof Instant i) {
+            return LocalDateTime.ofInstant(i, ZoneId.systemDefault());
+        }
+        if (v instanceof Date d) {
+            return LocalDateTime.ofInstant(d.toInstant(), ZoneId.systemDefault());
+        }
+        // Si GitLab4J renvoie une string ISO par sérialisation
+        if (v instanceof String s && !s.isBlank()) {
+            try {
+                return LocalDateTime.ofInstant(Instant.parse(s), ZoneId.systemDefault());
+            } catch (Exception ignored) {
+                return null;
+            }
+        }
+        return null;
     }
 }

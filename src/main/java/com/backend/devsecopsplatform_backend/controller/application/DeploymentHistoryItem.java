@@ -31,5 +31,11 @@ public class DeploymentHistoryItem {
     private List<Map<String, Object>> jobs;
 
     private String triggeredByUsername;
+
+    /** URL publique de l’app déployée (Ingress / NodePort), renseignée par le pipeline via callback. */
+    private String deploymentUrl;
+
+    private Integer ttlHours;
+    private LocalDateTime expiresAt;
 }
 

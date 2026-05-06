@@ -14,6 +14,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.gitlab4j.api.models.Pipeline;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -33,6 +34,40 @@ public class EnvironmentService {
     private final EphemeralEnvironmentRepository environmentRepository;
     private final PipelineExecutionRepository pipelineExecutionRepository;
     private final PipelineStageSyncService pipelineStageSyncService;
+
+    @Value("${deployment.preview.nip.enabled:false}")
+    private boolean nipPreviewEnabled;
+
+    @Value("${deployment.preview.nip.scheme:https}")
+    private String nipScheme;
+
+    @Value("${deployment.preview.nip.master-ip:}")
+    private String nipMasterIp;
+
+    @Value("${deployment.preview.nip.node-port:30374}")
+    private int nipNodePort;
+
+    /**
+     * URL publique pour l’UI : d’abord {@link EphemeralEnvironment#getUrl()} (callback pipeline), sinon URL nip.io dérivée si activée.
+     */
+    public String resolveDeploymentPublicUrl(EphemeralEnvironment e) {
+        if (e == null) {
+            return null;
+        }
+        if (e.getUrl() != null && !e.getUrl().isBlank()) {
+            return e.getUrl().trim();
+        }
+        if (!nipPreviewEnabled || nipMasterIp == null || nipMasterIp.isBlank()) {
+            return null;
+        }
+        String scheme = (nipScheme != null && !nipScheme.isBlank()) ? nipScheme.trim().toLowerCase() : "https";
+        if (scheme.endsWith("://")) {
+            scheme = scheme.substring(0, scheme.length() - 3);
+        }
+        String id = e.getId().toString().toLowerCase();
+        String host = "app-" + id + "." + nipMasterIp.trim() + ".nip.io";
+        return scheme + "://" + host + ":" + nipNodePort;
+    }
 
     /**
      * Déploiement : crée ou réutilise une application, crée l'environnement, déclenche le pipeline.
@@ -91,7 +126,9 @@ public class EnvironmentService {
                 request.getBranch(),
                 env.getId().toString(),
                 app.getId(),
-                app.getDockerfilePath()
+                app.getDockerfilePath(),
+                env.getTtlHours(),
+                env.getNamespace()
         );
 
         // 5. Enregistrer l'exécution du pipeline (relation OneToOne)
@@ -121,6 +158,21 @@ public class EnvironmentService {
                 .build();
     }
 
+    /**
+     * Enregistre l’URL publique après déploiement (callback GitLab / job pipeline).
+     */
+    @Transactional
+    public void publishDeploymentPublicUrl(UUID environmentId, String publicUrl) {
+        EphemeralEnvironment env = environmentRepository.findById(environmentId)
+                .orElseThrow(() -> new RuntimeException("Environnement introuvable: " + environmentId));
+        env.setUrl(publicUrl);
+        if (env.getStatus() == EnvironmentStatus.PENDING || env.getStatus() == EnvironmentStatus.BUILDING) {
+            env.setStatus(EnvironmentStatus.RUNNING);
+        }
+        environmentRepository.save(env);
+        log.info("🌐 URL déploiement enregistrée pour env {} : {}", environmentId, publicUrl);
+    }
+
     public Optional<EnvironmentSummaryResponse> getEnvironmentById(UUID envId) {
         return environmentRepository.findById(envId)
                 .map(this::toSummary);
@@ -140,7 +192,7 @@ public class EnvironmentService {
                     .gitBranch(e.getGitBranch())
                     .ttlHours(e.getTtlHours())
                     .status(e.getStatus().name())
-                    .previewUrl(e.getUrl())
+                    .previewUrl(resolveDeploymentPublicUrl(e))
                     .createdAt(e.getCreatedAt())
                     .expiresAt(e.getExpiresAt())
                     .latestPipelineId(pipeline != null ? pipeline.getGitlabPipelineId() : null)
@@ -290,7 +342,7 @@ public class EnvironmentService {
                 .gitBranch(e.getGitBranch())
                 .ttlHours(e.getTtlHours())
                 .status(e.getStatus().name())
-                .previewUrl(e.getUrl())
+                .previewUrl(resolveDeploymentPublicUrl(e))
                 .createdAt(e.getCreatedAt())
                 .expiresAt(e.getExpiresAt())
                 .latestPipelineId(pipeline != null ? pipeline.getGitlabPipelineId() : null)

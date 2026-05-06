@@ -112,7 +112,9 @@ public class EphemeralEnvironment {
 
     public void markAsDestroyed() {
         this.status = EnvironmentStatus.DESTROYED;
-        this.destroyedAt = LocalDateTime.now();
+        // Quand la destruction est déclenchée par le TTL, on veut aligner destroyedAt avec expiresAt.
+        // (destroyedAt reste la "date de destruction effective" si expiresAt est absent)
+        this.destroyedAt = this.expiresAt != null ? this.expiresAt : LocalDateTime.now();
     }
 
     public void addPipelineExecution(PipelineExecution execution) {

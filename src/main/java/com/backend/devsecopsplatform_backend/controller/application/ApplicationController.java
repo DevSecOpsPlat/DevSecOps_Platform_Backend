@@ -2,6 +2,7 @@ package com.backend.devsecopsplatform_backend.controller.application;
 
 
 import com.backend.devsecopsplatform_backend.service.application.ApplicationService;
+import com.backend.devsecopsplatform_backend.service.environment.EnvironmentService;
 import com.backend.devsecopsplatform_backend.service.GitLabService;
 import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
 import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
@@ -30,6 +31,7 @@ public class ApplicationController {
     private final EphemeralEnvironmentRepository environmentRepository;
     private final PipelineExecutionRepository pipelineExecutionRepository;
     private final GitLabService gitLabService;
+    private final EnvironmentService environmentService;
 
     /**
      * POST /api/applications
@@ -142,6 +144,9 @@ public class ApplicationController {
                                 item.setFinishedAt(exec.getFinishedAt());
                                 item.setTriggeredByUsername(env.getRequestedBy() != null ? env.getRequestedBy().getUsername() : null);
                                 item.setJobs(jobs);
+                                item.setDeploymentUrl(environmentService.resolveDeploymentPublicUrl(env));
+                                item.setTtlHours(env.getTtlHours());
+                                item.setExpiresAt(env.getExpiresAt());
 
                                 return item;
                             })

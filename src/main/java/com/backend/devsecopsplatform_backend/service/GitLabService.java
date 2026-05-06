@@ -95,17 +95,29 @@ public class GitLabService {
      * Le .gitlab-ci.yml existe déjà ; le backend envoie uniquement les variables (GIT_REPO_URL, GIT_BRANCH, GITHUB_TOKEN, etc.).
      * Utilise RestTemplate pour respecter le format exact de l'API GitLab (variables en tableau).
      */
-    public Pipeline triggerPipeline(String gitRepoUrl, String branch, String envId, UUID applicationId, String dockerfilePath) {
+    public Pipeline triggerPipeline(
+            String gitRepoUrl,
+            String branch,
+            String envId,
+            UUID applicationId,
+            String dockerfilePath,
+            Integer ttlHours,
+            String namespace
+    ) {
         try {
             String githubToken = applicationService.getDecryptedGithubToken(applicationId);
             String gitBranch = branch != null && !branch.isBlank() ? branch : "main";
             String dockerPath = dockerfilePath != null && !dockerfilePath.isBlank() ? dockerfilePath : "./Dockerfile";
+            int ttl = (ttlHours != null && ttlHours > 0) ? ttlHours : 4;
+            String ns = namespace != null ? namespace : "";
 
             log.info("📋 [Pipeline] Données envoyées au pipeline GitLab (amanibennaceur-group/EnviroTest, ref=master):");
             log.info("   GIT_REPO_URL={}", gitRepoUrl);
             log.info("   GIT_BRANCH={}", gitBranch);
             log.info("   ENVIRONMENT_ID={}", envId);
             log.info("   DOCKERFILE_PATH={}", dockerPath);
+            log.info("   TTL_HOURS={}", ttl);
+            log.info("   K8S_NAMESPACE={}", ns);
             log.info("   GITHUB_TOKEN présent={}", githubToken != null && !githubToken.isEmpty());
 
             if (githubToken == null || githubToken.isEmpty()) {
@@ -125,6 +137,8 @@ public class GitLabService {
             addVar(variablesList, "GITHUB_TOKEN", githubToken != null ? githubToken : "");
             addVar(variablesList, "ENVIRONMENT_ID", envId);
             addVar(variablesList, "DOCKERFILE_PATH", dockerPath);
+            addVar(variablesList, "TTL_HOURS", String.valueOf(ttl));
+            addVar(variablesList, "K8S_NAMESPACE", ns);
             addVar(variablesList, "SKIP_DEPLOYMENT", "true");
 
             Map<String, Object> body = new HashMap<>();
