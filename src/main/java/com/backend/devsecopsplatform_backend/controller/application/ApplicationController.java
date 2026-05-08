@@ -24,7 +24,7 @@ import java.util.stream.Collectors;
 @RequestMapping("/api/applications")
 @RequiredArgsConstructor
 @Slf4j
-@CrossOrigin(origins = "http://localhost:4200")
+@CrossOrigin(origins = {"http://localhost:4200", "http://envirotest.local","http://envirotest.local:4200"})
 public class ApplicationController {
 
     private final ApplicationService applicationService;

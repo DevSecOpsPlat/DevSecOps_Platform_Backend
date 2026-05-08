@@ -19,7 +19,7 @@ import java.util.UUID;
 @RequestMapping("/api/security/vulnerabilities")
 @RequiredArgsConstructor
 @Slf4j
-@CrossOrigin(origins = "http://localhost:4200")
+@CrossOrigin(origins = {"http://localhost:4200", "http://envirotest.local:4200"})
 public class SecurityVulnerabilitiesController {
 
     private final FindingOccurrenceRepository findingOccurrenceRepository;

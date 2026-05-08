@@ -29,7 +29,7 @@ import java.util.stream.Collectors;
 @RequestMapping("/api/pipelines")
 @RequiredArgsConstructor
 @Slf4j
-@CrossOrigin(origins = "http://localhost:4200")
+@CrossOrigin(origins = {"http://localhost:4200","http://envirotest.local", "http://envirotest.local:4200"})
 public class PipelineController {
 
     private final EphemeralEnvironmentRepository environmentRepository;

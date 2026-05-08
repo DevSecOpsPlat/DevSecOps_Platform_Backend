@@ -23,7 +23,7 @@ import java.util.Optional;
 @RequestMapping("/api/webhooks")
 @RequiredArgsConstructor
 @Slf4j
-@CrossOrigin(origins = "http://localhost:4200")
+@CrossOrigin(origins = {"http://localhost:4200","http://envirotest.local", "http://envirotest.local:4200"})
 public class GitLabWebhookController {
 
     private final PipelineExecutionRepository pipelineExecutionRepository;
