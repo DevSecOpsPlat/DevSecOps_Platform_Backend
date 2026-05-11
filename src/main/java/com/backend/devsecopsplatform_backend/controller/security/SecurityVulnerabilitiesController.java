@@ -27,15 +27,20 @@ public class SecurityVulnerabilitiesController {
     @GetMapping("/recent")
     public ResponseEntity<List<Map<String, Object>>> recent(
             @RequestParam(defaultValue = "5") int limit,
-            @RequestParam(required = false) UUID appId
+            @RequestParam(required = false) UUID appId,
+            @RequestParam(required = false) UUID envId
     ) {
         String username = currentUsername();
         int size = Math.max(1, Math.min(limit, 50));
 
-        List<FindingOccurrence> occs = appId == null
-                ? findingOccurrenceRepository.findRecentForUsername(username, PageRequest.of(0, size))
-                : findingOccurrenceRepository.findRecentForUsernameAndApplication(
-                        username, appId, PageRequest.of(0, size));
+        List<FindingOccurrence> occs;
+        if (envId != null) {
+            occs = findingOccurrenceRepository.findRecentForUsernameAndEnvironment(username, envId, PageRequest.of(0, size));
+        } else if (appId != null) {
+            occs = findingOccurrenceRepository.findRecentForUsernameAndApplication(username, appId, PageRequest.of(0, size));
+        } else {
+            occs = findingOccurrenceRepository.findRecentForUsername(username, PageRequest.of(0, size));
+        }
         List<Map<String, Object>> out = occs.stream().map(this::toDashboardItem).toList();
         return ResponseEntity.ok(out);
     }

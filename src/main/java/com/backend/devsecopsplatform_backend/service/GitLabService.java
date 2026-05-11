@@ -348,7 +348,9 @@ public class GitLabService {
     }
 
     /**
-     * Récupère un job par son nom (ex: "sast-sonarqube", "dependency-scan-trivy")
+     * Récupère un job par son nom (ex: "sast-sonarqube", "dependency-scan-trivy").
+     * Comparaison insensible à la casse ; plusieurs tentatives GitLab avec le même nom :
+     * on privilégie le dernier job en SUCCESS, sinon le dernier par id (message d’erreur cohérente).
      *
      * @param pipelineId ID du pipeline
      * @param jobName Nom du job
@@ -356,11 +358,36 @@ public class GitLabService {
      */
     public Job getJobByName(Long pipelineId, String jobName) {
         List<Job> jobs = getPipelineJobs(pipelineId);
-
-        return jobs.stream()
-                .filter(job -> job.getName().equals(jobName))
-                .findFirst()
+        if (jobName == null || jobName.isBlank()) {
+            return null;
+        }
+        String needle = jobName.trim();
+        List<Job> matches = jobs.stream()
+                .filter(job -> job.getName() != null && job.getName().trim().equalsIgnoreCase(needle))
+                .toList();
+        if (matches.isEmpty()) {
+            String norm = normalizePipelineJobName(needle);
+            matches = jobs.stream()
+                    .filter(job -> job.getName() != null
+                            && normalizePipelineJobName(job.getName()).equals(norm))
+                    .toList();
+        }
+        if (matches.isEmpty()) {
+            return null;
+        }
+        Optional<Job> latestSuccess = matches.stream()
+                .filter(j -> j.getStatus() == JobStatus.SUCCESS)
+                .max(Comparator.comparing(Job::getId, Comparator.nullsLast(Long::compareTo)));
+        if (latestSuccess.isPresent()) {
+            return latestSuccess.get();
+        }
+        return matches.stream()
+                .max(Comparator.comparing(Job::getId, Comparator.nullsLast(Long::compareTo)))
                 .orElse(null);
+    }
+
+    private static String normalizePipelineJobName(String name) {
+        return name.trim().toLowerCase(Locale.ROOT).replace('_', '-');
     }
 
     // ============================================
@@ -1474,6 +1501,21 @@ public class GitLabService {
         } catch (GitLabApiException e) {
             log.error("❌ Erreur relance pipeline {}: {}", pipelineId, e.getMessage());
             throw new RuntimeException("Impossible de relancer le pipeline", e);
+        }
+    }
+
+    /**
+     * Relance un job GitLab (retry) sans relancer tout le pipeline.
+     *
+     * @param jobId ID du job
+     */
+    public void retryJob(Long jobId) {
+        try {
+            log.info("🔁 Retry job {}", jobId);
+            gitLabApi.getJobApi().retryJob(gitlabProjectId, jobId);
+        } catch (GitLabApiException e) {
+            log.error("❌ Erreur retry job {}: {}", jobId, e.getMessage());
+            throw new RuntimeException("Impossible de relancer le job", e);
         }
     }
 

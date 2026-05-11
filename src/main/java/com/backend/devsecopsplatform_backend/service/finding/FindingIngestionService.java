@@ -4,6 +4,8 @@ import com.backend.devsecopsplatform_backend.entity.*;
 import com.backend.devsecopsplatform_backend.repository.FindingOccurrenceRepository;
 import com.backend.devsecopsplatform_backend.repository.FindingRepository;
 import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
+import com.backend.devsecopsplatform_backend.repository.SecurityScanRepository;
+import com.backend.devsecopsplatform_backend.repository.VulnerabilityRecommendationRepository;
 import com.backend.devsecopsplatform_backend.service.GitLabService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -39,6 +41,8 @@ public class FindingIngestionService {
     private final PipelineExecutionRepository pipelineExecutionRepository;
     private final FindingRepository findingRepository;
     private final FindingOccurrenceRepository findingOccurrenceRepository;
+    private final SecurityScanRepository securityScanRepository;
+    private final VulnerabilityRecommendationRepository vulnerabilityRecommendationRepository;
     private final ObjectMapper objectMapper;
 
     @Transactional
@@ -62,6 +66,8 @@ public class FindingIngestionService {
         int createdFindings = 0;
         int createdOccurrences = 0;
         int autoFixedFindings = 0;
+        int createdSecurityScans = 0;
+        int createdRecommendations = 0;
         List<String> parsed = new ArrayList<>();
 
         try (InputStream zipStream = gitLabService.downloadAllJobArtifacts(agg.getId());
@@ -167,6 +173,16 @@ public class FindingIngestionService {
             log.warn("⚠️ Auto-FIX ignoré (pipelineId={}): {}", pipelineId, e.getMessage());
         }
 
+        // Construire une vue “Security scans” persistée (BDD-first) + recommandations basiques.
+        // Objectif: éviter un dashboard vide si l’utilisateur n’a pas “cherché” manuellement.
+        try {
+            Map<String, Object> out = buildAndPersistSecurityScans(execution);
+            createdSecurityScans = (int) out.getOrDefault("createdSecurityScans", 0);
+            createdRecommendations = (int) out.getOrDefault("createdRecommendations", 0);
+        } catch (Exception e) {
+            log.warn("⚠️ SecurityScans ignored (pipelineId={}): {}", pipelineId, e.getMessage());
+        }
+
         return Map.of(
                 "pipelineId", pipelineId,
                 "job", AGGREGATE_JOB_NAME,
@@ -174,8 +190,125 @@ public class FindingIngestionService {
                 "parsed", parsed,
                 "createdFindings", createdFindings,
                 "createdOccurrences", createdOccurrences,
-                "autoFixedFindings", autoFixedFindings
+                "autoFixedFindings", autoFixedFindings,
+                "createdSecurityScans", createdSecurityScans,
+                "createdRecommendations", createdRecommendations
         );
+    }
+
+    /**
+     * Regroupe les occurrences de ce pipeline en scans (par tool) et génère des recommandations simples.
+     * La version IA peut être branchée plus tard ; ici on veut surtout remplir le dashboard.
+     */
+    private Map<String, Object> buildAndPersistSecurityScans(PipelineExecution execution) {
+        Long pipelineId = execution.getGitlabPipelineId();
+        if (pipelineId == null) {
+            return Map.of("createdSecurityScans", 0, "createdRecommendations", 0);
+        }
+        // Recharger toutes les occurrences du pipeline (avec finding via join fetch dans repo "recent",
+        // mais ici on utilise la méthode pipelineId -> occurrences lazy: on accède à finding, Hibernate fera le fetch).
+        List<FindingOccurrence> occs = findingOccurrenceRepository.findByGitlabPipelineId(pipelineId);
+        if (occs == null || occs.isEmpty()) {
+            return Map.of("createdSecurityScans", 0, "createdRecommendations", 0);
+        }
+
+        // Nettoyer les scans précédents pour ce pipeline (idempotent)
+        // Note: cascade des recommendations via orphanRemoval si on delete scans.
+        try {
+            List<SecurityScan> existing = securityScanRepository.findByPipelineExecutionId(execution.getId());
+            if (existing != null && !existing.isEmpty()) {
+                securityScanRepository.deleteAll(existing);
+            }
+        } catch (Exception ignored) {
+            // best-effort
+        }
+
+        Map<String, List<FindingOccurrence>> byTool = new LinkedHashMap<>();
+        for (FindingOccurrence o : occs) {
+            String tool = o.getToolName() != null && !o.getToolName().isBlank() ? o.getToolName().trim() : "unknown";
+            byTool.computeIfAbsent(tool, k -> new ArrayList<>()).add(o);
+        }
+
+        int createdScans = 0;
+        int createdRecs = 0;
+
+        for (Map.Entry<String, List<FindingOccurrence>> entry : byTool.entrySet()) {
+            String tool = entry.getKey();
+            List<FindingOccurrence> toolOccs = entry.getValue();
+            if (toolOccs.isEmpty()) continue;
+
+            SecurityScan scan = new SecurityScan();
+            scan.setPipelineExecution(execution);
+            scan.setToolName(tool);
+            // ScanType: on prend le scanType du premier finding si dispo, sinon OTHER
+            ScanType st = null;
+            try {
+                Finding f0 = toolOccs.get(0).getFinding();
+                st = f0 != null ? f0.getScanType() : null;
+            } catch (Exception ignored) {}
+            scan.setScanType(st != null ? st : ScanType.CODE);
+
+            Map<String, Integer> sev = new LinkedHashMap<>();
+            List<Map<String, Object>> vulns = new ArrayList<>();
+
+            for (FindingOccurrence o : toolOccs) {
+                Finding f = o.getFinding();
+                if (f == null) continue;
+                String s = f.getSeverity() != null ? f.getSeverity().name() : "MEDIUM";
+                sev.put(s, sev.getOrDefault(s, 0) + 1);
+                vulns.add(Map.of(
+                        "id", String.valueOf(f.getId()),
+                        "fingerprint", f.getFingerprint(),
+                        "title", f.getTitle() != null ? f.getTitle() : (f.getRuleId() != null ? f.getRuleId() : f.getFingerprint()),
+                        "severity", s,
+                        "component", f.getPackageName() != null ? f.getPackageName() : (f.getFilePath() != null ? f.getFilePath() : "N/A"),
+                        "version", f.getInstalledVersion() != null ? f.getInstalledVersion() : "",
+                        "fixedVersion", f.getFixedVersion() != null ? f.getFixedVersion() : ""
+                ));
+            }
+
+            scan.setSeveritySummary(sev);
+            scan.setVulnerabilitiesJson(vulns);
+
+            scan = securityScanRepository.save(scan);
+            createdScans++;
+
+            // Recommandations: pour CRITICAL/HIGH, max 20 par scan (sinon trop de bruit)
+            int limit = 20;
+            for (FindingOccurrence o : toolOccs) {
+                if (limit <= 0) break;
+                Finding f = o.getFinding();
+                if (f == null || f.getSeverity() == null) continue;
+                if (!(f.getSeverity() == Severity.CRITICAL || f.getSeverity() == Severity.HIGH)) continue;
+
+                VulnerabilityRecommendation r = new VulnerabilityRecommendation();
+                r.setSecurityScan(scan);
+                r.setVulnerabilityId(f.getCve() != null ? f.getCve() : (f.getRuleId() != null ? f.getRuleId() : f.getFingerprint()));
+                r.setSeverity(f.getSeverity());
+                r.setDescription(f.getTitle());
+                r.setAiGenerated(false);
+
+                String rec;
+                if (f.getFixedVersion() != null && !f.getFixedVersion().isBlank() && f.getInstalledVersion() != null && !f.getInstalledVersion().isBlank()) {
+                    rec = "Mettre à jour " + (f.getPackageName() != null ? f.getPackageName() : "le composant")
+                            + " de " + f.getInstalledVersion() + " vers " + f.getFixedVersion() + ".";
+                } else if (f.getPackageName() != null && !f.getPackageName().isBlank()) {
+                    rec = "Vérifier la version du package `" + f.getPackageName() + "` et appliquer le correctif recommandé (upgrade/patch), puis relancer le pipeline.";
+                } else if (f.getFilePath() != null && !f.getFilePath().isBlank()) {
+                    rec = "Revoir le code dans `" + f.getFilePath() + "` et appliquer une correction conforme à la règle (" +
+                            (f.getRuleId() != null ? f.getRuleId() : "security") + "), puis relancer le pipeline.";
+                } else {
+                    rec = "Appliquer les bonnes pratiques de remédiation, puis relancer le pipeline et ré-importer les résultats.";
+                }
+                r.setRecommendation(rec);
+
+                vulnerabilityRecommendationRepository.save(r);
+                createdRecs++;
+                limit--;
+            }
+        }
+
+        return Map.of("createdSecurityScans", createdScans, "createdRecommendations", createdRecs);
     }
 
     private int autoFixFindingsForApplicationBranch(PipelineExecution execution, List<String> currentFingerprints) {
@@ -337,6 +470,10 @@ public class FindingIngestionService {
         if (p.contains("gitleaks") && p.endsWith(".json")) {
             return parseGitleaks(path, root);
         }
+        // Rapports ESLint / ng lint (JSON tableau de { filePath, messages[] }) — stage sast-angular
+        if (p.endsWith(".json") && looksLikeEslintFileResultsArray(root)) {
+            return parseEslintStyleIssues(path, root);
+        }
         if (p.contains("semgrep") && p.endsWith(".json")) {
             return parseSemgrep(path, root);
         }
@@ -346,7 +483,9 @@ public class FindingIngestionService {
         if (p.contains("grype") && p.endsWith(".json")) {
             return parseGrype(path, root);
         }
-        if (p.contains("dependency-check") && p.endsWith(".json")) {
+        // OWASP DC : rapport JSON souvent nommé dependency-check-report.json ;
+        // le job CLI écrit sous reports/owasp/ (le chemin ne contient pas toujours "dependency-check").
+        if (p.endsWith(".json") && looksLikeOwaspDependencyCheckReport(path, root)) {
             return parseOwaspDependencyCheck(path, root);
         }
         if (p.contains("npm-audit") && p.endsWith(".json")) {
@@ -355,6 +494,10 @@ public class FindingIngestionService {
         if (p.contains("pip-audit") && p.endsWith(".json")) {
             return parsePipAudit(path, root);
         }
+        // PyUp Safety — job pip-audit, fichier safety.json (tableau dépendances + vulnérabilités)
+        if (p.endsWith(".json") && (p.contains("safety") || p.contains("/python/safety")) && looksLikeSafetyReport(root)) {
+            return parseSafety(path, root);
+        }
         if (p.contains("license") && p.endsWith(".json")) {
             return parseLicense(path, root);
         }
@@ -362,9 +505,32 @@ public class FindingIngestionService {
         return List.of();
     }
 
+    /**
+     * JSON OWASP Dependency-Check : racine {@code dependencies[]} (souvent + projectInfo).
+     */
+    private boolean looksLikeOwaspDependencyCheckReport(String path, JsonNode root) {
+        if (root == null || !root.isObject()) {
+            return false;
+        }
+        String pl = path.toLowerCase(Locale.ROOT);
+        if (!(pl.contains("dependency-check")
+                || pl.contains("/owasp/")
+                || pl.contains("\\owasp\\")
+                || pl.contains("/reports/java/")
+                || pl.contains("\\reports\\java\\"))) {
+            return false;
+        }
+        JsonNode deps = root.get("dependencies");
+        return deps != null && deps.isArray();
+    }
+
     private List<NormalizedFinding> parseTrivy(String path, JsonNode root) {
         // Support Trivy "fs" JSON: Results[].Vulnerabilities[]
         List<NormalizedFinding> out = new ArrayList<>();
+        String pl = path != null ? path.toLowerCase(Locale.ROOT) : "";
+        boolean imageScan = pl.contains("container-scan") || pl.contains("trivy-image");
+        String tool = imageScan ? "trivy-image" : "trivy";
+        ScanType scanType = imageScan ? ScanType.CONTAINER : ScanType.SCA;
         JsonNode results = root.get("Results");
         if (results == null || !results.isArray()) {
             results = root.get("results"); // some variants
@@ -387,8 +553,6 @@ public class FindingIngestionService {
                 String cve = vulnId != null && vulnId.startsWith("CVE-") ? vulnId : null;
 
                 Severity sev = toSeverity(severity);
-                ScanType scanType = ScanType.SCA;
-                String tool = "trivy";
                 String ruleId = vulnId;
 
                 Map<String, Object> evidence = objectMapper.convertValue(v, new TypeReference<>() {
@@ -569,6 +733,15 @@ public class FindingIngestionService {
         List<NormalizedFinding> out = new ArrayList<>();
         JsonNode deps = root.get("dependencies");
         if (deps == null || !deps.isArray()) return out;
+        String pl = path != null ? path.toLowerCase(Locale.ROOT) : "";
+        String toolBase;
+        if (pl.contains("/owasp/") || pl.contains("\\owasp\\")) {
+            toolBase = "owasp-dependency-check";
+        } else if (pl.contains("/java/") || pl.contains("\\java\\")) {
+            toolBase = "maven-dependency-check";
+        } else {
+            toolBase = "dependency-check";
+        }
         for (JsonNode d : deps) {
             String fileName = text(d, "fileName");
             JsonNode vulns = d.get("vulnerabilities");
@@ -579,7 +752,7 @@ public class FindingIngestionService {
                 String desc = text(v, "description");
                 Severity sev = toSeverity(severity);
                 ScanType scanType = ScanType.SCA;
-                String tool = "dependency-check";
+                String tool = toolBase;
                 String title = firstNonBlank(name, "Dependency-Check finding");
 
                 Map<String, Object> evidence = objectMapper.convertValue(v, new TypeReference<>() {
@@ -678,6 +851,107 @@ public class FindingIngestionService {
                 String fp = FindingFingerprint.sha256Hex(String.join("|", tool, scanType.name(), nullToEmpty(pkg), nullToEmpty(lic)));
                 out.add(new NormalizedFinding(fp, scanType, tool, sev, pkg, title, lic,
                         null, null, null, null, null, pkg, null, null, evidence));
+            }
+        }
+        return out;
+    }
+
+    /** Sortie standard ESLint / ng lint : tableau de { "filePath", "messages": [...] }. */
+    private boolean looksLikeEslintFileResultsArray(JsonNode root) {
+        if (root == null || !root.isArray() || root.size() == 0) {
+            return false;
+        }
+        JsonNode first = root.get(0);
+        return first != null && first.isObject()
+                && first.has("filePath")
+                && first.get("messages") != null
+                && first.get("messages").isArray();
+    }
+
+    private List<NormalizedFinding> parseEslintStyleIssues(String path, JsonNode root) {
+        List<NormalizedFinding> out = new ArrayList<>();
+        if (!root.isArray()) {
+            return out;
+        }
+        String pl = path != null ? path.toLowerCase(Locale.ROOT) : "";
+        String tool;
+        if (pl.contains("angular-lint")) {
+            tool = "ng-lint";
+        } else if (pl.contains("react-lint")) {
+            tool = "eslint";
+        } else if (pl.contains("safe-report")) {
+            tool = "safe";
+        } else {
+            tool = "eslint";
+        }
+        for (JsonNode fileNode : root) {
+            String filePath = text(fileNode, "filePath");
+            JsonNode messages = fileNode.get("messages");
+            if (messages == null || !messages.isArray()) {
+                continue;
+            }
+            for (JsonNode m : messages) {
+                String ruleId = text(m, "ruleId");
+                if (ruleId == null || ruleId.isBlank()) {
+                    continue;
+                }
+                String msg = firstNonBlank(text(m, "message"), ruleId);
+                int sevNum = m.has("severity") && m.get("severity").isNumber() ? m.get("severity").asInt() : 1;
+                Severity sev = sevNum >= 2 ? Severity.HIGH : Severity.MEDIUM;
+                Integer line = intOrNull(m.get("line"));
+                Map<String, Object> evidence = objectMapper.convertValue(m, new TypeReference<>() {});
+                String fpRaw = String.join("|", tool, ScanType.SAST.name(), nullToEmpty(ruleId), nullToEmpty(filePath),
+                        String.valueOf(line != null ? line : -1), nullToEmpty(msg));
+                String fp = FindingFingerprint.sha256Hex(fpRaw);
+                out.add(new NormalizedFinding(fp, ScanType.SAST, tool, sev, ruleId, msg, null,
+                        filePath, line, line, null, null, null, null, null, evidence));
+            }
+        }
+        return out;
+    }
+
+    private boolean looksLikeSafetyReport(JsonNode root) {
+        if (root == null || !root.isArray() || root.size() == 0) {
+            return false;
+        }
+        JsonNode first = root.get(0);
+        if (first == null || !first.isObject()) {
+            return false;
+        }
+        return first.has("vulnerabilities") || first.has("package_name") || first.has("package");
+    }
+
+    /**
+     * PyUp Safety JSON (souvent un tableau de dépendances avec {@code vulnerabilities[]}).
+     */
+    private List<NormalizedFinding> parseSafety(String path, JsonNode root) {
+        List<NormalizedFinding> out = new ArrayList<>();
+        if (!root.isArray()) {
+            return out;
+        }
+        String tool = "safety";
+        for (JsonNode dep : root) {
+            if (dep == null || !dep.isObject()) {
+                continue;
+            }
+            String pkg = firstNonBlank(text(dep, "package_name"), text(dep, "package"), text(dep, "spec"));
+            String ver = firstNonBlank(text(dep, "installed_version"), text(dep, "version"), text(dep, "installed"));
+            JsonNode vulns = dep.get("vulnerabilities");
+            if (vulns == null || !vulns.isArray()) {
+                continue;
+            }
+            for (JsonNode v : vulns) {
+                String vid = firstNonBlank(text(v, "vulnerability_id"), text(v, "id"), text(v, "cve_id"),
+                        text(v, "cve"), text(v, "CVE"));
+                String desc = firstNonBlank(text(v, "advisory"), text(v, "description"), text(v, "details"));
+                Severity sev = toSeverity(text(v, "severity"));
+                String title = firstNonBlank(vid, pkg, "Safety finding");
+                Map<String, Object> evidence = objectMapper.convertValue(v, new TypeReference<>() {});
+                String fp = FindingFingerprint.sha256Hex(String.join("|", tool, ScanType.SCA.name(),
+                        nullToEmpty(vid), nullToEmpty(pkg), nullToEmpty(ver)));
+                String cve = vid != null && vid.startsWith("CVE-") ? vid : null;
+                out.add(new NormalizedFinding(fp, ScanType.SCA, tool, sev, vid, title, desc,
+                        null, null, null, cve, null, pkg, ver, null, evidence));
             }
         }
         return out;

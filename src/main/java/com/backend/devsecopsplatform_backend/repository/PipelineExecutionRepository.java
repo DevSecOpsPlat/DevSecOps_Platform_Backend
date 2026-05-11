@@ -89,4 +89,21 @@ public interface PipelineExecutionRepository extends JpaRepository<PipelineExecu
             @Param("branch") String branch,
             Pageable pageable
     );
+
+    @Query("""
+            select count(pe)
+            from PipelineExecution pe
+            join pe.environment env
+            where env.application.id = :appId
+            """)
+    long countByApplicationId(@Param("appId") UUID appId);
+
+    @Query("""
+            select pe.status, count(pe)
+            from PipelineExecution pe
+            join pe.environment env
+            where env.application.id = :appId
+            group by pe.status
+            """)
+    List<Object[]> countByApplicationIdGroupByStatus(@Param("appId") UUID appId);
 }

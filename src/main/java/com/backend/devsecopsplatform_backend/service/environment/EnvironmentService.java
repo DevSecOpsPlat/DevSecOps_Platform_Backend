@@ -2,6 +2,7 @@ package com.backend.devsecopsplatform_backend.service.environment;
 
 import com.backend.devsecopsplatform_backend.controller.environment.*;
 import com.backend.devsecopsplatform_backend.entity.*;
+import com.backend.devsecopsplatform_backend.repository.CloudResourceRepository;
 import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
 import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
 import com.backend.devsecopsplatform_backend.repository.UserRepository;
@@ -34,6 +35,7 @@ public class EnvironmentService {
     private final EphemeralEnvironmentRepository environmentRepository;
     private final PipelineExecutionRepository pipelineExecutionRepository;
     private final PipelineStageSyncService pipelineStageSyncService;
+    private final CloudResourceRepository cloudResourceRepository;
 
     @Value("${deployment.preview.nip.enabled:false}")
     private boolean nipPreviewEnabled;
@@ -120,6 +122,43 @@ public class EnvironmentService {
         env.setNamespace("env-" + env.getId().toString().replace("-", "").substring(0, 12));
         env = environmentRepository.save(env);
 
+        // BDD-first: stocker l’URL publique dérivée (nip.io) dès la création, pour que l’UI n’attende rien.
+        // Le callback pipeline peut ensuite la remplacer (env.url).
+        String derivedUrl = resolveDeploymentPublicUrl(env);
+        if (derivedUrl != null && !derivedUrl.isBlank()) {
+            env.setUrl(derivedUrl);
+            env = environmentRepository.save(env);
+        }
+
+        // Enregistrer des ressources “banales” pour alimenter le dashboard (même sans introspection K8s).
+        try {
+            if (derivedUrl != null && !derivedUrl.isBlank()) {
+                CloudResource ingress = new CloudResource();
+                ingress.setEnvironment(env);
+                ingress.setResourceType(ResourceType.INGRESS);
+                ingress.setResourceName(derivedUrl);
+                ingress.setResourceMetadata(Map.of(
+                        "namespace", env.getNamespace(),
+                        "url", derivedUrl,
+                        "scheme", nipScheme,
+                        "masterIp", nipMasterIp,
+                        "nodePort", nipNodePort
+                ));
+                cloudResourceRepository.save(ingress);
+
+                CloudResource svc = new CloudResource();
+                svc.setEnvironment(env);
+                svc.setResourceType(ResourceType.SERVICE);
+                svc.setResourceName(env.getNamespace());
+                svc.setResourceMetadata(Map.of(
+                        "namespace", env.getNamespace()
+                ));
+                cloudResourceRepository.save(svc);
+            }
+        } catch (Exception e) {
+            log.debug("Cloud resources init ignoré: {}", e.getMessage());
+        }
+
         // 4. Déclencher le pipeline GitLab
         Pipeline pipeline = gitLabService.triggerPipeline(
                 request.getGitRepositoryUrl(),
@@ -184,6 +223,31 @@ public class EnvironmentService {
         List<EnvironmentSummaryResponse> result = new ArrayList<>();
         for (EphemeralEnvironment e : list) {
             // 🔥 Récupération directe du pipeline associé (OneToOne)
+            PipelineExecution pipeline = e.getPipelineExecution();
+            result.add(EnvironmentSummaryResponse.builder()
+                    .id(e.getId())
+                    .environmentName(e.getEnvironmentName())
+                    .gitRepositoryUrl(e.getApplication().getGitRepositoryUrl())
+                    .gitBranch(e.getGitBranch())
+                    .ttlHours(e.getTtlHours())
+                    .status(e.getStatus().name())
+                    .previewUrl(resolveDeploymentPublicUrl(e))
+                    .createdAt(e.getCreatedAt())
+                    .expiresAt(e.getExpiresAt())
+                    .latestPipelineId(pipeline != null ? pipeline.getGitlabPipelineId() : null)
+                    .latestPipelineStatus(pipeline != null ? pipeline.getStatus().name() : null)
+                    .build());
+        }
+        return result;
+    }
+
+    /** Environnements de l’utilisateur, filtrés par application (pour le sélecteur d’env du dashboard). */
+    public List<EnvironmentSummaryResponse> getMyEnvironmentsForApplication(UUID appId) {
+        User user = getCurrentUser();
+        List<EphemeralEnvironment> list = environmentRepository
+                .findByRequestedByAndApplicationIdWithApplicationAndPipelineOrderByCreatedAtDesc(user, appId);
+        List<EnvironmentSummaryResponse> result = new ArrayList<>();
+        for (EphemeralEnvironment e : list) {
             PipelineExecution pipeline = e.getPipelineExecution();
             result.add(EnvironmentSummaryResponse.builder()
                     .id(e.getId())

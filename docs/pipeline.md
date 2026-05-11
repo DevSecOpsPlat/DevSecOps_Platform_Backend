@@ -791,3 +791,25 @@ aggregate-report:
       - reports/
       - final-report/
 
+# -----------------------------------------------------------------------------
+# Intégration plateforme (BDD + dashboard vulnérabilités) — commentaires YAML
+# Ingestion : ZIP du job "aggregate-report" ; seuls les .json sous reports/ ou final-report/
+#
+# Stage GitLab (ordre du fichier) -> job(s) -> tool_name côté API / filtres dashboard
+#   hello / clone / sonarqube-setup : pas de JSON sécu (Sonar = API backend, pas ZIP)
+#   sonarqube-scan : SonarCloud (ingestion API)
+#   sca-trivy -> trivy-scan -> trivy
+#   sca-node -> npm-audit -> npm-audit
+#   sca-python -> pip-audit -> pip-audit + safety.json -> safety
+#   sca-java -> maven-dependency-check -> maven-dependency-check
+#   sca-owasp -> owasp-dependency-check -> owasp-dependency-check
+#   sast-generic -> semgrep-scan -> semgrep
+#   sast-angular -> safe-analysis -> safe / ng-lint / eslint (JSON type ESLint)
+#   secrets -> gitleaks-secrets -> gitleaks
+#   iac -> checkov-scan -> checkov
+#   license-* -> license -> license
+#   build-image / push-image / deploy-k8s / schedule-delete : pas de findings ZIP
+#   container-scan -> trivy-image-scan -> trivy-image (même schéma Trivy, outil distinct)
+#   report -> aggregate-report : agrège les artifacts ; bouton "Importer les données"
+# -----------------------------------------------------------------------------
+

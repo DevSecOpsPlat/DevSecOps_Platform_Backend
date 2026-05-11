@@ -55,8 +55,12 @@ public class EnvironmentController {
     }
 
     @GetMapping("/environments")
-    public ResponseEntity<List<EnvironmentSummaryResponse>> getMyEnvironments() {
-        List<EnvironmentSummaryResponse> list = environmentService.getMyEnvironments();
+    public ResponseEntity<List<EnvironmentSummaryResponse>> getMyEnvironments(
+            @RequestParam(name = "appId", required = false) UUID appId
+    ) {
+        List<EnvironmentSummaryResponse> list = (appId == null)
+                ? environmentService.getMyEnvironments()
+                : environmentService.getMyEnvironmentsForApplication(appId);
         return ResponseEntity.ok(list);
     }
 

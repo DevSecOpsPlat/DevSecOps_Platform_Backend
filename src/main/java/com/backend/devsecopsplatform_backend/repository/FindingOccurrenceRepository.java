@@ -178,5 +178,21 @@ public interface FindingOccurrenceRepository extends JpaRepository<FindingOccurr
             @Param("username") String username,
             @Param("appId") UUID appId,
             org.springframework.data.domain.Pageable pageable);
+
+    @Query("""
+            select o
+            from FindingOccurrence o
+            join fetch o.finding f
+            join o.pipelineExecution pe
+            join pe.environment env
+            join env.requestedBy u
+            where u.username = :username
+              and env.id = :envId
+            order by o.observedAt desc
+            """)
+    List<FindingOccurrence> findRecentForUsernameAndEnvironment(
+            @Param("username") String username,
+            @Param("envId") UUID envId,
+            org.springframework.data.domain.Pageable pageable);
 }
 

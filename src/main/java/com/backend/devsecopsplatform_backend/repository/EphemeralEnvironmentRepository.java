@@ -34,6 +34,18 @@ public interface EphemeralEnvironmentRepository extends JpaRepository<EphemeralE
                                                                    LocalDateTime before);
     List<EphemeralEnvironment> findByApplication_Id(UUID applicationId);
 
+    @Query("""
+            select distinct e from EphemeralEnvironment e
+            join fetch e.application a
+            left join fetch e.pipelineExecution p
+            where e.requestedBy = :user
+              and a.id = :appId
+            order by e.createdAt desc
+            """)
+    List<EphemeralEnvironment> findByRequestedByAndApplicationIdWithApplicationAndPipelineOrderByCreatedAtDesc(
+            @Param("user") User user,
+            @Param("appId") UUID appId);
+
     // ✅ Correction: Utiliser Pageable de Spring, pas java.awt.print.Pageable
     @Query("SELECT e FROM EphemeralEnvironment e " +
             "WHERE e.requestedBy = :user " +
