@@ -54,7 +54,7 @@ public class SecurityConfig {
                 "http://envirotest.local"
         ));
         config.setAllowedHeaders(List.of("*"));
-        config.setAllowedMethods(Arrays.asList("GET", "POST", "PUT", "DELETE", "OPTIONS"));
+        config.setAllowedMethods(Arrays.asList("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
         config.setMaxAge(3600L);
 
         source.registerCorsConfiguration("/**", config);

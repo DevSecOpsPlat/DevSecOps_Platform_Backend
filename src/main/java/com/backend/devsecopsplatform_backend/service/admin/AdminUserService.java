@@ -1,6 +1,7 @@
 package com.backend.devsecopsplatform_backend.service.admin;
 
-import com.backend.devsecopsplatform_backend.entity.AccountStatus;
+import com.backend.devsecopsplatform_backend.controller.admin.CreateUserRequest;
+import com.backend.devsecopsplatform_backend.controller.admin.CreateUserResponse;
 import com.backend.devsecopsplatform_backend.entity.Application;
 import com.backend.devsecopsplatform_backend.entity.EnvironmentStatus;
 import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
@@ -21,6 +22,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -40,36 +42,55 @@ public class AdminUserService {
     private final EphemeralEnvironmentRepository ephemeralEnvironmentRepository;
     private final PipelineExecutionRepository pipelineExecutionRepository;
     private final ApplicationRepository applicationRepository;
+    private final PasswordEncoder passwordEncoder;
 
     /**
-     * Liste des utilisateurs en attente de validation.
+     * Crée un compte utilisateur (statut APPROVED) — réservé à l'administrateur.
      */
-    public List<User> getPendingUsers() {
-        return userRepository.findByAccountStatus(AccountStatus.PENDING);
-    }
+    @Transactional
+    public CreateUserResponse createUser(CreateUserRequest request) {
+        if (request.username() == null || request.username().isBlank()) {
+            throw new IllegalArgumentException("Le nom d'utilisateur est obligatoire.");
+        }
+        if (request.email() == null || request.email().isBlank()) {
+            throw new IllegalArgumentException("L'e-mail est obligatoire.");
+        }
+        if (request.password() == null || request.password().length() < 6) {
+            throw new IllegalArgumentException("Le mot de passe doit contenir au moins 6 caractères.");
+        }
+        String username = request.username().trim();
+        String email = request.email().trim();
+        if (userRepository.existsByUsername(username)) {
+            throw new IllegalArgumentException("Ce nom d'utilisateur est déjà utilisé.");
+        }
+        if (userRepository.existsByEmail(email)) {
+            throw new IllegalArgumentException("Cet e-mail est déjà utilisé.");
+        }
 
-    /**
-     * Approuve un utilisateur (ACCOUNT_STATUS -> APPROVED).
-     */
-    public User approveUser(UUID userId) {
+        Role role = request.role() != null ? request.role() : Role.ROLE_TESTER;
+        if (role == Role.ROLE_ADMIN) {
+            throw new IllegalArgumentException("La création de comptes administrateur via cette API n'est pas autorisée.");
+        }
+
         User admin = getCurrentUser();
-        User user = findByIdOrThrow(userId);
+        User user = new User();
+        user.setUsername(username);
+        user.setEmail(email);
+        user.setPassword(passwordEncoder.encode(request.password()));
+        user.setRoles(List.of(role));
         user.approve(admin);
-        User saved = userRepository.save(user);
-        log.info("✅ Utilisateur {} approuvé par {}", saved.getUsername(), admin.getUsername());
-        return saved;
-    }
 
-    /**
-     * Rejette un utilisateur (ACCOUNT_STATUS -> REJECTED).
-     */
-    public User rejectUser(UUID userId, String reason) {
-        User admin = getCurrentUser();
-        User user = findByIdOrThrow(userId);
-        user.reject(admin, reason != null ? reason : "Rejeté par l'administrateur");
         User saved = userRepository.save(user);
-        log.info("🚫 Utilisateur {} rejeté par {} (raison: {})", saved.getUsername(), admin.getUsername(), saved.getRejectionReason());
-        return saved;
+        log.info("Utilisateur {} créé par {}", saved.getUsername(), admin.getUsername());
+
+        List<String> roles = saved.getRoles().stream().map(Role::name).toList();
+        return new CreateUserResponse(
+                saved.getId(),
+                saved.getUsername(),
+                saved.getEmail(),
+                roles,
+                saved.getAccountStatus().name()
+        );
     }
 
     /**
@@ -224,13 +245,6 @@ public class AdminUserService {
                 map.getOrDefault(PipelineStatus.CANCELED, 0L),
                 map.getOrDefault(PipelineStatus.SKIPPED, 0L)
         );
-    }
-
-    private User findByIdOrThrow(UUID id) {
-        return userRepository.findAll().stream()
-                .filter(u -> id.equals(u.getId()))
-                .findFirst()
-                .orElseThrow(() -> new RuntimeException("Utilisateur introuvable"));
     }
 
     private User getCurrentUser() {

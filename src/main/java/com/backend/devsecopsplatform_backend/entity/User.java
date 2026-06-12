@@ -1,5 +1,6 @@
 package com.backend.devsecopsplatform_backend.entity;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import lombok.Data;
 import java.util.List;
 import jakarta.persistence.*;
@@ -33,7 +34,9 @@ public class User {
     @Column(name = "email", unique = true, nullable = false, length = 255)
     private String email;
 
+    /* WRITE_ONLY : accepté dans les requêtes (login), jamais exposé dans les réponses JSON. */
     @Column(name = "password_hash", nullable = false, length = 255)
+    @JsonProperty(access = JsonProperty.Access.WRITE_ONLY)
     private String password;
 
     @ElementCollection(fetch = FetchType.EAGER)
@@ -48,7 +51,7 @@ public class User {
 
     @Enumerated(EnumType.STRING)
     @Column(name = "account_status", nullable = false, length = 50)
-    private AccountStatus accountStatus = AccountStatus.PENDING;
+    private AccountStatus accountStatus = AccountStatus.APPROVED;
 
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "validated_by")
