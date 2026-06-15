@@ -4,7 +4,6 @@ import com.backend.devsecopsplatform_backend.controller.user.ChangePasswordReque
 import com.backend.devsecopsplatform_backend.controller.user.ProfileResponse;
 import com.backend.devsecopsplatform_backend.controller.user.UpdateEmailRequest;
 import com.backend.devsecopsplatform_backend.entity.AlertType;
-import com.backend.devsecopsplatform_backend.entity.AuditAction;
 import com.backend.devsecopsplatform_backend.entity.Role;
 import com.backend.devsecopsplatform_backend.entity.User;
 import com.backend.devsecopsplatform_backend.entity.UserActivityLog;
@@ -12,6 +11,7 @@ import com.backend.devsecopsplatform_backend.entity.UserActivityType;
 import com.backend.devsecopsplatform_backend.repository.UserActivityLogRepository;
 import com.backend.devsecopsplatform_backend.repository.UserRepository;
 import com.backend.devsecopsplatform_backend.service.security.SecurityEventService;
+import com.backend.devsecopsplatform_backend.util.IpAddressUtils;
 import lombok.RequiredArgsConstructor;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
@@ -72,14 +72,7 @@ public class ProfileService {
                 AlertType.EMAIL_CHANGED,
                 "E-mail modifié : " + oldEmail + " → " + email,
                 saved,
-                ipAddress
-        );
-        securityEventService.recordAudit(
-                AuditAction.EMAIL_CHANGED,
-                saved,
-                oldEmail + " → " + email,
-                saved.getUsername(),
-                ipAddress
+                IpAddressUtils.normalize(ipAddress)
         );
         return toResponse(saved);
     }
@@ -111,14 +104,7 @@ public class ProfileService {
                 AlertType.PASSWORD_CHANGED,
                 "Mot de passe modifié pour " + user.getEmail(),
                 user,
-                ipAddress
-        );
-        securityEventService.recordAudit(
-                AuditAction.PASSWORD_CHANGED,
-                user,
-                "Mot de passe modifié par l'utilisateur",
-                user.getUsername(),
-                ipAddress
+                IpAddressUtils.normalize(ipAddress)
         );
     }
 

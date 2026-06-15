@@ -1,8 +1,12 @@
 package com.backend.devsecopsplatform_backend.configuration;
 
+import com.backend.devsecopsplatform_backend.entity.AlertType;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.jdbc.core.JdbcTemplate;
+
+import java.util.Arrays;
+import java.util.stream.Collectors;
 
 /**
  * Colonnes sécurité sur {@code users} et {@code login_attempts} — idempotent.
@@ -16,8 +20,9 @@ public class SecuritySchemaMigration {
     public void migrate() {
         addUserSecurityColumns();
         addLoginAttemptColumns();
+        alignAlertsTypeCheck();
         backfillLegacyUsers();
-        log.info("Schéma sécurité vérifié (users, login_attempts).");
+        log.info("Schéma sécurité vérifié (users, login_attempts, alerts).");
     }
 
     private void addUserSecurityColumns() {
@@ -51,6 +56,28 @@ public class SecuritySchemaMigration {
                   END IF;
                 END $$
                 """);
+    }
+
+    /**
+     * Hibernate ddl-auto=update n'actualise pas les CHECK PostgreSQL sur {@code alerts.type}.
+     */
+    private void alignAlertsTypeCheck() {
+        String allowedTypes = Arrays.stream(AlertType.values())
+                .map(t -> "'" + t.name() + "'")
+                .collect(Collectors.joining(", "));
+        jdbcTemplate.execute("""
+                DO $$
+                BEGIN
+                  IF EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'alerts'
+                  ) THEN
+                    ALTER TABLE alerts DROP CONSTRAINT IF EXISTS alerts_type_check;
+                    ALTER TABLE alerts ADD CONSTRAINT alerts_type_check CHECK (type IN (%s));
+                  END IF;
+                END $$
+                """.formatted(allowedTypes));
+        log.info("Contrainte alerts_type_check alignée sur AlertType ({} valeurs).", AlertType.values().length);
     }
 
     private void backfillLegacyUsers() {

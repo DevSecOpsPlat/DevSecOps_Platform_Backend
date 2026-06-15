@@ -8,6 +8,7 @@ import com.backend.devsecopsplatform_backend.entity.AuditLog;
 import com.backend.devsecopsplatform_backend.entity.User;
 import com.backend.devsecopsplatform_backend.repository.AlertRepository;
 import com.backend.devsecopsplatform_backend.repository.AuditLogRepository;
+import com.backend.devsecopsplatform_backend.util.IpAddressUtils;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -29,7 +30,7 @@ public class SecurityEventService {
             alert.setRelatedUserId(relatedUser.getId());
             alert.setRelatedUsername(relatedUser.getUsername());
         }
-        alert.setIpAddress(ipAddress);
+        alert.setIpAddress(IpAddressUtils.normalize(ipAddress));
         alertRepository.save(alert);
     }
 
@@ -43,7 +44,7 @@ public class SecurityEventService {
         log.setAction(action);
         log.setDetails(details);
         log.setPerformedBy(performedBy);
-        log.setIpAddress(ipAddress);
+        log.setIpAddress(IpAddressUtils.normalize(ipAddress));
         auditLogRepository.save(log);
     }
 }

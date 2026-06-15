@@ -4,6 +4,7 @@ import com.backend.devsecopsplatform_backend.configuration.JwtUtils;
 import com.backend.devsecopsplatform_backend.entity.User;
 import com.backend.devsecopsplatform_backend.repository.UserRepository;
 import com.backend.devsecopsplatform_backend.service.auth.LoginAuditService;
+import com.backend.devsecopsplatform_backend.service.auth.LoginFailureResult;
 import com.backend.devsecopsplatform_backend.service.security.AccountActivationService;
 import com.backend.devsecopsplatform_backend.util.IpAddressUtils;
 import jakarta.servlet.http.HttpServletRequest;
@@ -21,6 +22,8 @@ import org.springframework.web.bind.annotation.RestController;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
+import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.HashMap;
 import java.util.Map;
@@ -58,12 +61,7 @@ public class AuthController {
             }
 
             if (user.isLocked()) {
-                return ResponseEntity.status(HttpStatus.LOCKED)
-                        .body(Map.of(
-                                "message", "Compte verrouillé après plusieurs tentatives. Réessayez après "
-                                        + user.getLockedUntil().format(LOCK_FMT) + ".",
-                                "lockedUntil", user.getLockedUntil().toString()
-                        ));
+                return lockedResponse(user);
             }
 
             if (!user.isAdmin() && !user.canLogin()) {
@@ -96,14 +94,12 @@ public class AuthController {
                 return ResponseEntity.ok(authData);
             }
 
-            loginAuditService.recordFailure(user, ip);
-            return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
-                    .body(Map.of("message", "Identifiants invalides."));
+            return failedLoginResponse(user, ip);
 
         } catch (AuthenticationException e) {
             log.error("Login error: {}", e.getMessage());
             if (user != null) {
-                loginAuditService.recordFailure(user, ip);
+                return failedLoginResponse(user, ip);
             }
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
                     .body(Map.of("message", "Identifiants invalides."));
@@ -122,5 +118,38 @@ public class AuthController {
         } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest().body(Map.of("message", e.getMessage()));
         }
+    }
+
+    private ResponseEntity<Map<String, Object>> failedLoginResponse(User user, String ip) {
+        LoginFailureResult result = loginAuditService.recordFailure(user, ip);
+        userRepository.findOneById(user.getId()).ifPresent(u -> user.setLockedUntil(u.getLockedUntil()));
+
+        if (result.accountLocked() || user.isLocked()) {
+            return lockedResponse(user);
+        }
+
+        Map<String, Object> body = new HashMap<>();
+        body.put("message", "Identifiants invalides.");
+        body.put("accountLocked", false);
+        return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(body);
+    }
+
+    private ResponseEntity<Map<String, Object>> lockedResponse(User user) {
+        LocalDateTime until = user.getLockedUntil();
+        long minutesLeft = until != null
+                ? Math.max(1, Duration.between(LocalDateTime.now(), until).toMinutes() + 1)
+                : LoginAuditService.LOCKOUT_MINUTES;
+
+        Map<String, Object> body = new HashMap<>();
+        body.put("message", String.format(
+                "Compte verrouillé pendant %d minutes après 3 tentatives incorrectes. Réessayez à partir du %s.",
+                LoginAuditService.LOCKOUT_MINUTES,
+                until != null ? until.format(LOCK_FMT) : "—"
+        ));
+        body.put("accountLocked", true);
+        body.put("lockedUntil", until != null ? until.toString() : null);
+        body.put("minutesRemaining", minutesLeft);
+        body.put("remainingAttempts", 0);
+        return ResponseEntity.status(HttpStatus.LOCKED).body(body);
     }
 }

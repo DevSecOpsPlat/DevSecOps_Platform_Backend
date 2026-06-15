@@ -12,6 +12,7 @@ import com.backend.devsecopsplatform_backend.service.admin.dto.AdminSecurityAler
 import com.backend.devsecopsplatform_backend.service.admin.dto.AdminSecurityAttempt;
 import com.backend.devsecopsplatform_backend.service.admin.dto.AdminUsersDashboardStats;
 import com.backend.devsecopsplatform_backend.service.security.SecurityEventService;
+import com.backend.devsecopsplatform_backend.util.IpAddressUtils;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -24,14 +25,14 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.stream.Collectors;
+import java.util.UUID;
 
 @Service
 @RequiredArgsConstructor
 public class LoginAuditService {
 
-    private static final int ALERT_THRESHOLD = 3;
-    private static final int LOCKOUT_MINUTES = 15;
+    public static final int ALERT_THRESHOLD = 3;
+    public static final int LOCKOUT_MINUTES = 15;
     private static final int STATS_WINDOW_DAYS = 30;
     private static final DateTimeFormatter FMT = DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm");
 
@@ -41,57 +42,89 @@ public class LoginAuditService {
 
     @Transactional
     public void recordSuccess(User user, String ipAddress) {
+        String ip = IpAddressUtils.normalize(ipAddress);
         user.setLastLoginAt(LocalDateTime.now());
         user.setLockedUntil(null);
         userRepository.save(user);
-        saveAttempt(user, true, ipAddress);
+        saveAttempt(user, true, ip);
         securityEventService.recordAudit(
                 AuditAction.LOGIN_SUCCESS,
                 user,
                 "Connexion réussie",
                 user.getUsername(),
-                ipAddress
+                ip
         );
     }
 
+    /**
+     * Enregistre un échec de connexion. Une alerte est créée à chaque tentative.
+     * Verrouillage 15 min après 3 échecs consécutifs (utilisateurs non-admin actifs).
+     */
     @Transactional
-    public void recordFailure(User user, String ipAddress) {
-        saveAttempt(user, false, ipAddress);
-        securityEventService.recordAudit(
-                AuditAction.LOGIN_FAILED,
-                user,
-                "Tentative de connexion échouée",
-                user.getUsername(),
-                ipAddress
-        );
-
-        if (user.isAdmin()) {
-            return;
-        }
+    public LoginFailureResult recordFailure(User user, String ipAddress) {
+        String ip = IpAddressUtils.normalize(ipAddress);
+        saveAttempt(user, false, ip);
 
         long consecutive = countRecentFailuresSinceLastSuccess(user);
+        recordLoginFailedAudit(user, ip, consecutive);
+
+        if (user.isPendingActivation()) {
+            return LoginFailureResult.notApplicable();
+        }
+
+        createLoginFailedAlert(user, ip, consecutive);
+
+        if (user.isAdmin() || !user.isActive()) {
+            return LoginFailureResult.notApplicable();
+        }
+
+        int remaining = (int) Math.max(0, ALERT_THRESHOLD - consecutive);
+
         if (consecutive >= ALERT_THRESHOLD && !user.isLocked()) {
             LocalDateTime lockedUntil = LocalDateTime.now().plusMinutes(LOCKOUT_MINUTES);
             user.setLockedUntil(lockedUntil);
             userRepository.save(user);
 
             String message = String.format(
-                    "Utilisateur : %s%nDate : %s%nÉchec de connexion : %d tentatives consécutives%nAdresse IP : %s",
-                    user.getEmail(),
-                    LocalDateTime.now().format(FMT),
+                    "Compte verrouillé 15 min après %d tentatives incorrectes.%nUtilisateur : %s (%s)%nIP : %s%nDéverrouillage : %s",
                     consecutive,
-                    ipAddress != null ? ipAddress : "—"
+                    user.getUsername(),
+                    user.getEmail(),
+                    ip,
+                    lockedUntil.format(FMT)
             );
-            securityEventService.createAlert(AlertType.FAILED_LOGIN_REPEATED, message, user, ipAddress);
-            securityEventService.createAlert(AlertType.ACCOUNT_LOCKED, message, user, ipAddress);
-            securityEventService.recordAudit(
-                    AuditAction.ACCOUNT_LOCKED,
-                    user,
-                    consecutive + " échecs consécutifs — verrouillage 15 min",
-                    "system",
-                    ipAddress
-            );
+            securityEventService.createAlert(AlertType.ACCOUNT_LOCKED, message, user, ip);
+            return new LoginFailureResult(consecutive, true, lockedUntil, 0);
         }
+
+        return new LoginFailureResult(consecutive, false, null, remaining);
+    }
+
+    private void createLoginFailedAlert(User user, String ip, long consecutive) {
+        StringBuilder message = new StringBuilder();
+        message.append(String.format(
+                "Connexion échouée — %s (%s) — %d échec(s) consécutif(s) — IP : %s",
+                user.getUsername(),
+                user.getEmail(),
+                consecutive,
+                ip
+        ));
+        securityEventService.createAlert(AlertType.LOGIN_FAILED, message.toString(), user, ip);
+    }
+
+    private void recordLoginFailedAudit(User user, String ip, long consecutive) {
+        String details = String.format(
+                "Connexion échouée — %d échec(s) consécutif(s) — IP : %s",
+                consecutive,
+                ip
+        );
+        securityEventService.recordAudit(
+                AuditAction.LOGIN_FAILED,
+                user,
+                details,
+                user.getUsername(),
+                ip
+        );
     }
 
     @Transactional(readOnly = true)
@@ -119,7 +152,7 @@ public class LoginAuditService {
                         a.getUser().getUsername(),
                         a.getUser().getEmail(),
                         a.getAttemptedAt(),
-                        a.getIpAddress()
+                        IpAddressUtils.normalize(a.getIpAddress())
                 ))
                 .toList();
 
@@ -169,34 +202,47 @@ public class LoginAuditService {
     }
 
     private List<AdminSecurityAlert> buildSecurityAlerts(List<LoginAttempt> failedNonAdmin) {
-        Map<User, List<LoginAttempt>> byUser = failedNonAdmin.stream()
-                .collect(Collectors.groupingBy(
-                        LoginAttempt::getUser,
-                        LinkedHashMap::new,
-                        Collectors.toList()
-                ));
+        Map<UUID, User> usersById = new LinkedHashMap<>();
+        for (LoginAttempt attempt : failedNonAdmin) {
+            User user = attempt.getUser();
+            if (user != null && user.getId() != null) {
+                usersById.putIfAbsent(user.getId(), user);
+            }
+        }
 
         List<AdminSecurityAlert> alerts = new ArrayList<>();
-        for (Map.Entry<User, List<LoginAttempt>> entry : byUser.entrySet()) {
-            List<LoginAttempt> failures = entry.getValue();
-            if (failures.size() < ALERT_THRESHOLD) {
+        for (User user : usersById.values()) {
+            if (user.isAdmin()) {
                 continue;
             }
-            List<AdminSecurityAttempt> attempts = failures.stream()
-                    .sorted((a, b) -> a.getAttemptedAt().compareTo(b.getAttemptedAt()))
-                    .map(a -> new AdminSecurityAttempt(a.getAttemptedAt(), a.getIpAddress()))
+            List<LoginAttempt> consecutiveFailures = findConsecutiveFailures(user);
+            if (consecutiveFailures.size() < ALERT_THRESHOLD && !user.isLocked()) {
+                continue;
+            }
+            List<AdminSecurityAttempt> attempts = consecutiveFailures.stream()
+                    .map(a -> new AdminSecurityAttempt(
+                            a.getAttemptedAt(),
+                            IpAddressUtils.normalize(a.getIpAddress())))
                     .toList();
-            User user = entry.getKey();
             alerts.add(new AdminSecurityAlert(
                     user.getId(),
                     user.getUsername(),
                     user.getEmail(),
-                    failures.size(),
+                    consecutiveFailures.size(),
                     attempts
             ));
         }
         alerts.sort((a, b) -> Integer.compare(b.failedCount(), a.failedCount()));
         return alerts;
+    }
+
+    private List<LoginAttempt> findConsecutiveFailures(User user) {
+        LocalDateTime since = loginAttemptRepository
+                .findTopByUserAndSuccessTrueOrderByAttemptedAtDesc(user)
+                .map(LoginAttempt::getAttemptedAt)
+                .orElse(LocalDateTime.of(1970, 1, 1, 0, 0));
+        return loginAttemptRepository
+                .findByUserAndSuccessFalseAndAttemptedAtAfterOrderByAttemptedAtAsc(user, since);
     }
 
     private LocalDate toLocalDate(Object value) {

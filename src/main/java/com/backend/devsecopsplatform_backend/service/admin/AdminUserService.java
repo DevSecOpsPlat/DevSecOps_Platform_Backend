@@ -11,7 +11,6 @@ import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
 import com.backend.devsecopsplatform_backend.entity.PipelineStatus;
 import com.backend.devsecopsplatform_backend.entity.Role;
 import com.backend.devsecopsplatform_backend.entity.User;
-import com.backend.devsecopsplatform_backend.entity.AlertType;
 import com.backend.devsecopsplatform_backend.entity.AuditAction;
 import com.backend.devsecopsplatform_backend.entity.UserActivityLog;
 import com.backend.devsecopsplatform_backend.entity.UserActivityType;
@@ -229,12 +228,6 @@ public class AdminUserService {
         activityLogRepository.save(UserActivityLog.of(
                 user, UserActivityType.ADMIN_PASSWORD_RESET,
                 "Mot de passe réinitialisé par l'administrateur", admin.getUsername()));
-        securityEventService.createAlert(
-                AlertType.ADMIN_PASSWORD_RESET,
-                "Mot de passe réinitialisé pour " + user.getEmail() + " par " + admin.getUsername(),
-                user,
-                null
-        );
         securityEventService.recordAudit(
                 AuditAction.ADMIN_PASSWORD_RESET,
                 user,
@@ -275,12 +268,6 @@ public class AdminUserService {
         activityLogRepository.save(UserActivityLog.of(
                 saved, UserActivityType.ADMIN_EMAIL_CHANGED,
                 oldEmail + " → " + email, admin.getUsername()));
-        securityEventService.createAlert(
-                AlertType.ADMIN_EMAIL_CHANGED,
-                "E-mail modifié pour " + saved.getUsername() + " : " + oldEmail + " → " + email,
-                saved,
-                null
-        );
         securityEventService.recordAudit(
                 AuditAction.ADMIN_EMAIL_CHANGED,
                 saved,
