@@ -1,6 +1,8 @@
 package com.backend.devsecopsplatform_backend.controller.user;
 
 import com.backend.devsecopsplatform_backend.service.user.ProfileService;
+import com.backend.devsecopsplatform_backend.util.IpAddressUtils;
+import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -21,9 +23,9 @@ public class ProfileController {
     }
 
     @PatchMapping("/email")
-    public ResponseEntity<?> updateEmail(@RequestBody UpdateEmailRequest request) {
+    public ResponseEntity<?> updateEmail(@RequestBody UpdateEmailRequest request, HttpServletRequest httpRequest) {
         try {
-            ProfileResponse updated = profileService.updateEmail(request);
+            ProfileResponse updated = profileService.updateEmail(request, IpAddressUtils.resolve(httpRequest));
             return ResponseEntity.ok(updated);
         } catch (IllegalArgumentException | IllegalStateException e) {
             return ResponseEntity.badRequest().body(Map.of("message", e.getMessage()));
@@ -31,9 +33,9 @@ public class ProfileController {
     }
 
     @PatchMapping("/password")
-    public ResponseEntity<?> changePassword(@RequestBody ChangePasswordRequest request) {
+    public ResponseEntity<?> changePassword(@RequestBody ChangePasswordRequest request, HttpServletRequest httpRequest) {
         try {
-            profileService.changePassword(request);
+            profileService.changePassword(request, IpAddressUtils.resolve(httpRequest));
             return ResponseEntity.ok(Map.of("message", "Mot de passe mis à jour avec succès."));
         } catch (IllegalArgumentException | IllegalStateException e) {
             return ResponseEntity.badRequest().body(Map.of("message", e.getMessage()));

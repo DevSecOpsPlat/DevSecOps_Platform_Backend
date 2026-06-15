@@ -8,5 +8,8 @@ public record CreateUserResponse(
         String username,
         String email,
         List<String> roles,
-        String accountStatus
+        String accountStatus,
+        boolean activationEmailSent,
+        String message,
+        String activationLink
 ) {}

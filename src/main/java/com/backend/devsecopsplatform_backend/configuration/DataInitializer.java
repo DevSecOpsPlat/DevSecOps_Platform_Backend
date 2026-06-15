@@ -6,6 +6,7 @@ import com.backend.devsecopsplatform_backend.entity.User;
 import com.backend.devsecopsplatform_backend.repository.UserRepository;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
+import org.springframework.context.annotation.DependsOn;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Component;
 
@@ -13,6 +14,7 @@ import java.util.List;
 
 
 @Component
+@DependsOn({"securitySchemaMigration", "legacyAccountStatusMigration"})
 @RequiredArgsConstructor
 public class DataInitializer {
 
@@ -27,7 +29,7 @@ public class DataInitializer {
             admin.setEmail("admin@devsecops.com");
             admin.setPassword(passwordEncoder.encode("Admin@123"));
             admin.setRoles(List.of(Role.ROLE_ADMIN));
-            admin.setAccountStatus(AccountStatus.APPROVED);
+            admin.setAccountStatus(AccountStatus.ACTIVE);
 
             userRepository.save(admin);
             System.out.println("Admin created");

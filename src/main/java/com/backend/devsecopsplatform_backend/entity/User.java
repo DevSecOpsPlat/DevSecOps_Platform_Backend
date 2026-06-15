@@ -51,17 +51,7 @@ public class User {
 
     @Enumerated(EnumType.STRING)
     @Column(name = "account_status", nullable = false, length = 50)
-    private AccountStatus accountStatus = AccountStatus.APPROVED;
-
-    @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "validated_by")
-    private User validatedBy;
-
-    @Column(name = "validated_at")
-    private LocalDateTime validatedAt;
-
-    @Column(name = "rejection_reason", length = 500)
-    private String rejectionReason;
+    private AccountStatus accountStatus = AccountStatus.ACTIVE;
 
     @CreationTimestamp
     @Column(name = "created_at", nullable = false, updatable = false)
@@ -71,34 +61,46 @@ public class User {
     @Column(name = "updated_at")
     private LocalDateTime updatedAt;
 
+    @Column(name = "last_login_at")
+    private LocalDateTime lastLoginAt;
+
+    @Column(name = "locked_until")
+    private LocalDateTime lockedUntil;
+
+    @Column(name = "must_change_password", nullable = false)
+    private boolean mustChangePassword = false;
+
+    @Column(name = "activation_token", length = 64)
+    private String activationToken;
+
+    @Column(name = "activation_token_expires_at")
+    private LocalDateTime activationTokenExpiresAt;
+
+    @Column(name = "activated_at")
+    private LocalDateTime activatedAt;
+
     @OneToMany(mappedBy = "createdBy", cascade = CascadeType.ALL, orphanRemoval = true)
     @JsonIgnoreProperties("createdBy") // Évite la boucle avec Application
     private List<Application> applications = new ArrayList<>();
 
 
-    public boolean canLogin() {
-        return accountStatus == AccountStatus.APPROVED;
+    public boolean isActive() {
+        return accountStatus == AccountStatus.ACTIVE;
     }
+
+    public boolean canLogin() {
+        return isActive() && !isPendingActivation() && !isLocked();
+    }
+
+    public boolean isPendingActivation() {
+        return activationToken != null && activatedAt == null;
+    }
+
+    public boolean isLocked() {
+        return lockedUntil != null && lockedUntil.isAfter(LocalDateTime.now());
+    }
+
     public boolean isAdmin() {
         return roles != null && roles.contains(Role.ROLE_ADMIN);
-    }
-    public boolean isPending() {
-        return accountStatus == AccountStatus.PENDING;
-    }
-    public void approve(User admin) {
-        this.accountStatus = AccountStatus.APPROVED;
-        this.validatedBy = admin;
-        this.validatedAt = LocalDateTime.now();
-        this.rejectionReason = null;
-    }
-    public void reject(User admin, String reason) {
-        this.accountStatus = AccountStatus.REJECTED;
-        this.validatedBy = admin;
-        this.validatedAt = LocalDateTime.now();
-        this.rejectionReason = reason;
-    }
-    public void suspend(String reason) {
-        this.accountStatus = AccountStatus.SUSPENDED;
-        this.rejectionReason = reason;
     }
 }

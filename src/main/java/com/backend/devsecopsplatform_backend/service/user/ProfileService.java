@@ -3,9 +3,15 @@ package com.backend.devsecopsplatform_backend.service.user;
 import com.backend.devsecopsplatform_backend.controller.user.ChangePasswordRequest;
 import com.backend.devsecopsplatform_backend.controller.user.ProfileResponse;
 import com.backend.devsecopsplatform_backend.controller.user.UpdateEmailRequest;
+import com.backend.devsecopsplatform_backend.entity.AlertType;
+import com.backend.devsecopsplatform_backend.entity.AuditAction;
 import com.backend.devsecopsplatform_backend.entity.Role;
 import com.backend.devsecopsplatform_backend.entity.User;
+import com.backend.devsecopsplatform_backend.entity.UserActivityLog;
+import com.backend.devsecopsplatform_backend.entity.UserActivityType;
+import com.backend.devsecopsplatform_backend.repository.UserActivityLogRepository;
 import com.backend.devsecopsplatform_backend.repository.UserRepository;
+import com.backend.devsecopsplatform_backend.service.security.SecurityEventService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
@@ -24,7 +30,9 @@ public class ProfileService {
             Pattern.compile("^[A-Za-z0-9+_.-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$");
 
     private final UserRepository userRepository;
+    private final UserActivityLogRepository activityLogRepository;
     private final PasswordEncoder passwordEncoder;
+    private final SecurityEventService securityEventService;
 
     @Transactional(readOnly = true)
     public ProfileResponse getCurrentProfile() {
@@ -32,7 +40,7 @@ public class ProfileService {
     }
 
     @Transactional
-    public ProfileResponse updateEmail(UpdateEmailRequest request) {
+    public ProfileResponse updateEmail(UpdateEmailRequest request, String ipAddress) {
         if (request.email() == null || request.email().isBlank()) {
             throw new IllegalArgumentException("L'e-mail est obligatoire.");
         }
@@ -54,12 +62,30 @@ public class ProfileService {
             throw new IllegalArgumentException("Cet e-mail est déjà utilisé par un autre compte.");
         }
 
+        String oldEmail = user.getEmail();
         user.setEmail(email);
-        return toResponse(userRepository.save(user));
+        User saved = userRepository.save(user);
+        activityLogRepository.save(UserActivityLog.of(
+                saved, UserActivityType.EMAIL_CHANGED,
+                oldEmail + " → " + email, saved.getUsername()));
+        securityEventService.createAlert(
+                AlertType.EMAIL_CHANGED,
+                "E-mail modifié : " + oldEmail + " → " + email,
+                saved,
+                ipAddress
+        );
+        securityEventService.recordAudit(
+                AuditAction.EMAIL_CHANGED,
+                saved,
+                oldEmail + " → " + email,
+                saved.getUsername(),
+                ipAddress
+        );
+        return toResponse(saved);
     }
 
     @Transactional
-    public void changePassword(ChangePasswordRequest request) {
+    public void changePassword(ChangePasswordRequest request, String ipAddress) {
         if (request.currentPassword() == null || request.currentPassword().isBlank()) {
             throw new IllegalArgumentException("Le mot de passe actuel est obligatoire.");
         }
@@ -76,7 +102,24 @@ public class ProfileService {
         }
 
         user.setPassword(passwordEncoder.encode(request.newPassword()));
+        user.setMustChangePassword(false);
         userRepository.save(user);
+        activityLogRepository.save(UserActivityLog.of(
+                user, UserActivityType.PASSWORD_CHANGED,
+                "Mot de passe modifié par l'utilisateur", user.getUsername()));
+        securityEventService.createAlert(
+                AlertType.PASSWORD_CHANGED,
+                "Mot de passe modifié pour " + user.getEmail(),
+                user,
+                ipAddress
+        );
+        securityEventService.recordAudit(
+                AuditAction.PASSWORD_CHANGED,
+                user,
+                "Mot de passe modifié par l'utilisateur",
+                user.getUsername(),
+                ipAddress
+        );
     }
 
     private ProfileResponse toResponse(User user) {
