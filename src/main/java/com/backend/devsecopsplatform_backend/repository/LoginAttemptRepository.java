@@ -22,6 +22,8 @@ public interface LoginAttemptRepository extends JpaRepository<LoginAttempt, UUID
 
     long countBySuccessFalseAndAttemptedAtAfter(LocalDateTime after);
 
+    long countBySuccessFalseAndIpAddressAndAttemptedAtAfter(String ipAddress, LocalDateTime after);
+
     @Query("""
             SELECT l FROM LoginAttempt l JOIN FETCH l.user u
             WHERE l.success = false AND l.attemptedAt >= :since

@@ -9,5 +9,8 @@ public record ProfileResponse(
         String email,
         List<String> roles,
         String accountStatus,
-        String createdAt
+        String createdAt,
+        boolean twoFactorEnabled,
+        boolean mustEnableTwoFactor,
+        String twoFactorMethod
 ) {}

@@ -33,6 +33,8 @@ import com.backend.devsecopsplatform_backend.service.security.AccountActivationS
 import com.backend.devsecopsplatform_backend.service.security.AccountPrepareResult;
 import com.backend.devsecopsplatform_backend.service.security.EmailSendResult;
 import com.backend.devsecopsplatform_backend.service.security.SecurityEventService;
+import com.backend.devsecopsplatform_backend.util.PasswordPolicy;
+import com.backend.devsecopsplatform_backend.util.UsernamePolicy;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -73,14 +75,15 @@ public class AdminUserService {
      */
     @Transactional
     public CreateUserResponse createUser(CreateUserRequest request) {
-        if (request.username() == null || request.username().isBlank()) {
-            throw new IllegalArgumentException("Le nom d'utilisateur est obligatoire.");
-        }
         if (request.email() == null || request.email().isBlank()) {
             throw new IllegalArgumentException("L'e-mail est obligatoire.");
         }
-        String username = request.username().trim();
-        String email = request.email().trim();
+        String username = request.username() != null ? request.username().trim() : "";
+        UsernamePolicy.validate(username);
+        String email = request.email().trim().toLowerCase();
+        if (!email.matches("^[A-Za-z0-9+_.-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$")) {
+            throw new IllegalArgumentException("Format d'e-mail invalide.");
+        }
         if (userRepository.existsByUsername(username)) {
             throw new IllegalArgumentException("Ce nom d'utilisateur est déjà utilisé.");
         }
@@ -96,7 +99,7 @@ public class AdminUserService {
         User admin = getCurrentUser();
         User user = new User();
         user.setUsername(username);
-        user.setEmail(email.toLowerCase());
+        user.setEmail(email);
         user.setRoles(List.of(role));
         user.setAccountStatus(AccountStatus.ACTIVE);
 
@@ -214,9 +217,7 @@ public class AdminUserService {
      */
     @Transactional
     public void resetPassword(UUID userId, String newPassword) {
-        if (newPassword == null || newPassword.length() < 8) {
-            throw new IllegalArgumentException("Le nouveau mot de passe doit contenir au moins 8 caractères.");
-        }
+        PasswordPolicy.validate(newPassword);
         User user = userRepository.findOneById(userId)
                 .orElseThrow(() -> new IllegalArgumentException("Utilisateur introuvable."));
         if (user.isAdmin()) {

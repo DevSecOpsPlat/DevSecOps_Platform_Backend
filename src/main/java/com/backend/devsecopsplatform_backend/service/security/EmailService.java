@@ -97,6 +97,62 @@ public class EmailService {
         }
     }
 
+    public EmailSendResult sendTwoFactorCode(User user, String code, String contextLabel) {
+        String recipient = normalizeEmail(user.getEmail());
+        String subject = "Code de vérification EnviroTest";
+        String body = """
+                Bonjour %s,
+
+                Votre code de vérification EnviroTest (%s) :
+
+                %s
+
+                Ce code expire dans 5 minutes. Ne le partagez avec personne.
+
+                Si vous n'êtes pas à l'origine de cette demande, contactez votre administrateur.
+                """.formatted(user.getUsername(), contextLabel, code);
+
+        if (!EMAIL.matcher(recipient).matches()) {
+            String reason = "Adresse e-mail du compte invalide : " + recipient;
+            log.error(reason);
+            return EmailSendResult.notSent("", recipient, reason);
+        }
+
+        if (!mailEnabled) {
+            String reason = "SMTP désactivé (app.mail.enabled=false). Code (dev) : " + code;
+            log.warn("{} — destinataire : {}", reason, recipient);
+            return EmailSendResult.notSent("", recipient, reason);
+        }
+        if (!StringUtils.hasText(mailPassword)) {
+            String reason = "Variable PASSSMTP vide.";
+            log.error("{} — destinataire : {}", reason, recipient);
+            return EmailSendResult.notSent("", recipient, reason);
+        }
+        if (mailSender == null) {
+            String reason = "Serveur SMTP non configuré.";
+            log.error("{} — destinataire : {}", reason, recipient);
+            return EmailSendResult.notSent("", recipient, reason);
+        }
+
+        try {
+            MimeMessage mime = mailSender.createMimeMessage();
+            MimeMessageHelper helper = new MimeMessageHelper(mime, false, "UTF-8");
+            helper.setFrom(new InternetAddress(mailFrom.trim(), "EnviroTest", "UTF-8"));
+            helper.setTo(new InternetAddress(recipient));
+            helper.setReplyTo(mailFrom.trim());
+            helper.setSubject(subject);
+            helper.setText(body, false);
+
+            mailSender.send(mime);
+            log.info("Code 2FA e-mail envoyé — destinataire: {}", recipient);
+            return EmailSendResult.sent("", recipient);
+        } catch (Exception e) {
+            String reason = friendlySmtpError(e);
+            log.error("Échec envoi code 2FA — destinataire: {} — {}", recipient, reason, e);
+            return EmailSendResult.notSent("", recipient, reason);
+        }
+    }
+
     private String normalizeEmail(String email) {
         return email == null ? "" : email.trim().toLowerCase();
     }

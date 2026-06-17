@@ -29,6 +29,8 @@ public class SecurityConfig {
     private final CustomUserDetailsService customUserDetailsService;
     private final JwtUtils jwtUtils;
     private final SecurityExceptionHandlers securityExceptionHandlers;
+    private final SecurityMonitoringFilter securityMonitoringFilter;
+    private final TwoFactorEnforcementFilter twoFactorEnforcementFilter;
 
     @Bean
     public PasswordEncoder passwordEncoder() {
@@ -97,7 +99,9 @@ public class SecurityConfig {
                         // Reste de l'API : nécessite un JWT valide
                         .anyRequest().authenticated()
                 )
-                .addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class);
+                .addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class)
+                .addFilterAfter(twoFactorEnforcementFilter, JwtFilter.class)
+                .addFilterBefore(securityMonitoringFilter, JwtFilter.class);
 
         return http.build();
     }

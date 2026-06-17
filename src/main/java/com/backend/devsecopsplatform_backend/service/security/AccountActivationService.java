@@ -3,6 +3,7 @@ package com.backend.devsecopsplatform_backend.service.security;
 import com.backend.devsecopsplatform_backend.entity.AuditAction;
 import com.backend.devsecopsplatform_backend.entity.User;
 import com.backend.devsecopsplatform_backend.repository.UserRepository;
+import com.backend.devsecopsplatform_backend.util.PasswordPolicy;
 import lombok.RequiredArgsConstructor;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
@@ -79,9 +80,7 @@ public class AccountActivationService {
 
     @Transactional
     public void activateAccount(String token, String newPassword, String ipAddress) {
-        if (newPassword == null || newPassword.length() < 8) {
-            throw new IllegalArgumentException("Le mot de passe doit contenir au moins 8 caractères.");
-        }
+        PasswordPolicy.validate(newPassword);
         User user = userRepository.findByActivationToken(token)
                 .orElseThrow(() -> new IllegalArgumentException("Lien d'activation invalide ou expiré."));
 

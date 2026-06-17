@@ -1,6 +1,8 @@
 package com.backend.devsecopsplatform_backend.configuration;
 
 import com.backend.devsecopsplatform_backend.entity.AlertType;
+import com.backend.devsecopsplatform_backend.entity.AuditAction;
+import com.backend.devsecopsplatform_backend.entity.TwoFactorMethod;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -20,9 +22,13 @@ public class SecuritySchemaMigration {
     public void migrate() {
         addUserSecurityColumns();
         addLoginAttemptColumns();
+        addUserTwoFactorColumns();
+        alignTwoFactorMethodCheck();
         alignAlertsTypeCheck();
+        alignAuditLogActionCheck();
+        ensureBlockedIpsTable();
         backfillLegacyUsers();
-        log.info("Schéma sécurité vérifié (users, login_attempts, alerts).");
+        log.info("Schéma sécurité vérifié (users, login_attempts, alerts, audit_log, blocked_ips).");
     }
 
     private void addUserSecurityColumns() {
@@ -53,9 +59,57 @@ public class SecuritySchemaMigration {
                     WHERE table_schema = 'public' AND table_name = 'login_attempts'
                   ) THEN
                     ALTER TABLE login_attempts ADD COLUMN IF NOT EXISTS ip_address VARCHAR(45);
+                    CREATE INDEX IF NOT EXISTS idx_login_ip_attempted_at ON login_attempts (ip_address, attempted_at);
                   END IF;
                 END $$
                 """);
+    }
+
+    private void addUserTwoFactorColumns() {
+        jdbcTemplate.execute("""
+                DO $$
+                BEGIN
+                  IF EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'users'
+                  ) THEN
+                    ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret_enc VARCHAR(512);
+                    ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_enabled BOOLEAN NOT NULL DEFAULT false;
+                    ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_enabled_at TIMESTAMP;
+                    ALTER TABLE users ADD COLUMN IF NOT EXISTS two_factor_method VARCHAR(10);
+                    UPDATE users
+                    SET two_factor_method = 'TOTP'
+                    WHERE two_factor_method IS NULL
+                      AND totp_enabled = true
+                      AND totp_secret_enc IS NOT NULL
+                      AND totp_secret_enc <> '';
+                  END IF;
+                END $$
+                """);
+    }
+
+    /**
+     * Hibernate ddl-auto=update crée {@code users_two_factor_method_check} sans mettre à jour
+     * les valeurs autorisées quand l'enum Java évolue (ex. ajout de EMAIL).
+     */
+    public void alignTwoFactorMethodCheck() {
+        String allowed = Arrays.stream(TwoFactorMethod.values())
+                .map(m -> "'" + m.name() + "'")
+                .collect(Collectors.joining(", "));
+        jdbcTemplate.execute("""
+                DO $$
+                BEGIN
+                  IF EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'users'
+                  ) THEN
+                    ALTER TABLE users DROP CONSTRAINT IF EXISTS users_two_factor_method_check;
+                    ALTER TABLE users ADD CONSTRAINT users_two_factor_method_check
+                      CHECK (two_factor_method IS NULL OR two_factor_method IN (%s));
+                  END IF;
+                END $$
+                """.formatted(allowed));
+        log.info("Contrainte users_two_factor_method_check alignée ({} valeurs).", TwoFactorMethod.values().length);
     }
 
     /**
@@ -78,6 +132,46 @@ public class SecuritySchemaMigration {
                 END $$
                 """.formatted(allowedTypes));
         log.info("Contrainte alerts_type_check alignée sur AlertType ({} valeurs).", AlertType.values().length);
+    }
+
+    /**
+     * Hibernate ddl-auto=update n'actualise pas les CHECK PostgreSQL sur {@code audit_log.action}.
+     */
+    private void alignAuditLogActionCheck() {
+        String allowedActions = Arrays.stream(AuditAction.values())
+                .map(a -> "'" + a.name() + "'")
+                .collect(Collectors.joining(", "));
+        jdbcTemplate.execute("""
+                DO $$
+                BEGIN
+                  IF EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'audit_log'
+                  ) THEN
+                    ALTER TABLE audit_log DROP CONSTRAINT IF EXISTS audit_log_action_check;
+                    ALTER TABLE audit_log ADD CONSTRAINT audit_log_action_check CHECK (action IN (%s));
+                  END IF;
+                END $$
+                """.formatted(allowedActions));
+        log.info("Contrainte audit_log_action_check alignée sur AuditAction ({} valeurs).", AuditAction.values().length);
+    }
+
+    private void ensureBlockedIpsTable() {
+        jdbcTemplate.execute("""
+                CREATE TABLE IF NOT EXISTS blocked_ips (
+                  id UUID PRIMARY KEY,
+                  ip_address VARCHAR(45) NOT NULL,
+                  reason VARCHAR(500) NOT NULL,
+                  blocked_until TIMESTAMP NOT NULL,
+                  source VARCHAR(20) NOT NULL DEFAULT 'AUTO',
+                  active BOOLEAN NOT NULL DEFAULT true,
+                  created_at TIMESTAMP NOT NULL DEFAULT NOW()
+                )
+                """);
+        jdbcTemplate.execute("CREATE INDEX IF NOT EXISTS idx_blocked_ip_address ON blocked_ips (ip_address)");
+        jdbcTemplate.execute("CREATE INDEX IF NOT EXISTS idx_blocked_ip_until ON blocked_ips (blocked_until)");
+        jdbcTemplate.execute("CREATE INDEX IF NOT EXISTS idx_blocked_ip_active ON blocked_ips (active)");
+        log.info("Table blocked_ips vérifiée.");
     }
 
     private void backfillLegacyUsers() {

@@ -12,6 +12,7 @@ import com.backend.devsecopsplatform_backend.repository.UserActivityLogRepositor
 import com.backend.devsecopsplatform_backend.repository.UserRepository;
 import com.backend.devsecopsplatform_backend.service.security.SecurityEventService;
 import com.backend.devsecopsplatform_backend.util.IpAddressUtils;
+import com.backend.devsecopsplatform_backend.util.PasswordPolicy;
 import lombok.RequiredArgsConstructor;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
@@ -20,14 +21,10 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
-import java.util.regex.Pattern;
 
 @Service
 @RequiredArgsConstructor
 public class ProfileService {
-
-    private static final Pattern EMAIL_PATTERN =
-            Pattern.compile("^[A-Za-z0-9+_.-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$");
 
     private final UserRepository userRepository;
     private final UserActivityLogRepository activityLogRepository;
@@ -54,7 +51,7 @@ public class ProfileService {
         }
 
         String email = request.email().trim();
-        if (!EMAIL_PATTERN.matcher(email).matches()) {
+        if (!email.matches("^[A-Za-z0-9+_.-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$")) {
             throw new IllegalArgumentException("Format d'e-mail invalide.");
         }
 
@@ -82,9 +79,7 @@ public class ProfileService {
         if (request.currentPassword() == null || request.currentPassword().isBlank()) {
             throw new IllegalArgumentException("Le mot de passe actuel est obligatoire.");
         }
-        if (request.newPassword() == null || request.newPassword().length() < 8) {
-            throw new IllegalArgumentException("Le nouveau mot de passe doit contenir au moins 8 caractères.");
-        }
+        PasswordPolicy.validate(request.newPassword());
 
         User user = getCurrentUser();
         if (!passwordEncoder.matches(request.currentPassword(), user.getPassword())) {
@@ -119,7 +114,10 @@ public class ProfileService {
                 user.getEmail(),
                 roles,
                 user.getAccountStatus().name(),
-                createdAt
+                createdAt,
+                user.isTwoFactorEnabled(),
+                !user.isTwoFactorEnabled(),
+                user.getTwoFactorMethod() != null ? user.getTwoFactorMethod().name() : null
         );
     }
 

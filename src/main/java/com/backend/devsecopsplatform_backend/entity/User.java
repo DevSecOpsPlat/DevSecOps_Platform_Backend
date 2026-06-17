@@ -79,6 +79,22 @@ public class User {
     @Column(name = "activated_at")
     private LocalDateTime activatedAt;
 
+    /** Secret TOTP chiffré (AES-GCM) — null si 2FA non configurée. */
+    @Column(name = "totp_secret_enc", length = 512)
+    @JsonProperty(access = JsonProperty.Access.WRITE_ONLY)
+    private String totpSecretEncrypted;
+
+    @Column(name = "totp_enabled", nullable = false)
+    private boolean totpEnabled = false;
+
+    @Column(name = "totp_enabled_at")
+    private LocalDateTime totpEnabledAt;
+
+    /** Méthode 2FA active : TOTP (application) ou EMAIL (code envoyé au compte). */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "two_factor_method", length = 10)
+    private TwoFactorMethod twoFactorMethod;
+
     @OneToMany(mappedBy = "createdBy", cascade = CascadeType.ALL, orphanRemoval = true)
     @JsonIgnoreProperties("createdBy") // Évite la boucle avec Application
     private List<Application> applications = new ArrayList<>();
@@ -102,5 +118,21 @@ public class User {
 
     public boolean isAdmin() {
         return roles != null && roles.contains(Role.ROLE_ADMIN);
+    }
+
+    /** 2FA TOTP active : flag + secret présent. */
+    public boolean isTotpEnabled() {
+        return twoFactorMethod == TwoFactorMethod.TOTP
+                && totpEnabled
+                && totpSecretEncrypted != null
+                && !totpSecretEncrypted.isBlank();
+    }
+
+    /** 2FA active (TOTP ou e-mail). */
+    public boolean isTwoFactorEnabled() {
+        if (twoFactorMethod == TwoFactorMethod.TOTP) {
+            return isTotpEnabled();
+        }
+        return twoFactorMethod == TwoFactorMethod.EMAIL;
     }
 }

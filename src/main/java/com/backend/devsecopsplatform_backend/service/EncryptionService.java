@@ -12,8 +12,8 @@ import java.security.SecureRandom;
 import java.util.Base64;
 
 /**
- * Service pour chiffrer/déchiffrer les tokens GitHub des applications
- * Utilise AES-256-GCM pour un chiffrement fort
+ * Coffre-fort applicatif : chiffrement AES-256-GCM des données sensibles au repos
+ * (tokens GitHub, secrets TOTP). Clé : ENCRYPTION_SECRET_KEY (32+ caractères).
  */
 @Service
 @Slf4j

@@ -12,6 +12,7 @@ import com.backend.devsecopsplatform_backend.service.admin.dto.AdminSecurityAler
 import com.backend.devsecopsplatform_backend.service.admin.dto.AdminSecurityAttempt;
 import com.backend.devsecopsplatform_backend.service.admin.dto.AdminUsersDashboardStats;
 import com.backend.devsecopsplatform_backend.service.security.SecurityEventService;
+import com.backend.devsecopsplatform_backend.service.security.monitoring.IpBruteForceService;
 import com.backend.devsecopsplatform_backend.util.IpAddressUtils;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
@@ -39,6 +40,7 @@ public class LoginAuditService {
     private final LoginAttemptRepository loginAttemptRepository;
     private final UserRepository userRepository;
     private final SecurityEventService securityEventService;
+    private final IpBruteForceService ipBruteForceService;
 
     @Transactional
     public void recordSuccess(User user, String ipAddress) {
@@ -73,6 +75,7 @@ public class LoginAuditService {
         }
 
         createLoginFailedAlert(user, ip, consecutive);
+        ipBruteForceService.recordKnownUserFailure(ip, user);
 
         if (user.isAdmin() || !user.isActive()) {
             return LoginFailureResult.notApplicable();
@@ -94,6 +97,13 @@ public class LoginAuditService {
                     lockedUntil.format(FMT)
             );
             securityEventService.createAlert(AlertType.ACCOUNT_LOCKED, message, user, ip);
+            securityEventService.recordAudit(
+                    AuditAction.ACCOUNT_LOCKED,
+                    user,
+                    message,
+                    user.getUsername(),
+                    ip
+            );
             return new LoginFailureResult(consecutive, true, lockedUntil, 0);
         }
 
