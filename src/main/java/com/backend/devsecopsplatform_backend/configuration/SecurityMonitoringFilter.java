@@ -10,6 +10,7 @@ import com.backend.devsecopsplatform_backend.service.security.monitoring.ThreatS
 import com.backend.devsecopsplatform_backend.util.IpAddressUtils;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
+import com.backend.devsecopsplatform_backend.util.SecurityAlertDetailsBuilder;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import lombok.RequiredArgsConstructor;
@@ -60,7 +61,7 @@ public class SecurityMonitoringFilter extends OncePerRequestFilter {
         boolean loginPath = isLoginPath(path);
         boolean adminPath = isAdminPath(path);
         boolean sensitive = loginPath || adminPath;
-
+//verfier nb de requetes 
         RateLimitResult global = rateLimiter.tryConsume(ip, Scope.GLOBAL);
         if (!global.allowed()) {
             monitoringService.handleRateLimitExceeded(ip, "global", global.limit(), global.windowSeconds());
@@ -88,7 +89,9 @@ public class SecurityMonitoringFilter extends OncePerRequestFilter {
 
         ThreatScanResult threat = threatDetection.scanRequest(path, query, userAgent, sensitive);
         if (threat != null) {
-            monitoringService.handleThreat(ip, request.getMethod(), path, threat);
+            String detailsJson = SecurityAlertDetailsBuilder.fromRequest(
+                    request, path, query, userAgent, threat.category().name(), threat.detail());
+            monitoringService.handleThreat(ip, request.getMethod(), path, threat, detailsJson);
             if (threat.blockImmediately() || blocklistService.isBlocked(ip)) {
                 writeJson(response, HttpServletResponse.SC_FORBIDDEN, "Requête refusée.");
                 return;

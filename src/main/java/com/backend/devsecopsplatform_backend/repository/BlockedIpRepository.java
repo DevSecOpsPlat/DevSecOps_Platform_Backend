@@ -18,6 +18,17 @@ public interface BlockedIpRepository extends JpaRepository<BlockedIp, UUID> {
 
     List<BlockedIp> findByActiveTrueAndBlockedUntilAfterOrderByBlockedUntilAsc(LocalDateTime now);
 
+    long countByActiveTrueAndBlockedUntilAfter(LocalDateTime now);
+
+    List<BlockedIp> findTop50ByOrderByCreatedAtDesc();
+
+    @Query("""
+            SELECT b FROM BlockedIp b
+            WHERE b.createdAt >= :since OR (b.active = true AND b.blockedUntil > :now)
+            ORDER BY b.createdAt DESC
+            """)
+    List<BlockedIp> findForDashboard(@Param("since") LocalDateTime since, @Param("now") LocalDateTime now);
+
     @Modifying
     @Query("""
             UPDATE BlockedIp b SET b.active = false

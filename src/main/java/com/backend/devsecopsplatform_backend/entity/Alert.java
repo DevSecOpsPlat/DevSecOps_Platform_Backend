@@ -47,6 +47,10 @@ public class Alert {
     @Column(name = "ip_address", length = 45)
     private String ipAddress;
 
+    /** Contexte technique JSON (méthode, URL, headers, payload…) pour le modal détails. */
+    @Column(name = "details_json", columnDefinition = "TEXT")
+    private String detailsJson;
+
     @CreationTimestamp
     @Column(name = "created_at", nullable = false, updatable = false)
     private LocalDateTime createdAt;

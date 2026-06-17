@@ -22,6 +22,11 @@ public class SecurityEventService {
 
     @Transactional
     public void createAlert(AlertType type, String message, User relatedUser, String ipAddress) {
+        createAlert(type, message, relatedUser, ipAddress, null);
+    }
+
+    @Transactional
+    public void createAlert(AlertType type, String message, User relatedUser, String ipAddress, String detailsJson) {
         Alert alert = new Alert();
         alert.setType(type);
         alert.setMessage(message);
@@ -31,6 +36,7 @@ public class SecurityEventService {
             alert.setRelatedUsername(relatedUser.getUsername());
         }
         alert.setIpAddress(IpAddressUtils.normalize(ipAddress));
+        alert.setDetailsJson(detailsJson);
         alertRepository.save(alert);
     }
 

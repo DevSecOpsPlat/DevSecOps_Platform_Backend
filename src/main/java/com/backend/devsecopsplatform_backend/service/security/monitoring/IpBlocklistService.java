@@ -12,6 +12,8 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import com.fasterxml.jackson.annotation.JsonFormat;
+
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
@@ -83,6 +85,16 @@ public class IpBlocklistService {
 
     @Transactional
     public void block(String ip, int minutes, String reason) {
+        block(ip, minutes, reason, BlockSource.AUTO);
+    }
+
+    @Transactional
+    public void blockManual(String ip, int minutes, String reason) {
+        block(ip, minutes, reason, BlockSource.MANUAL);
+    }
+
+    @Transactional
+    public void block(String ip, int minutes, String reason, BlockSource source) {
         if (!properties.getBlocklist().isEnabled()) {
             return;
         }
@@ -95,12 +107,12 @@ public class IpBlocklistService {
         row.setIpAddress(key);
         row.setReason(truncate(reason, 500));
         row.setBlockedUntil(until);
-        row.setSource(BlockSource.AUTO);
+        row.setSource(source);
         row.setActive(true);
         blockedIpRepository.save(row);
 
         cache.put(key, new BlockEntry(until, row.getReason()));
-        log.warn("IP bloquée {} jusqu'à {} — {} (persisté en BD)", key, until.format(FMT), reason);
+        log.warn("IP bloquée {} jusqu'à {} — {} ({}, persisté en BD)", key, until.format(FMT), reason, source);
     }
 
     @Transactional
@@ -113,10 +125,33 @@ public class IpBlocklistService {
 
     @Transactional(readOnly = true)
     public List<BlockedIpView> listBlocked() {
+        return listBlockedDetailed();
+    }
+
+    @Transactional(readOnly = true)
+    public long countCurrentlyBlocked() {
+        return blockedIpRepository.countByActiveTrueAndBlockedUntilAfter(LocalDateTime.now());
+    }
+
+    /** 50 derniers blocages en base (actifs ou expirés) — visibilité admin complète. */
+    @Transactional(readOnly = true)
+    public List<BlockedIpView> listBlockedDetailed() {
         LocalDateTime now = LocalDateTime.now();
-        return blockedIpRepository.findByActiveTrueAndBlockedUntilAfterOrderByBlockedUntilAsc(now).stream()
-                .map(row -> new BlockedIpView(row.getIpAddress(), row.getReason(), row.getBlockedUntil()))
+        return blockedIpRepository.findTop50ByOrderByCreatedAtDesc().stream()
+                .map(row -> toView(row, now))
                 .toList();
+    }
+
+    private BlockedIpView toView(BlockedIp row, LocalDateTime now) {
+        boolean active = row.isActive() && row.getBlockedUntil().isAfter(now);
+        return new BlockedIpView(
+                row.getIpAddress(),
+                row.getReason(),
+                row.getBlockedUntil(),
+                row.getCreatedAt(),
+                row.getSource().name(),
+                active
+        );
     }
 
     public BlockEntry getEntry(String ip) {
@@ -139,5 +174,14 @@ public class IpBlocklistService {
 
     public record BlockEntry(LocalDateTime blockedUntil, String reason) {}
 
-    public record BlockedIpView(String ip, String reason, LocalDateTime blockedUntil) {}
+    public record BlockedIpView(
+            String ip,
+            String reason,
+            @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd'T'HH:mm:ss")
+            LocalDateTime blockedUntil,
+            @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd'T'HH:mm:ss")
+            LocalDateTime createdAt,
+            String source,
+            boolean currentlyActive
+    ) {}
 }

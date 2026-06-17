@@ -2,17 +2,16 @@ package com.backend.devsecopsplatform_backend.controller.admin;
 
 import com.backend.devsecopsplatform_backend.entity.AlertStatus;
 import com.backend.devsecopsplatform_backend.entity.AlertType;
-import com.backend.devsecopsplatform_backend.entity.AuditAction;
 import com.backend.devsecopsplatform_backend.service.admin.AlertService;
-import com.backend.devsecopsplatform_backend.service.admin.AuditLogService;
 import com.backend.devsecopsplatform_backend.service.admin.dto.AdminAlertResponse;
 import com.backend.devsecopsplatform_backend.service.admin.dto.AdminAlertStatsResponse;
-import com.backend.devsecopsplatform_backend.service.admin.dto.AdminAuditPageResponse;
+import com.backend.devsecopsplatform_backend.service.admin.dto.AdminSecurityDashboardResponse;
 import lombok.RequiredArgsConstructor;
+import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
-import java.util.List;
+import java.time.LocalDate;
 import java.util.Map;
 import java.util.UUID;
 
@@ -24,12 +23,33 @@ public class AdminAlertController {
     private final AlertService alertService;
 
     @GetMapping
-    public ResponseEntity<List<AdminAlertResponse>> list(
+    public ResponseEntity<?> list(
             @RequestParam(required = false) String status,
-            @RequestParam(required = false) String type) {
+            @RequestParam(required = false) String type,
+            @RequestParam(required = false) String ip,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to,
+            @RequestParam(required = false) Integer page,
+            @RequestParam(required = false) Integer size) {
         AlertStatus alertStatus = parseStatus(status);
         AlertType alertType = parseType(type);
+        if (page != null || size != null) {
+            return ResponseEntity.ok(alertService.listAlertsPage(
+                    page != null ? page : 0,
+                    size != null ? size : 20,
+                    alertStatus,
+                    alertType,
+                    ip,
+                    from,
+                    to
+            ));
+        }
         return ResponseEntity.ok(alertService.listAlerts(alertStatus, alertType));
+    }
+
+    @GetMapping("/dashboard")
+    public ResponseEntity<AdminSecurityDashboardResponse> dashboard() {
+        return ResponseEntity.ok(alertService.getSecurityDashboard());
     }
 
     @GetMapping("/stats")
@@ -40,6 +60,11 @@ public class AdminAlertController {
     @GetMapping("/unread-count")
     public ResponseEntity<Map<String, Long>> unreadCount() {
         return ResponseEntity.ok(Map.of("count", alertService.countUnread()));
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<AdminAlertResponse> getById(@PathVariable UUID id) {
+        return ResponseEntity.ok(alertService.getById(id));
     }
 
     @PatchMapping("/{id}/read")

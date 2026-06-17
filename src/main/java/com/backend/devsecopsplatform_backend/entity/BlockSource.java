@@ -4,6 +4,6 @@ package com.backend.devsecopsplatform_backend.entity;
 public enum BlockSource {
     /** Déclenché automatiquement (force brute, honeypot, rate limit…). */
     AUTO,
-    /** Débloqué puis re-bloqué manuellement par un admin (extension future). */
+    /** Débloqué puis re-bloqué manuellement par un admin. */
     MANUAL
 }

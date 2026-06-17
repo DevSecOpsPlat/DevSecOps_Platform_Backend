@@ -34,7 +34,7 @@ public class SecurityMonitoringService {
         return properties.isTrustLocalhost() && isLocalhost(ip);
     }
 
-    public void handleThreat(String ip, String method, String uri, ThreatScanResult threat) {
+    public void handleThreat(String ip, String method, String uri, ThreatScanResult threat, String detailsJson) {
         if (shouldBypassMonitoring(ip)) {
             return;
         }
@@ -49,7 +49,7 @@ public class SecurityMonitoringService {
         );
 
         if (shouldEmitAlert(ip, alertType.name())) {
-            securityEventService.createAlert(alertType, message, null, ip);
+            securityEventService.createAlert(alertType, message, null, ip, detailsJson);
             securityEventService.recordAudit(
                     AuditAction.SUSPICIOUS_ACTIVITY,
                     null,
