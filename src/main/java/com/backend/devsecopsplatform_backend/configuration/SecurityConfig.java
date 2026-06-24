@@ -90,6 +90,8 @@ public class SecurityConfig {
                         .requestMatchers("/api/ai/**", "/projet/api/ai/**").authenticated()
                         // API Findings (dashboard vulnérabilités centralisé)
                         .requestMatchers("/api/findings/**", "/projet/api/findings/**").authenticated()
+                        // API DefectDojo (dashboard sécurité par produit / branche)
+                        .requestMatchers("/api/defectdojo/**", "/projet/api/defectdojo/**").authenticated()
                         // API Reports (PDF export)
                         .requestMatchers("/api/reports/**", "/projet/api/reports/**").authenticated()
                         // Webhook GitLab (appelé par GitLab, pas par le front)
