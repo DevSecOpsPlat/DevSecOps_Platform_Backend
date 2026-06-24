@@ -5,5 +5,14 @@ public enum ScanType {
     IMAGE,
     DEPENDENCIES,
     INFRASTRUCTURE,
-    DAST
+    DAST,
+
+    // Extensions pour supporter la centralisation "findings" multi-stages
+    SAST,
+    SCA,
+    SECRETS,
+    CONTAINER,
+    IAC,
+    LICENSE,
+    QUALITY
 }

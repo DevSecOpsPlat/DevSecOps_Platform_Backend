@@ -38,7 +38,7 @@ public class AdminBootstrap {
             admin.setEmail("admin@devsecops.com");
             admin.setPassword(passwordEncoder.encode("Admin@123")); // à changer en prod
             admin.setRoles(List.of(Role.ROLE_ADMIN));
-            admin.setAccountStatus(AccountStatus.APPROVED);
+            admin.setAccountStatus(AccountStatus.ACTIVE);
 
             userRepository.save(admin);
             log.info("✅ Compte administrateur par défaut créé (username=admin, password=admin123)");

@@ -12,10 +12,18 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.http.*;
-import org.springframework.web.client.RestTemplate;
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.util.*;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.util.LinkedMultiValueMap;
+import org.springframework.util.MultiValueMap;
+
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 
 /**
  * Service pour interagir avec GitLab API
@@ -41,9 +49,31 @@ public class GitLabService {
 
     @Value("${pipeline.default-branch}")
     private String defaultBranch;
+    @Value("${gitlab.timeout.seconds:3}")
+    private int gitlabTimeoutSeconds;
+
+    @Value("${gitlab.max-pipelines:20}")
+    private int maxPipelines;
 
     @Value("${pipeline.timeout-minutes}")
     private Integer timeoutMinutes;
+
+    // SonarQube / SonarCloud
+    @Value("${sonarqube.host-url}")
+    private String sonarHostUrl;
+
+    @Value("${sonarqube.token}")
+    private String sonarToken;
+
+    @Value("${sonarqube.project-key}")
+    private String sonarProjectKey;
+
+    /**
+     * Utilisateur SonarCloud par défaut pour \"Assign to me\" côté plateforme.
+     * (par exemple le mainteneur principal du projet).
+     */
+    @Value("${sonarqube.default-assignee:}")
+    private String sonarDefaultAssignee;
 
     // ============================================
     // PIPELINE - CRÉATION ET DÉCLENCHEMENT
@@ -65,17 +95,29 @@ public class GitLabService {
      * Le .gitlab-ci.yml existe déjà ; le backend envoie uniquement les variables (GIT_REPO_URL, GIT_BRANCH, GITHUB_TOKEN, etc.).
      * Utilise RestTemplate pour respecter le format exact de l'API GitLab (variables en tableau).
      */
-    public Pipeline triggerPipeline(String gitRepoUrl, String branch, String envId, UUID applicationId, String dockerfilePath) {
+    public Pipeline triggerPipeline(
+            String gitRepoUrl,
+            String branch,
+            String envId,
+            UUID applicationId,
+            String dockerfilePath,
+            Integer ttlHours,
+            String namespace
+    ) {
         try {
             String githubToken = applicationService.getDecryptedGithubToken(applicationId);
             String gitBranch = branch != null && !branch.isBlank() ? branch : "main";
             String dockerPath = dockerfilePath != null && !dockerfilePath.isBlank() ? dockerfilePath : "./Dockerfile";
+            int ttl = (ttlHours != null && ttlHours > 0) ? ttlHours : 4;
+            String ns = namespace != null ? namespace : "";
 
             log.info("📋 [Pipeline] Données envoyées au pipeline GitLab (amanibennaceur-group/EnviroTest, ref=master):");
             log.info("   GIT_REPO_URL={}", gitRepoUrl);
             log.info("   GIT_BRANCH={}", gitBranch);
             log.info("   ENVIRONMENT_ID={}", envId);
             log.info("   DOCKERFILE_PATH={}", dockerPath);
+            log.info("   TTL_HOURS={}", ttl);
+            log.info("   K8S_NAMESPACE={}", ns);
             log.info("   GITHUB_TOKEN présent={}", githubToken != null && !githubToken.isEmpty());
 
             if (githubToken == null || githubToken.isEmpty()) {
@@ -95,6 +137,8 @@ public class GitLabService {
             addVar(variablesList, "GITHUB_TOKEN", githubToken != null ? githubToken : "");
             addVar(variablesList, "ENVIRONMENT_ID", envId);
             addVar(variablesList, "DOCKERFILE_PATH", dockerPath);
+            addVar(variablesList, "TTL_HOURS", String.valueOf(ttl));
+            addVar(variablesList, "K8S_NAMESPACE", ns);
             addVar(variablesList, "SKIP_DEPLOYMENT", "true");
 
             Map<String, Object> body = new HashMap<>();
@@ -304,7 +348,9 @@ public class GitLabService {
     }
 
     /**
-     * Récupère un job par son nom (ex: "sast-sonarqube", "dependency-scan-trivy")
+     * Récupère un job par son nom (ex: "sast-sonarqube", "dependency-scan-trivy").
+     * Comparaison insensible à la casse ; plusieurs tentatives GitLab avec le même nom :
+     * on privilégie le dernier job en SUCCESS, sinon le dernier par id (message d’erreur cohérente).
      *
      * @param pipelineId ID du pipeline
      * @param jobName Nom du job
@@ -312,11 +358,36 @@ public class GitLabService {
      */
     public Job getJobByName(Long pipelineId, String jobName) {
         List<Job> jobs = getPipelineJobs(pipelineId);
-
-        return jobs.stream()
-                .filter(job -> job.getName().equals(jobName))
-                .findFirst()
+        if (jobName == null || jobName.isBlank()) {
+            return null;
+        }
+        String needle = jobName.trim();
+        List<Job> matches = jobs.stream()
+                .filter(job -> job.getName() != null && job.getName().trim().equalsIgnoreCase(needle))
+                .toList();
+        if (matches.isEmpty()) {
+            String norm = normalizePipelineJobName(needle);
+            matches = jobs.stream()
+                    .filter(job -> job.getName() != null
+                            && normalizePipelineJobName(job.getName()).equals(norm))
+                    .toList();
+        }
+        if (matches.isEmpty()) {
+            return null;
+        }
+        Optional<Job> latestSuccess = matches.stream()
+                .filter(j -> j.getStatus() == JobStatus.SUCCESS)
+                .max(Comparator.comparing(Job::getId, Comparator.nullsLast(Long::compareTo)));
+        if (latestSuccess.isPresent()) {
+            return latestSuccess.get();
+        }
+        return matches.stream()
+                .max(Comparator.comparing(Job::getId, Comparator.nullsLast(Long::compareTo)))
                 .orElse(null);
+    }
+
+    private static String normalizePipelineJobName(String name) {
+        return name.trim().toLowerCase(Locale.ROOT).replace('_', '-');
     }
 
     // ============================================
@@ -438,8 +509,9 @@ public class GitLabService {
 
     /**
      * Récupère le résultat du scan (JSON) d'un job une fois le pipeline terminé.
-     * Utilise RestTemplate pour télécharger l'artefact .json du job (Trivy, SonarQube, etc.).
-     * Essaie plusieurs chemins d'artefacts courants.
+     * 1) Essaie quelques chemins d'artefacts connus en accès direct (rapide).
+     * 2) Si rien n'est trouvé, télécharge le ZIP d'artifacts du job et cherche
+     *    un fichier .json à l'intérieur (peu importe le dossier).
      *
      * @param jobId ID du job GitLab (ex: job de stage Scan)
      * @return Rapport de scan en JSON (JsonNode), ou null si aucun artefact trouvé
@@ -449,7 +521,7 @@ public class GitLabService {
         HttpHeaders headers = new HttpHeaders();
         headers.set("PRIVATE-TOKEN", gitlabToken);
 
-        // Chemins d'artefacts courants selon .gitlab-ci.yml (Trivy, SonarQube, rapport générique)
+        // Chemins d'artefacts courants selon .gitlab-ci.yml (Trivy, SonarQube, rapports GitLab natifs)
         String[] artifactPaths = {
                 "report.json",
                 "trivy-report.json",
@@ -457,7 +529,12 @@ public class GitLabService {
                 "gl-dependency-scanning-report.json",
                 "gl-sast-report.json",
                 "sonarqube-report.json",
-                "scan-report.json"
+                "scan-report.json",
+                // Variantes quand le projet est empaqueté dans un sous-répertoire (ex: user-repo/)
+                "user-repo/report.json",
+                "user-repo/trivy-report.json",
+                "user-repo/trivy-dependencies-report.json",
+                "user-repo/scan-report.json"
         };
 
         for (String path : artifactPaths) {
@@ -472,17 +549,868 @@ public class GitLabService {
                 );
                 if (response.getStatusCode() == HttpStatus.OK && response.getBody() != null && response.getBody().length > 0) {
                     JsonNode report = objectMapper.readTree(response.getBody());
-                    log.info("✅ Scan results récupérés pour job {} (artefact: {})", jobId, path);
+                    log.info("✅ Scan results récupérés pour job {} (artefact direct: {})", jobId, path);
                     return report;
                 }
             } catch (Exception e) {
-                log.debug("Artefact {} non trouvé pour job {}: {}", path, jobId, e.getMessage());
+                log.debug("Artefact direct {} non trouvé pour job {}: {}", path, jobId, e.getMessage());
             }
         }
+
+        // Fallback générique : télécharger le ZIP de tous les artifacts et chercher un .json
+        try (InputStream zipStream = gitLabApi.getJobApi().downloadArtifactsFile(gitlabProjectId, jobId);
+             ZipInputStream zis = new ZipInputStream(zipStream)) {
+
+            ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
+                String name = entry.getName();
+                if (entry.isDirectory()) {
+                    continue;
+                }
+                // On cherche un JSON de scan : d'abord ceux contenant des mots-clés, sinon le premier .json
+                if (name.toLowerCase().endsWith(".json")) {
+                    boolean looksLikeScan =
+                            name.contains("trivy") ||
+                                    name.contains("sast") ||
+                                    name.contains("scan") ||
+                                    name.contains("report") ||
+                                    name.contains("sonar");
+
+                    ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+                    byte[] tmp = new byte[4096];
+                    int read;
+                    while ((read = zis.read(tmp)) != -1) {
+                        buffer.write(tmp, 0, read);
+                    }
+
+                    if (looksLikeScan) {
+                        JsonNode report = objectMapper.readTree(buffer.toByteArray());
+                        log.info("✅ Scan results récupérés pour job {} depuis le ZIP (fichier: {})", jobId, name);
+                        return report;
+                    } else if (log.isDebugEnabled()) {
+                        log.debug("JSON trouvé dans les artifacts mais ignoré (nom: {})", name);
+                    }
+                }
+            }
+        } catch (GitLabApiException e) {
+            log.warn("⚠️ Impossible de télécharger le ZIP d'artifacts pour le job {}: {}", jobId, e.getMessage());
+        } catch (Exception e) {
+            log.error("❌ Erreur lors de l'analyse du ZIP d'artifacts pour le job {}: {}", jobId, e.getMessage());
+        }
+
         log.warn("⚠️ Aucun artefact JSON de scan trouvé pour le job {}", jobId);
         return null;
     }
 
+    // ============================================
+    // SONARQUBE - RÉCUPÉRATION DES RÉSULTATS
+    // ============================================
+
+    /**
+     * Normalise le statut Quality Gate renvoyé par SonarQube pour un affichage frontend cohérent
+     * et ajoute un message de détail (errorDescription) pour chaque condition en échec.
+     */
+    private Map<String, Object> normalizeQualityGateStatus(JsonNode projectStatus) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        if (projectStatus == null || projectStatus.isMissingNode()) return out;
+
+        String status = projectStatus.has("status") ? projectStatus.get("status").asText("UNKNOWN")
+                : (projectStatus.has("level") ? projectStatus.get("level").asText("UNKNOWN") : "UNKNOWN");
+        out.put("status", status);
+
+        JsonNode conditionsNode = projectStatus.path("conditions");
+        if (!conditionsNode.isArray()) {
+            out.put("conditions", Collections.emptyList());
+            return out;
+        }
+
+        List<Map<String, Object>> conditions = new ArrayList<>();
+        for (JsonNode cond : conditionsNode) {
+            Map<String, Object> c = new LinkedHashMap<>();
+            String condStatus = cond.has("status") ? cond.get("status").asText("OK")
+                    : (cond.has("level") ? cond.get("level").asText("OK") : "OK");
+            String metricKey = cond.has("metricKey") ? cond.get("metricKey").asText("")
+                    : (cond.has("metric") ? cond.get("metric").asText("") : "");
+            String actual = cond.has("actualValue") ? cond.get("actualValue").asText("0")
+                    : (cond.has("actual") ? cond.get("actual").asText("0") : "0");
+            String errorThreshold = cond.has("errorThreshold") ? cond.get("errorThreshold").asText("")
+                    : (cond.has("error") ? cond.get("error").asText("") : "");
+            String comparator = cond.has("comparator") ? cond.get("comparator").asText("")
+                    : (cond.has("op") ? cond.get("op").asText("") : "");
+
+            c.put("status", condStatus);
+            c.put("metricKey", metricKey);
+            c.put("metric", metricKey);
+            c.put("actualValue", actual);
+            c.put("errorThreshold", errorThreshold);
+            c.put("comparator", comparator);
+
+            if ("ERROR".equalsIgnoreCase(condStatus) && (actual != null || errorThreshold != null)) {
+                String desc = buildQualityGateConditionErrorDescription(
+                        metricKey, actual, errorThreshold, comparator);
+                if (desc != null) c.put("errorDescription", desc);
+            }
+            conditions.add(c);
+        }
+        out.put("conditions", conditions);
+        return out;
+    }
+
+    /**
+     * SonarQube encode les notes A–E comme 1–5 dans l’API project_status ; on les affiche en lettres dans les messages.
+     */
+    private String formatSonarRatingForMessage(String metricKey, String raw) {
+        if (raw == null || metricKey == null) {
+            return raw != null ? raw : "0";
+        }
+        String k = metricKey.toLowerCase();
+        if (!k.contains("reliability_rating") && !k.contains("security_rating")
+                && !k.contains("maintainability_rating") && !k.contains("sqale_rating")) {
+            return raw;
+        }
+        try {
+            int n = Integer.parseInt(raw.trim());
+            if (n >= 1 && n <= 5) {
+                return String.valueOf("ABCDE".charAt(n - 1));
+            }
+        } catch (NumberFormatException ignored) {
+            // garder la valeur brute
+        }
+        return raw;
+    }
+
+    /**
+     * Construit un message lisible pour une condition Quality Gate en échec.
+     */
+    private String buildQualityGateConditionErrorDescription(String metricKey, String actualValue, String errorThreshold, String comparator) {
+        if (metricKey == null) metricKey = "";
+        String metricLabel = metricKey.toLowerCase().contains("coverage") ? "Couverture"
+                : metricKey.toLowerCase().contains("security_hotspots") ? "Security Hotspots à revoir"
+                : metricKey.toLowerCase().contains("duplicated") ? "Duplication"
+                : metricKey.toLowerCase().contains("reliability_rating") ? "Note de fiabilité (Reliability Rating)"
+                : metricKey.toLowerCase().contains("security_rating") ? "Note de sécurité (Security Rating)"
+                : metricKey.toLowerCase().contains("maintainability_rating")
+                        || metricKey.toLowerCase().contains("sqale_rating")
+                        ? "Note de maintenabilité (Maintainability Rating)"
+                : metricKey.toLowerCase().contains("reliability") ? "Fiabilité"
+                : metricKey.toLowerCase().contains("maintainability") ? "Maintenabilité"
+                : (metricKey.isEmpty() ? "Cette métrique" : metricKey);
+        String actual = formatSonarRatingForMessage(metricKey, actualValue != null ? actualValue : "0");
+        String required = formatSonarRatingForMessage(metricKey, errorThreshold != null ? errorThreshold : "–");
+        // Comparateur: LT = inférieur à, GT = supérieur à, EQ = égal
+        String opLabel = "LT".equalsIgnoreCase(comparator) ? "≥"
+                : "GT".equalsIgnoreCase(comparator) ? "≤"
+                : "≥";
+        return String.format("La valeur actuelle (%s) ne respecte pas le seuil requis (%s %s). Améliorez la métrique \"%s\" pour passer le Quality Gate.",
+                actual, opLabel, required, metricLabel);
+    }
+
+    /**
+     * Récupère les résultats SonarQube pour un projet (métriques globales, issues, hotspots, quality gate).
+     */
+    public Map<String, Object> getSonarQubeResults() {
+        try {
+            log.info("🔍 Récupération des résultats SonarQube pour le projet: {}", sonarProjectKey);
+
+            RestTemplate restTemplate = new RestTemplate();
+            HttpHeaders headers = new HttpHeaders();
+            headers.set("Authorization", "Bearer " + sonarToken);
+
+            HttpEntity<String> entity = new HttpEntity<>(headers);
+
+            // 1. Métriques principales
+            String measuresUrl = String.format(
+                    "%s/api/measures/component?component=%s&metricKeys=bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density,ncloc,security_hotspots,security_rating",
+                    sonarHostUrl,
+                    sonarProjectKey
+            );
+
+            ResponseEntity<JsonNode> measuresResponse = restTemplate.exchange(
+                    measuresUrl,
+                    HttpMethod.GET,
+                    entity,
+                    JsonNode.class
+            );
+
+            // 2. Issues (avec facettes principales pour les filtres frontend)
+            // Facets supportés par l'API : severities, types, statuses, languages, tags, assignees, etc.
+            // On reste sur un sous-ensemble sûr pour éviter les erreurs 400 si un nom de facet change.
+            String issuesUrl = String.format(
+                    "%s/api/issues/search?componentKeys=%s&ps=500"
+                            + "&additionalFields=_all"
+                            + "&facets=severities,types,statuses,languages,tags,assignees",
+                    sonarHostUrl,
+                    sonarProjectKey
+            );
+
+            // SonarCloud: le max renvoyé par requête est 500. On pagine donc pour avoir le bon total.
+            int pageIndex = 1;
+            int totalIssues = 0;
+            com.fasterxml.jackson.databind.node.ArrayNode allIssues = objectMapper.createArrayNode();
+            JsonNode firstIssuesBody = null;
+            while (true) {
+                ResponseEntity<JsonNode> issuesResponsePage = restTemplate.exchange(
+                        issuesUrl + "&p=" + pageIndex,
+                        HttpMethod.GET,
+                        entity,
+                        JsonNode.class
+                );
+                JsonNode issuesBodyPage = issuesResponsePage.getBody();
+                if (issuesBodyPage == null) break;
+                if (firstIssuesBody == null) firstIssuesBody = issuesBodyPage;
+                if (totalIssues == 0) totalIssues = issuesBodyPage.path("total").asInt(0);
+
+                JsonNode issuesPageArr = issuesBodyPage.path("issues");
+                if (!issuesPageArr.isArray() || issuesPageArr.size() == 0) break;
+                for (JsonNode item : issuesPageArr) {
+                    allIssues.add(item);
+                }
+
+                if (allIssues.size() >= totalIssues) break;
+                pageIndex++;
+                // Sécurité: le endpoint a une limite totale pratique (souvent 10000). On évite une boucle infinie.
+                if (pageIndex > 50) break;
+            }
+
+            // 3. Hotspots de sécurité
+            String hotspotsUrl = String.format(
+                    "%s/api/hotspots/search?projectKey=%s&ps=100",
+                    sonarHostUrl,
+                    sonarProjectKey
+            );
+
+            ResponseEntity<JsonNode> hotspotsResponse = restTemplate.exchange(
+                    hotspotsUrl,
+                    HttpMethod.GET,
+                    entity,
+                    JsonNode.class
+            );
+
+            Map<String, Object> result = new HashMap<>();
+
+            // Métriques
+            if (measuresResponse.getBody() != null && measuresResponse.getBody().has("component")) {
+                JsonNode component = measuresResponse.getBody().get("component");
+                JsonNode measures = component.get("measures");
+
+                Map<String, Object> metrics = new HashMap<>();
+                for (JsonNode measure : measures) {
+                    String metric = measure.get("metric").asText();
+                    String value = measure.get("value").asText();
+                    metrics.put(metric, value);
+                }
+                result.put("metrics", metrics);
+            }
+            // Exposer host & project pour permettre des liens directs dans le front
+            result.put("sonar_host_url", sonarHostUrl);
+            result.put("sonar_project_key", sonarProjectKey);
+
+            // Issues (+ facettes pour les filtres frontend)
+            if (firstIssuesBody != null) {
+                result.put("total_issues", totalIssues);
+                result.put("issues", allIssues);
+                result.put("issue_facets", firstIssuesBody.path("facets"));
+            }
+
+            // Hotspots (total peut être absent ou 0 : utiliser la taille de la liste)
+            if (hotspotsResponse.getBody() != null) {
+                JsonNode hotspotsBody = hotspotsResponse.getBody();
+                JsonNode hotspotsArray = hotspotsBody.path("hotspots");
+                int totalFromApi = hotspotsBody.path("total").asInt(0);
+                int count = hotspotsArray.isArray() ? hotspotsArray.size() : 0;
+                result.put("total_hotspots", Math.max(totalFromApi, count));
+                result.put("hotspots", hotspotsArray);
+            }
+
+            // Duplication par fichier (component tree, fichiers uniquement)
+            try {
+                String dupUrl = String.format(
+                        "%s/api/measures/component_tree?component=%s&metricKeys=duplicated_lines_density&qualifiers=FIL&ps=100",
+                        sonarHostUrl,
+                        sonarProjectKey
+                );
+
+                ResponseEntity<JsonNode> dupResponse = restTemplate.exchange(
+                        dupUrl,
+                        HttpMethod.GET,
+                        entity,
+                        JsonNode.class
+                );
+
+                if (dupResponse.getBody() != null) {
+                    result.put("duplication_components", dupResponse.getBody().path("components"));
+                }
+            } catch (Exception e) {
+                log.warn("⚠️ Impossible de récupérer le détail de duplication par fichier: {}", e.getMessage());
+            }
+
+            // Couverture par fichier (pour Quality Gate Coverage)
+            try {
+                String covUrl = String.format(
+                        "%s/api/measures/component_tree?component=%s&metricKeys=coverage,uncovered_lines,uncovered_conditions&qualifiers=FIL&ps=100",
+                        sonarHostUrl,
+                        sonarProjectKey
+                );
+
+                ResponseEntity<JsonNode> covResponse = restTemplate.exchange(
+                        covUrl,
+                        HttpMethod.GET,
+                        entity,
+                        JsonNode.class
+                );
+
+                if (covResponse.getBody() != null) {
+                    result.put("coverage_components", covResponse.getBody().path("components"));
+                }
+            } catch (Exception e) {
+                log.warn("⚠️ Impossible de récupérer le détail de couverture par fichier: {}", e.getMessage());
+            }
+
+            // Quality Gate
+            String qualityGateUrl = String.format(
+                    "%s/api/qualitygates/project_status?projectKey=%s",
+                    sonarHostUrl,
+                    sonarProjectKey
+            );
+
+            ResponseEntity<JsonNode> qualityGateResponse = restTemplate.exchange(
+                    qualityGateUrl,
+                    HttpMethod.GET,
+                    entity,
+                    JsonNode.class
+            );
+
+            if (qualityGateResponse.getBody() != null && qualityGateResponse.getBody().has("projectStatus")) {
+                JsonNode projectStatus = qualityGateResponse.getBody().get("projectStatus");
+                result.put("quality_gate", normalizeQualityGateStatus(projectStatus));
+            }
+
+            log.info("✅ Résultats SonarQube récupérés avec succès");
+            return result;
+
+        } catch (Exception e) {
+            log.error("❌ Erreur récupération résultats SonarQube: {}", e.getMessage());
+            throw new RuntimeException("Impossible de récupérer les résultats SonarQube", e);
+        }
+    }
+
+    /**
+     * Change le statut d'une issue SonarQube/SonarCloud (persisté côté SonarCloud).
+     * Transitions possibles: confirm, unconfirm, resolve, reopen, falsepositive, wontfix, accept.
+     */
+    public void sonarIssueDoTransition(String issueKey, String transition) {
+        if (issueKey == null || issueKey.isBlank() || transition == null || transition.isBlank()) {
+            throw new IllegalArgumentException("issueKey et transition sont requis");
+        }
+        String url = sonarHostUrl.replaceAll("/+$", "") + "/api/issues/do_transition";
+        RestTemplate restTemplate = new RestTemplate();
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(org.springframework.http.MediaType.APPLICATION_FORM_URLENCODED);
+        headers.set("Authorization", "Bearer " + sonarToken);
+        MultiValueMap<String, String> body = new LinkedMultiValueMap<>();
+        body.add("issue", issueKey);
+        body.add("transition", transition);
+        HttpEntity<MultiValueMap<String, String>> entity = new HttpEntity<>(body, headers);
+        ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.POST, entity, String.class);
+        if (!response.getStatusCode().is2xxSuccessful()) {
+            throw new RuntimeException("Transition échouée: " + response.getStatusCode());
+        }
+        log.info("✅ Issue {} transition vers {}", issueKey, transition);
+    }
+
+    /**
+     * Assigne ou désassigne une issue SonarQube/SonarCloud (persisté côté SonarCloud).
+     * @param issueKey clé de l'issue
+     * @param assignee login utilisateur SonarCloud, ou null/empty pour désassigner
+     */
+    public void sonarIssueAssign(String issueKey, String assignee) {
+        if (issueKey == null || issueKey.isBlank()) {
+            throw new IllegalArgumentException("issueKey est requis");
+        }
+        String url = sonarHostUrl.replaceAll("/+$", "") + "/api/issues/assign";
+        RestTemplate restTemplate = new RestTemplate();
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(org.springframework.http.MediaType.APPLICATION_FORM_URLENCODED);
+        headers.set("Authorization", "Bearer " + sonarToken);
+        MultiValueMap<String, String> body = new LinkedMultiValueMap<>();
+        body.add("issue", issueKey);
+        if (assignee != null && !assignee.isBlank()) {
+            body.add("assignee", assignee);
+        }
+        HttpEntity<MultiValueMap<String, String>> entity = new HttpEntity<>(body, headers);
+        ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.POST, entity, String.class);
+        if (!response.getStatusCode().is2xxSuccessful()) {
+            throw new RuntimeException("Assignation échouée: " + response.getStatusCode());
+        }
+        log.info("✅ Issue {} assignée à {}", issueKey, assignee != null ? assignee : "(désassignée)");
+    }
+
+    /**
+     * Assigne l'issue au compte SonarCloud par défaut (utilisé pour \"Assign to me\" côté plateforme).
+     */
+    public void sonarIssueAssignToDefault(String issueKey) {
+        if (sonarDefaultAssignee == null || sonarDefaultAssignee.isBlank()) {
+            throw new IllegalStateException("sonarqube.default-assignee n'est pas configuré côté backend");
+        }
+        sonarIssueAssign(issueKey, sonarDefaultAssignee);
+    }
+
+    /**
+     * Désassigne complètement l'issue (équivalent Not assigned).
+     */
+    public void sonarIssueUnassign(String issueKey) {
+        sonarIssueAssign(issueKey, null);
+    }
+
+    /**
+     * Récupère les résultats SonarQube pour une branche spécifique.
+     */
+    public Map<String, Object> getSonarQubeResultsForBranch(String branch) {
+        try {
+            log.info("🔍 Récupération des résultats SonarQube pour la branche: {}", branch);
+
+            RestTemplate restTemplate = new RestTemplate();
+            HttpHeaders headers = new HttpHeaders();
+            headers.set("Authorization", "Bearer " + sonarToken);
+
+            HttpEntity<String> entity = new HttpEntity<>(headers);
+
+            Map<String, Object> result = new HashMap<>();
+            result.put("branch", branch);
+
+            // 1) Métriques (branch)
+            String measuresUrl = String.format(
+                    "%s/api/measures/component?component=%s&branch=%s&metricKeys=bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density,ncloc,security_hotspots,security_rating",
+                    sonarHostUrl,
+                    sonarProjectKey,
+                    branch
+            );
+            ResponseEntity<JsonNode> measuresResponse = restTemplate.exchange(measuresUrl, HttpMethod.GET, entity, JsonNode.class);
+            if (measuresResponse.getBody() != null && measuresResponse.getBody().has("component")) {
+                JsonNode component = measuresResponse.getBody().get("component");
+                JsonNode measures = component.get("measures");
+                Map<String, Object> metrics = new HashMap<>();
+                for (JsonNode measure : measures) {
+                    String metric = measure.get("metric").asText();
+                    String value = measure.path("value").asText("");
+                    metrics.put(metric, value);
+                }
+                result.put("metrics", metrics);
+            }
+
+            result.put("sonar_host_url", sonarHostUrl);
+            result.put("sonar_project_key", sonarProjectKey);
+
+            // 2) Issues (branch + statuts par défaut SonarCloud)
+            // SonarCloud UI “Issues” affiche par défaut OPEN + CONFIRMED + REOPENED, mais on inclut aussi RESOLVED
+            // pour pouvoir filtrer "Fixed / False Positive / Accepted" côté UI.
+            // IMPORTANT: ne pas filtrer par statuses ici.
+            // SonarCloud UI applique un filtre par défaut (OPEN/CONFIRMED/REOPENED) côté client,
+            // mais pour que "Fixed / False Positive / Accepted" fonctionne, il faut récupérer aussi CLOSED/RESOLVED.
+            String issuesUrl = String.format(
+                    "%s/api/issues/search?componentKeys=%s&branch=%s&ps=500"
+                            + "&additionalFields=_all"
+                            + "&facets=severities,types,statuses,languages,tags,assignees,resolutions",
+                    sonarHostUrl,
+                    sonarProjectKey,
+                    branch
+            );
+            // SonarCloud: paginer pour éviter le plafond à 500.
+            int pageIndex = 1;
+            int totalIssues = 0;
+            com.fasterxml.jackson.databind.node.ArrayNode allIssues = objectMapper.createArrayNode();
+            JsonNode firstIssuesBody = null;
+            while (true) {
+                ResponseEntity<JsonNode> issuesResponsePage = restTemplate.exchange(
+                        issuesUrl + "&p=" + pageIndex,
+                        HttpMethod.GET,
+                        entity,
+                        JsonNode.class
+                );
+                JsonNode issuesBodyPage = issuesResponsePage.getBody();
+                if (issuesBodyPage == null) break;
+                if (firstIssuesBody == null) firstIssuesBody = issuesBodyPage;
+                if (totalIssues == 0) totalIssues = issuesBodyPage.path("total").asInt(0);
+
+                JsonNode issuesPageArr = issuesBodyPage.path("issues");
+                if (!issuesPageArr.isArray() || issuesPageArr.size() == 0) break;
+                for (JsonNode item : issuesPageArr) {
+                    allIssues.add(item);
+                }
+                if (allIssues.size() >= totalIssues) break;
+
+                pageIndex++;
+                if (pageIndex > 50) break;
+            }
+            if (firstIssuesBody != null) {
+                result.put("total_issues", totalIssues);
+                result.put("issues", allIssues);
+                result.put("issue_facets", firstIssuesBody.path("facets"));
+            }
+
+            // 3) Hotspots (pas de filtre branch fiable) : identique à /results
+            try {
+                String hotspotsUrl = String.format("%s/api/hotspots/search?projectKey=%s&ps=100", sonarHostUrl, sonarProjectKey);
+                ResponseEntity<JsonNode> hotspotsResponse = restTemplate.exchange(hotspotsUrl, HttpMethod.GET, entity, JsonNode.class);
+                if (hotspotsResponse.getBody() != null) {
+                    JsonNode hotspotsBody = hotspotsResponse.getBody();
+                    JsonNode hotspotsArray = hotspotsBody.path("hotspots");
+                    int totalFromApi = hotspotsBody.path("total").asInt(0);
+                    int count = hotspotsArray.isArray() ? hotspotsArray.size() : 0;
+                    result.put("total_hotspots", Math.max(totalFromApi, count));
+                    result.put("hotspots", hotspotsArray);
+                }
+            } catch (Exception e) {
+                log.warn("⚠️ Hotspots non récupérés (branch={}): {}", branch, e.getMessage());
+            }
+
+            // 4) Duplication par fichier (branch)
+            try {
+                String dupUrl = String.format(
+                        "%s/api/measures/component_tree?component=%s&branch=%s&metricKeys=duplicated_lines_density&qualifiers=FIL&ps=100",
+                        sonarHostUrl,
+                        sonarProjectKey,
+                        branch
+                );
+                ResponseEntity<JsonNode> dupResponse = restTemplate.exchange(dupUrl, HttpMethod.GET, entity, JsonNode.class);
+                if (dupResponse.getBody() != null) {
+                    result.put("duplication_components", dupResponse.getBody().path("components"));
+                }
+            } catch (Exception e) {
+                log.warn("⚠️ Impossible de récupérer le détail de duplication par fichier (branch={}): {}", branch, e.getMessage());
+            }
+
+            // 5) Couverture par fichier (branch)
+            try {
+                String covUrl = String.format(
+                        "%s/api/measures/component_tree?component=%s&branch=%s&metricKeys=coverage,uncovered_lines,uncovered_conditions&qualifiers=FIL&ps=100",
+                        sonarHostUrl,
+                        sonarProjectKey,
+                        branch
+                );
+                ResponseEntity<JsonNode> covResponse = restTemplate.exchange(covUrl, HttpMethod.GET, entity, JsonNode.class);
+                if (covResponse.getBody() != null) {
+                    result.put("coverage_components", covResponse.getBody().path("components"));
+                }
+            } catch (Exception e) {
+                log.warn("⚠️ Impossible de récupérer le détail de couverture par fichier (branch={}): {}", branch, e.getMessage());
+            }
+
+            // 6) Quality Gate (global projet)
+            try {
+                String qualityGateUrl = String.format("%s/api/qualitygates/project_status?projectKey=%s", sonarHostUrl, sonarProjectKey);
+                ResponseEntity<JsonNode> qualityGateResponse = restTemplate.exchange(qualityGateUrl, HttpMethod.GET, entity, JsonNode.class);
+                if (qualityGateResponse.getBody() != null && qualityGateResponse.getBody().has("projectStatus")) {
+                    JsonNode projectStatus = qualityGateResponse.getBody().get("projectStatus");
+                    result.put("quality_gate", normalizeQualityGateStatus(projectStatus));
+                }
+            } catch (Exception e) {
+                log.warn("⚠️ Quality Gate non récupéré: {}", e.getMessage());
+            }
+
+            log.info("✅ Résultats SonarQube récupérés avec succès (branch={})", branch);
+            return result;
+
+        } catch (Exception e) {
+            log.error("❌ Erreur récupération résultats SonarQube pour branche {}: {}", branch, e.getMessage());
+            return Collections.emptyMap();
+        }
+    }
+
+    /**
+     * Variante: récupère les résultats SonarQube/SonarCloud pour un projectKey dynamique.
+     * Utilisé quand chaque environnement a son propre projectKey (ex: EnviroTest_{ENV_ID}).
+     *
+     * @param projectKey projectKey SonarCloud
+     * @param branch     branche (optionnelle)
+     */
+    public Map<String, Object> getSonarQubeResultsForProjectKey(String projectKey, String branch) {
+        if (projectKey == null || projectKey.isBlank()) {
+            return Collections.emptyMap();
+        }
+        try {
+            String pk = projectKey.trim();
+            String b = branch != null && !branch.isBlank() ? branch.trim() : null;
+            log.info("🔍 Récupération SonarQube results (projectKey={}, branch={})", pk, b);
+
+            RestTemplate restTemplate = new RestTemplate();
+            HttpHeaders headers = new HttpHeaders();
+            headers.set("Authorization", "Bearer " + sonarToken);
+            HttpEntity<String> entity = new HttpEntity<>(headers);
+
+            Map<String, Object> result = new HashMap<>();
+            result.put("sonar_host_url", sonarHostUrl);
+            result.put("sonar_project_key", pk);
+            if (b != null) result.put("branch", b);
+
+            String issuesUrl = String.format(
+                    "%s/api/issues/search?componentKeys=%s&ps=500"
+                            + "&additionalFields=_all"
+                            + "&facets=severities,types,statuses,languages,tags,assignees,resolutions",
+                    sonarHostUrl,
+                    pk
+            );
+            if (b != null) {
+                issuesUrl += "&branch=" + b;
+            }
+
+            int pageIndex = 1;
+            int totalIssues = 0;
+            com.fasterxml.jackson.databind.node.ArrayNode allIssues = objectMapper.createArrayNode();
+            JsonNode firstIssuesBody = null;
+            while (true) {
+                ResponseEntity<JsonNode> issuesResponsePage = restTemplate.exchange(
+                        issuesUrl + "&p=" + pageIndex,
+                        HttpMethod.GET,
+                        entity,
+                        JsonNode.class
+                );
+                JsonNode issuesBodyPage = issuesResponsePage.getBody();
+                if (issuesBodyPage == null) break;
+                if (firstIssuesBody == null) firstIssuesBody = issuesBodyPage;
+                if (totalIssues == 0) totalIssues = issuesBodyPage.path("total").asInt(0);
+
+                JsonNode issuesPageArr = issuesBodyPage.path("issues");
+                if (!issuesPageArr.isArray() || issuesPageArr.size() == 0) break;
+                for (JsonNode item : issuesPageArr) {
+                    allIssues.add(item);
+                }
+                if (allIssues.size() >= totalIssues) break;
+
+                pageIndex++;
+                if (pageIndex > 50) break;
+            }
+            if (firstIssuesBody != null) {
+                result.put("total_issues", totalIssues);
+                result.put("issues", allIssues);
+                result.put("issue_facets", firstIssuesBody.path("facets"));
+            }
+
+            // Hotspots (branch non fiable)
+            try {
+                String hotspotsUrl = String.format("%s/api/hotspots/search?projectKey=%s&ps=100", sonarHostUrl, pk);
+                ResponseEntity<JsonNode> hotspotsResponse = restTemplate.exchange(hotspotsUrl, HttpMethod.GET, entity, JsonNode.class);
+                if (hotspotsResponse.getBody() != null) {
+                    JsonNode hotspotsBody = hotspotsResponse.getBody();
+                    JsonNode hotspotsArray = hotspotsBody.path("hotspots");
+                    int totalFromApi = hotspotsBody.path("total").asInt(0);
+                    int count = hotspotsArray.isArray() ? hotspotsArray.size() : 0;
+                    result.put("total_hotspots", Math.max(totalFromApi, count));
+                    result.put("hotspots", hotspotsArray);
+                }
+            } catch (Exception e) {
+                log.warn("⚠️ Hotspots non récupérés (projectKey={}): {}", pk, e.getMessage());
+            }
+
+            // Quality Gate
+            try {
+                String qualityGateUrl = String.format("%s/api/qualitygates/project_status?projectKey=%s", sonarHostUrl, pk);
+                ResponseEntity<JsonNode> qualityGateResponse = restTemplate.exchange(qualityGateUrl, HttpMethod.GET, entity, JsonNode.class);
+                if (qualityGateResponse.getBody() != null && qualityGateResponse.getBody().has("projectStatus")) {
+                    JsonNode projectStatus = qualityGateResponse.getBody().get("projectStatus");
+                    result.put("quality_gate", normalizeQualityGateStatus(projectStatus));
+                }
+            } catch (Exception e) {
+                log.warn("⚠️ Quality Gate non récupéré (projectKey={}): {}", pk, e.getMessage());
+            }
+
+            return result;
+        } catch (Exception e) {
+            log.warn("⚠️ Erreur récupération SonarQube results (projectKey={}, branch={}): {}", projectKey, branch, e.getMessage());
+            return Collections.emptyMap();
+        }
+    }
+
+    /**
+     * Récupère le statut du Quality Gate global.
+     */
+    public Map<String, Object> getQualityGateStatus() {
+        try {
+            String url = String.format(
+                    "%s/api/qualitygates/project_status?projectKey=%s",
+                    sonarHostUrl,
+                    sonarProjectKey
+            );
+
+            RestTemplate restTemplate = new RestTemplate();
+            HttpHeaders headers = new HttpHeaders();
+            headers.set("Authorization", "Bearer " + sonarToken);
+
+            HttpEntity<String> entity = new HttpEntity<>(headers);
+
+            ResponseEntity<JsonNode> response = restTemplate.exchange(
+                    url,
+                    HttpMethod.GET,
+                    entity,
+                    JsonNode.class
+            );
+
+            Map<String, Object> result = new HashMap<>();
+
+            if (response.getBody() != null && response.getBody().has("projectStatus")) {
+                JsonNode status = response.getBody().get("projectStatus");
+                result.put("status", status.path("status").asText());
+                result.put("conditions", status.path("conditions"));
+            }
+
+            return result;
+
+        } catch (Exception e) {
+            log.error("❌ Erreur récupération Quality Gate: {}", e.getMessage());
+            return Collections.emptyMap();
+        }
+    }
+
+    /**
+     * Récupère le code source brut et les métadonnées de duplication SonarQube pour un composant (fichier).
+     */
+    public Map<String, Object> getSonarFileDuplications(String componentKey) {
+        try {
+            RestTemplate restTemplate = new RestTemplate();
+            HttpHeaders headers = new HttpHeaders();
+            headers.set("Authorization", "Bearer " + sonarToken);
+            HttpEntity<String> entity = new HttpEntity<>(headers);
+
+            // Source brute
+            String srcUrl = String.format(
+                    "%s/api/sources/raw?key=%s",
+                    sonarHostUrl,
+                    componentKey
+            );
+            ResponseEntity<String> srcResponse = restTemplate.exchange(
+                    srcUrl,
+                    HttpMethod.GET,
+                    entity,
+                    String.class
+            );
+
+            // Métadonnées de duplication (blocs)
+            String dupUrl = String.format(
+                    "%s/api/duplications/show?key=%s",
+                    sonarHostUrl,
+                    componentKey
+            );
+            ResponseEntity<JsonNode> dupResponse = restTemplate.exchange(
+                    dupUrl,
+                    HttpMethod.GET,
+                    entity,
+                    JsonNode.class
+            );
+
+            Map<String, Object> result = new HashMap<>();
+            result.put("componentKey", componentKey);
+            result.put("source", srcResponse.getBody() != null ? srcResponse.getBody() : "");
+            result.put("duplications", dupResponse.getBody());
+            return result;
+        } catch (Exception e) {
+            log.error("❌ Erreur récupération duplications SonarQube pour {}: {}", componentKey, e.getMessage());
+            throw new RuntimeException("Impossible de récupérer les duplications pour " + componentKey, e);
+        }
+    }
+
+    /**
+     * Récupère tous les détails d'un Security Hotspot : hotspot (show), règle (risk/fix), extrait de code.
+     */
+    /**
+     * Récupère tous les détails d'un Security Hotspot : hotspot (show), règle (risk/fix), extrait de code.
+     */
+    public Map<String, Object> getHotspotDetails(String hotspotKey) {
+        try {
+            RestTemplate restTemplate = new RestTemplate();
+            HttpHeaders headers = new HttpHeaders();
+            headers.set("Authorization", "Bearer " + sonarToken);
+            HttpEntity<String> entity = new HttpEntity<>(headers);
+
+            // 1. Détail du hotspot
+            String showUrl = String.format("%s/api/hotspots/show?hotspot=%s", sonarHostUrl, hotspotKey);
+            ResponseEntity<JsonNode> showResponse = restTemplate.exchange(
+                    showUrl, HttpMethod.GET, entity, JsonNode.class);
+            if (showResponse.getBody() == null || !showResponse.getBody().has("key")) {
+                throw new RuntimeException("Hotspot non trouvé: " + hotspotKey);
+            }
+            JsonNode hotspot = showResponse.getBody();
+            String ruleKey = hotspot.has("ruleKey") ? hotspot.get("ruleKey").asText() : null;
+
+            // Logs détaillés pour vérifier ce que renvoie SonarQube
+            log.info("🔍 Hotspot récupéré (key={}): {}", hotspotKey, hotspot.toString());
+            log.info("🔍 Hotspot - ruleKey={}, component={}", ruleKey, hotspot.path("component").toString());
+
+            Map<String, Object> result = new HashMap<>();
+            result.put("hotspot", objectMapper.convertValue(hotspot, Map.class));
+
+            // 2. Détails de la règle (risk, fix, description)
+            if (ruleKey != null) {
+                try {
+                    // Appeler l'API des règles
+                    String ruleUrl = String.format("%s/api/rules/show?key=%s", sonarHostUrl, ruleKey);
+                    ResponseEntity<JsonNode> ruleResponse = restTemplate.exchange(
+                            ruleUrl, HttpMethod.GET, entity, JsonNode.class);
+
+                    if (ruleResponse.getBody() != null) {
+                        JsonNode rootRule = ruleResponse.getBody();
+                        JsonNode rule = rootRule.has("rule") ? rootRule.get("rule") : rootRule;
+
+                        // Log brut pour comparer avec l'interface SonarQube
+                        log.info("📋 Règle brute pour hotspot {} (ruleKey={}): {}", hotspotKey, ruleKey, rule.toString());
+
+                        // On renvoie la règle complète au front pour debug/affichage
+                        Map<String, Object> ruleMap = objectMapper.convertValue(rule, Map.class);
+                        result.put("rule", ruleMap);
+                    } else {
+                        log.warn("❓ Réponse vide de /api/rules/show pour ruleKey={}", ruleKey);
+                    }
+                } catch (Exception e) {
+                    log.warn("Règle non récupérée pour {}: {}", ruleKey, e.getMessage());
+                }
+            }
+
+            // 3. Extrait de code (où est le risque)
+            String componentKey = null;
+            JsonNode compNode = hotspot.get("component");
+            if (compNode != null && !compNode.isMissingNode()) {
+                if (compNode.isTextual()) {
+                    componentKey = compNode.asText();
+                } else if (compNode.has("key")) {
+                    componentKey = compNode.get("key").asText();
+                } else if (compNode.has("path")) {
+                    componentKey = compNode.get("path").asText();
+                }
+            }
+
+            int line = hotspot.has("line") ? hotspot.path("line").asInt(0) : 0;
+
+            if (componentKey != null && line > 0) {
+                try {
+                    String rawUrl = String.format("%s/api/sources/raw?key=%s", sonarHostUrl, componentKey);
+                    ResponseEntity<String> rawResponse = restTemplate.exchange(
+                            rawUrl, HttpMethod.GET, entity, String.class);
+                    if (rawResponse.getBody() != null) {
+                        String[] lines = rawResponse.getBody().split("\r?\n");
+                        int from = Math.max(0, line - 6);
+                        int to = Math.min(lines.length, line + 5);
+                        List<String> snippet = new ArrayList<>();
+                        for (int i = from; i < to; i++) {
+                            snippet.add(lines[i]);
+                        }
+                        result.put("sourceLines", snippet);
+                        result.put("sourceLineFrom", from + 1);
+                        result.put("highlightLine", line);
+                    }
+                } catch (Exception e) {
+                    log.warn("Source non récupérée pour {}: {}", componentKey, e.getMessage());
+                }
+            }
+
+            result.put("sonar_host_url", sonarHostUrl);
+            result.put("sonar_project_key", sonarProjectKey);
+            log.info("✅ Détail hotspot récupéré: {}", hotspotKey);
+            return result;
+
+        } catch (Exception e) {
+            log.error("❌ Erreur récupération détail hotspot {}: {}", hotspotKey, e.getMessage());
+            throw new RuntimeException("Impossible de récupérer le détail du hotspot", e);
+        }
+    }
     // ============================================
     // PIPELINE - GESTION AVANCÉE
     // ============================================
@@ -576,6 +1504,21 @@ public class GitLabService {
         }
     }
 
+    /**
+     * Relance un job GitLab (retry) sans relancer tout le pipeline.
+     *
+     * @param jobId ID du job
+     */
+    public void retryJob(Long jobId) {
+        try {
+            log.info("🔁 Retry job {}", jobId);
+            gitLabApi.getJobApi().retryJob(gitlabProjectId, jobId);
+        } catch (GitLabApiException e) {
+            log.error("❌ Erreur retry job {}: {}", jobId, e.getMessage());
+            throw new RuntimeException("Impossible de relancer le job", e);
+        }
+    }
+
     // ============================================
     // UTILITAIRES
     // ============================================
@@ -608,54 +1551,97 @@ public class GitLabService {
      * @param pipelineId ID du pipeline
      * @return Map avec les informations essentielles
      */
+    @Cacheable(value = "pipelineSummaries", key = "#pipelineId", unless = "#result == null")
     public Map<String, Object> getPipelineSummary(Long pipelineId) {
         try {
-            Pipeline pipeline = getPipeline(pipelineId);
-            List<Job> jobs = getPipelineJobs(pipelineId);
+            // Version avec timeout et exécution parallèle
+            CompletableFuture<Pipeline> pipelineFuture = CompletableFuture.supplyAsync(() -> {
+                try {
+                    return gitLabApi.getPipelineApi().getPipeline(gitlabProjectId, pipelineId);
+                } catch (GitLabApiException e) {
+                    throw new RuntimeException(e);
+                }
+            });
 
-            Map<String, Object> summary = new HashMap<>();
-            summary.put("id", pipeline.getId());
-            summary.put("status", pipeline.getStatus().toString());
-            summary.put("webUrl", pipeline.getWebUrl());
-            summary.put("duration", pipeline.getDuration());
-            summary.put("createdAt", pipeline.getCreatedAt());
-            summary.put("finishedAt", pipeline.getFinishedAt());
-            summary.put("isFinished", isPipelineFinished(pipelineId));
-            String sha = pipeline.getSha();
-            summary.put("ref", pipeline.getRef());
-            summary.put("sha", sha);
-            summary.put("shortSha", sha != null && !sha.isEmpty() ? sha.substring(0, Math.min(8, sha.length())) : null);
+            CompletableFuture<List<Job>> jobsFuture = CompletableFuture.supplyAsync(() -> {
+                try {
+                    return gitLabApi.getJobApi().getJobsForPipeline(gitlabProjectId, pipelineId);
+                } catch (GitLabApiException e) {
+                    throw new RuntimeException(e);
+                }
+            });
 
-            // Compter les jobs par statut
-            Map<String, Long> jobStatusCount = new HashMap<>();
-            for (Job job : jobs) {
-                String status = job.getStatus().toString();
-                jobStatusCount.put(status, jobStatusCount.getOrDefault(status, 0L) + 1);
-            }
-            summary.put("jobStatusCount", jobStatusCount);
-            summary.put("totalJobs", jobs.size());
+            // Timeout de 3 secondes
+            Pipeline pipeline = pipelineFuture.get(gitlabTimeoutSeconds, TimeUnit.SECONDS);
+            List<Job> jobs = jobsFuture.get(gitlabTimeoutSeconds, TimeUnit.SECONDS);
 
-            // Liste des jobs
-            List<Map<String, Object>> jobsList = new ArrayList<>();
-            for (Job job : jobs) {
-                Map<String, Object> jobInfo = new HashMap<>();
-                jobInfo.put("id", job.getId());
-                jobInfo.put("name", job.getName());
-                jobInfo.put("status", job.getStatus().toString());
-                jobInfo.put("stage", job.getStage());
-                jobInfo.put("duration", job.getDuration());
-                jobInfo.put("webUrl", job.getWebUrl());
-                jobsList.add(jobInfo);
-            }
-            summary.put("jobs", jobsList);
-
-            log.info("✅ Résumé du pipeline {} généré", pipelineId);
-            return summary;
+            return buildPipelineSummary(pipeline, jobs);
 
         } catch (Exception e) {
-            log.error("❌ Erreur génération résumé pipeline {}: {}", pipelineId, e.getMessage());
-            throw new RuntimeException("Impossible de générer le résumé du pipeline", e);
+            log.warn("⚠️ Timeout ou erreur GitLab pour pipeline {}, utilisation fallback DB", pipelineId);
+            // Retourner les infos minimales depuis la base de données
+            return getFallbackSummary(pipelineId);
         }
+    }
+
+    /**
+     * Construit le résumé à partir des données GitLab
+     */
+    private Map<String, Object> buildPipelineSummary(Pipeline pipeline, List<Job> jobs) {
+        Map<String, Object> summary = new HashMap<>();
+        summary.put("id", pipeline.getId());
+        summary.put("status", pipeline.getStatus().toString());
+        summary.put("webUrl", pipeline.getWebUrl());
+        summary.put("duration", pipeline.getDuration());
+        summary.put("createdAt", pipeline.getCreatedAt());
+        summary.put("finishedAt", pipeline.getFinishedAt());
+
+        String sha = pipeline.getSha();
+        summary.put("ref", pipeline.getRef());
+        summary.put("sha", sha);
+        summary.put("shortSha", sha != null && !sha.isEmpty() ? sha.substring(0, Math.min(8, sha.length())) : null);
+
+        // Compter les jobs par statut
+        Map<String, Long> jobStatusCount = new HashMap<>();
+        for (Job job : jobs) {
+            String status = job.getStatus().toString();
+            jobStatusCount.put(status, jobStatusCount.getOrDefault(status, 0L) + 1);
+        }
+        summary.put("jobStatusCount", jobStatusCount);
+        summary.put("totalJobs", jobs.size());
+
+        // Liste des jobs
+        List<Map<String, Object>> jobsList = new ArrayList<>();
+        for (Job job : jobs) {
+            Map<String, Object> jobInfo = new HashMap<>();
+            jobInfo.put("id", job.getId());
+            jobInfo.put("name", job.getName());
+            jobInfo.put("status", job.getStatus().toString());
+            jobInfo.put("stage", job.getStage());
+            jobInfo.put("duration", job.getDuration());
+            jobInfo.put("webUrl", job.getWebUrl());
+            jobsList.add(jobInfo);
+        }
+        summary.put("jobs", jobsList);
+
+        log.info("✅ Résumé du pipeline {} généré", pipeline.getId());
+        return summary;
+    }
+    private Map<String, Object> getFallbackSummary(Long pipelineId) {
+        Map<String, Object> summary = new HashMap<>();
+        summary.put("id", pipelineId);
+        summary.put("status", "UNKNOWN");
+        summary.put("webUrl", null);
+        summary.put("duration", null);
+        summary.put("createdAt", null);
+        summary.put("finishedAt", null);
+        summary.put("ref", null);
+        summary.put("sha", null);
+        summary.put("shortSha", null);
+        summary.put("jobStatusCount", new HashMap<>());
+        summary.put("totalJobs", 0);
+        summary.put("jobs", List.of());
+        return summary;
     }
 
     /**
@@ -716,6 +1702,25 @@ public class GitLabService {
         } catch (Exception e) {
             log.error("❌ Erreur récupération rapports de sécurité: {}", e.getMessage());
             return reports; // Retourner ce qui a été récupéré
+        }
+    }
+
+    // Dans GitLabService.java
+
+    /**
+     * Supprime un pipeline dans GitLab
+     */
+    public void deletePipeline(Long pipelineId) {
+        try {
+            gitLabApi.getPipelineApi().deletePipeline(gitlabProjectId, pipelineId);
+            log.info("✅ Pipeline {} supprimé de GitLab", pipelineId);
+        } catch (GitLabApiException e) {
+            if (e.getHttpStatus() == 404) {
+                log.warn("Pipeline {} déjà supprimé ou inexistant dans GitLab", pipelineId);
+            } else {
+                log.error("❌ Erreur suppression pipeline {} dans GitLab: {}", pipelineId, e.getMessage());
+                throw new RuntimeException("Impossible de supprimer le pipeline dans GitLab", e);
+            }
         }
     }
 }

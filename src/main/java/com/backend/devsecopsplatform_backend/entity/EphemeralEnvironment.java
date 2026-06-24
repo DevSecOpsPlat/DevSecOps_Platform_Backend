@@ -81,9 +81,9 @@ public class EphemeralEnvironment {
     private LocalDateTime destroyedAt;
 
 
-    @OneToMany(mappedBy = "environment", cascade = CascadeType.ALL, orphanRemoval = true)
-    @JsonManagedReference("env-pipeline") // Parent de Pipeline
-    private List<PipelineExecution> pipelineExecutions = new ArrayList<>();
+    @OneToOne(mappedBy = "environment", cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.LAZY)
+    @JsonManagedReference("env-pipeline")
+    private PipelineExecution pipelineExecution;
 
     @OneToMany(mappedBy = "environment", cascade = CascadeType.ALL, orphanRemoval = true)
     @JsonManagedReference("env-resource") // Parent de CloudResource
@@ -112,11 +112,13 @@ public class EphemeralEnvironment {
 
     public void markAsDestroyed() {
         this.status = EnvironmentStatus.DESTROYED;
-        this.destroyedAt = LocalDateTime.now();
+        // Quand la destruction est déclenchée par le TTL, on veut aligner destroyedAt avec expiresAt.
+        // (destroyedAt reste la "date de destruction effective" si expiresAt est absent)
+        this.destroyedAt = this.expiresAt != null ? this.expiresAt : LocalDateTime.now();
     }
 
     public void addPipelineExecution(PipelineExecution execution) {
-        pipelineExecutions.add(execution);
+        this.pipelineExecution = execution;
         execution.setEnvironment(this);
     }
 

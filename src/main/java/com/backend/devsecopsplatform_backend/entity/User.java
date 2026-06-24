@@ -1,5 +1,6 @@
 package com.backend.devsecopsplatform_backend.entity;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import lombok.Data;
 import java.util.List;
 import jakarta.persistence.*;
@@ -33,7 +34,9 @@ public class User {
     @Column(name = "email", unique = true, nullable = false, length = 255)
     private String email;
 
+    /* WRITE_ONLY : accepté dans les requêtes (login), jamais exposé dans les réponses JSON. */
     @Column(name = "password_hash", nullable = false, length = 255)
+    @JsonProperty(access = JsonProperty.Access.WRITE_ONLY)
     private String password;
 
     @ElementCollection(fetch = FetchType.EAGER)
@@ -48,17 +51,7 @@ public class User {
 
     @Enumerated(EnumType.STRING)
     @Column(name = "account_status", nullable = false, length = 50)
-    private AccountStatus accountStatus = AccountStatus.PENDING;
-
-    @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "validated_by")
-    private User validatedBy;
-
-    @Column(name = "validated_at")
-    private LocalDateTime validatedAt;
-
-    @Column(name = "rejection_reason", length = 500)
-    private String rejectionReason;
+    private AccountStatus accountStatus = AccountStatus.ACTIVE;
 
     @CreationTimestamp
     @Column(name = "created_at", nullable = false, updatable = false)
@@ -68,34 +61,78 @@ public class User {
     @Column(name = "updated_at")
     private LocalDateTime updatedAt;
 
+    @Column(name = "last_login_at")
+    private LocalDateTime lastLoginAt;
+
+    @Column(name = "locked_until")
+    private LocalDateTime lockedUntil;
+
+    @Column(name = "must_change_password", nullable = false)
+    private boolean mustChangePassword = false;
+
+    @Column(name = "activation_token", length = 64)
+    private String activationToken;
+
+    @Column(name = "activation_token_expires_at")
+    private LocalDateTime activationTokenExpiresAt;
+
+    @Column(name = "activated_at")
+    private LocalDateTime activatedAt;
+
+    /** Secret TOTP chiffré (AES-GCM) — null si 2FA non configurée. */
+    @Column(name = "totp_secret_enc", length = 512)
+    @JsonProperty(access = JsonProperty.Access.WRITE_ONLY)
+    private String totpSecretEncrypted;
+
+    @Column(name = "totp_enabled", nullable = false)
+    private boolean totpEnabled = false;
+
+    @Column(name = "totp_enabled_at")
+    private LocalDateTime totpEnabledAt;
+
+    /** Méthode 2FA active : TOTP (application) ou EMAIL (code envoyé au compte). */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "two_factor_method", length = 10)
+    private TwoFactorMethod twoFactorMethod;
+
     @OneToMany(mappedBy = "createdBy", cascade = CascadeType.ALL, orphanRemoval = true)
     @JsonIgnoreProperties("createdBy") // Évite la boucle avec Application
     private List<Application> applications = new ArrayList<>();
 
 
-    public boolean canLogin() {
-        return accountStatus == AccountStatus.APPROVED;
+    public boolean isActive() {
+        return accountStatus == AccountStatus.ACTIVE;
     }
+
+    public boolean canLogin() {
+        return isActive() && !isPendingActivation() && !isLocked();
+    }
+
+    public boolean isPendingActivation() {
+        return activationToken != null && activatedAt == null;
+    }
+
+    public boolean isLocked() {
+        return lockedUntil != null && lockedUntil.isAfter(LocalDateTime.now());
+    }
+
     public boolean isAdmin() {
         return roles != null && roles.contains(Role.ROLE_ADMIN);
     }
-    public boolean isPending() {
-        return accountStatus == AccountStatus.PENDING;
+
+    /** 2FA TOTP active : flag + secret présent. */
+    public boolean isTotpEnabled() {
+        return twoFactorMethod == TwoFactorMethod.TOTP
+                && totpEnabled
+                && totpSecretEncrypted != null
+                && !totpSecretEncrypted.isBlank();
     }
-    public void approve(User admin) {
-        this.accountStatus = AccountStatus.APPROVED;
-        this.validatedBy = admin;
-        this.validatedAt = LocalDateTime.now();
-        this.rejectionReason = null;
-    }
-    public void reject(User admin, String reason) {
-        this.accountStatus = AccountStatus.REJECTED;
-        this.validatedBy = admin;
-        this.validatedAt = LocalDateTime.now();
-        this.rejectionReason = reason;
-    }
-    public void suspend(String reason) {
-        this.accountStatus = AccountStatus.SUSPENDED;
-        this.rejectionReason = reason;
+
+    /** 2FA active (TOTP ou e-mail). */
+    public boolean isTwoFactorEnabled() {
+        if (twoFactorMethod == TwoFactorMethod.TOTP) {
+            return isTotpEnabled();
+        }
+        return twoFactorMethod == TwoFactorMethod.EMAIL;
     }
 }

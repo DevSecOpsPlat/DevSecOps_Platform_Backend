@@ -2,6 +2,7 @@ package com.backend.devsecopsplatform_backend.service.environment;
 
 import com.backend.devsecopsplatform_backend.controller.environment.*;
 import com.backend.devsecopsplatform_backend.entity.*;
+import com.backend.devsecopsplatform_backend.repository.CloudResourceRepository;
 import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
 import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
 import com.backend.devsecopsplatform_backend.repository.UserRepository;
@@ -9,10 +10,12 @@ import com.backend.devsecopsplatform_backend.service.application.ApplicationServ
 import com.backend.devsecopsplatform_backend.service.EncryptionService;
 import com.backend.devsecopsplatform_backend.service.GitHubValidationService;
 import com.backend.devsecopsplatform_backend.service.GitLabService;
+import com.backend.devsecopsplatform_backend.service.PipelineStageSyncService;
 import com.fasterxml.jackson.databind.JsonNode;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.gitlab4j.api.models.Pipeline;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -31,6 +34,42 @@ public class EnvironmentService {
     private final UserRepository userRepository;
     private final EphemeralEnvironmentRepository environmentRepository;
     private final PipelineExecutionRepository pipelineExecutionRepository;
+    private final PipelineStageSyncService pipelineStageSyncService;
+    private final CloudResourceRepository cloudResourceRepository;
+
+    @Value("${deployment.preview.nip.enabled:false}")
+    private boolean nipPreviewEnabled;
+
+    @Value("${deployment.preview.nip.scheme:https}")
+    private String nipScheme;
+
+    @Value("${deployment.preview.nip.master-ip:}")
+    private String nipMasterIp;
+
+    @Value("${deployment.preview.nip.node-port:30374}")
+    private int nipNodePort;
+
+    /**
+     * URL publique pour l’UI : d’abord {@link EphemeralEnvironment#getUrl()} (callback pipeline), sinon URL nip.io dérivée si activée.
+     */
+    public String resolveDeploymentPublicUrl(EphemeralEnvironment e) {
+        if (e == null) {
+            return null;
+        }
+        if (e.getUrl() != null && !e.getUrl().isBlank()) {
+            return e.getUrl().trim();
+        }
+        if (!nipPreviewEnabled || nipMasterIp == null || nipMasterIp.isBlank()) {
+            return null;
+        }
+        String scheme = (nipScheme != null && !nipScheme.isBlank()) ? nipScheme.trim().toLowerCase() : "https";
+        if (scheme.endsWith("://")) {
+            scheme = scheme.substring(0, scheme.length() - 3);
+        }
+        String id = e.getId().toString().toLowerCase();
+        String host = "app-" + id + "." + nipMasterIp.trim() + ".nip.io";
+        return scheme + "://" + host + ":" + nipNodePort;
+    }
 
     /**
      * Déploiement : crée ou réutilise une application, crée l'environnement, déclenche le pipeline.
@@ -40,7 +79,6 @@ public class EnvironmentService {
     public DeployResponse deploy(DeployRequest request) {
         User currentUser = getCurrentUser();
 
-        // Log des données reçues (pour vérifier le clonage) — token non affiché en clair
         log.info("📥 [Deploy] Données reçues: GIT_REPO_URL={}, GIT_BRANCH={}, sessionDurationHours={}, GITHUB_TOKEN présent={}",
                 request.getGitRepositoryUrl(),
                 request.getBranch(),
@@ -58,10 +96,10 @@ public class EnvironmentService {
             }
         }
 
-        // 2. Trouver ou créer l'application (token chiffré, dockerfilePath)
+        // 2. Trouver ou créer l'application
         String dockerfilePath = request.getDockerfilePath() != null && !request.getDockerfilePath().isBlank()
                 ? request.getDockerfilePath() : "./Dockerfile";
-        com.backend.devsecopsplatform_backend.entity.Application app = applicationService
+        Application app = applicationService
                 .findOrCreateApplicationForDeploy(
                         currentUser,
                         request.getGitRepositoryUrl(),
@@ -84,24 +122,67 @@ public class EnvironmentService {
         env.setNamespace("env-" + env.getId().toString().replace("-", "").substring(0, 12));
         env = environmentRepository.save(env);
 
-        // 4. Déclencher le pipeline GitLab (token déchiffré, variables: GIT_REPO_URL, GIT_BRANCH, GITHUB_TOKEN, DOCKERFILE_PATH)
+        // BDD-first: stocker l’URL publique dérivée (nip.io) dès la création, pour que l’UI n’attende rien.
+        // Le callback pipeline peut ensuite la remplacer (env.url).
+        String derivedUrl = resolveDeploymentPublicUrl(env);
+        if (derivedUrl != null && !derivedUrl.isBlank()) {
+            env.setUrl(derivedUrl);
+            env = environmentRepository.save(env);
+        }
+
+        // Enregistrer des ressources “banales” pour alimenter le dashboard (même sans introspection K8s).
+        try {
+            if (derivedUrl != null && !derivedUrl.isBlank()) {
+                CloudResource ingress = new CloudResource();
+                ingress.setEnvironment(env);
+                ingress.setResourceType(ResourceType.INGRESS);
+                ingress.setResourceName(derivedUrl);
+                ingress.setResourceMetadata(Map.of(
+                        "namespace", env.getNamespace(),
+                        "url", derivedUrl,
+                        "scheme", nipScheme,
+                        "masterIp", nipMasterIp,
+                        "nodePort", nipNodePort
+                ));
+                cloudResourceRepository.save(ingress);
+
+                CloudResource svc = new CloudResource();
+                svc.setEnvironment(env);
+                svc.setResourceType(ResourceType.SERVICE);
+                svc.setResourceName(env.getNamespace());
+                svc.setResourceMetadata(Map.of(
+                        "namespace", env.getNamespace()
+                ));
+                cloudResourceRepository.save(svc);
+            }
+        } catch (Exception e) {
+            log.debug("Cloud resources init ignoré: {}", e.getMessage());
+        }
+
+        // 4. Déclencher le pipeline GitLab
         Pipeline pipeline = gitLabService.triggerPipeline(
                 request.getGitRepositoryUrl(),
                 request.getBranch(),
                 env.getId().toString(),
                 app.getId(),
-                app.getDockerfilePath()
+                app.getDockerfilePath(),
+                env.getTtlHours(),
+                env.getNamespace()
         );
 
-        // 5. Enregistrer l'exécution du pipeline
+        // 5. Enregistrer l'exécution du pipeline (relation OneToOne)
         PipelineExecution execution = new PipelineExecution();
-        execution.setEnvironment(env);
-        execution.setGitlabPipelineId(pipeline.getId()); // Long au lieu de intValue()
+        execution.setGitlabPipelineId(pipeline.getId());
         execution.setStatus(com.backend.devsecopsplatform_backend.entity.PipelineStatus
                 .fromGitLabStatus(pipeline.getStatus() != null ? pipeline.getStatus().toString() : "running"));
         execution.setStartedAt(LocalDateTime.now());
-        env.addPipelineExecution(execution);
+
+        // 🔥 Établir la relation bidirectionnelle OneToOne
+        execution.setEnvironment(env);
+        env.setPipelineExecution(execution);  // Nouvelle méthode setter
+
         pipelineExecutionRepository.save(execution);
+        environmentRepository.save(env); // Mise à jour de l'environnement avec la relation
 
         log.info("✅ Déploiement lancé - env: {} pipeline: {}", env.getId(), pipeline.getId());
 
@@ -116,12 +197,33 @@ public class EnvironmentService {
                 .build();
     }
 
+    /**
+     * Enregistre l’URL publique après déploiement (callback GitLab / job pipeline).
+     */
+    @Transactional
+    public void publishDeploymentPublicUrl(UUID environmentId, String publicUrl) {
+        EphemeralEnvironment env = environmentRepository.findById(environmentId)
+                .orElseThrow(() -> new RuntimeException("Environnement introuvable: " + environmentId));
+        env.setUrl(publicUrl);
+        if (env.getStatus() == EnvironmentStatus.PENDING || env.getStatus() == EnvironmentStatus.BUILDING) {
+            env.setStatus(EnvironmentStatus.RUNNING);
+        }
+        environmentRepository.save(env);
+        log.info("🌐 URL déploiement enregistrée pour env {} : {}", environmentId, publicUrl);
+    }
+
+    public Optional<EnvironmentSummaryResponse> getEnvironmentById(UUID envId) {
+        return environmentRepository.findById(envId)
+                .map(this::toSummary);
+    }
+
     public List<EnvironmentSummaryResponse> getMyEnvironments() {
         User user = getCurrentUser();
         List<EphemeralEnvironment> list = environmentRepository.findMyEnvironments(user);
         List<EnvironmentSummaryResponse> result = new ArrayList<>();
         for (EphemeralEnvironment e : list) {
-            PipelineExecution latest = pipelineExecutionRepository.findFirstByEnvironmentOrderByCreatedAtDesc(e).orElse(null);
+            // 🔥 Récupération directe du pipeline associé (OneToOne)
+            PipelineExecution pipeline = e.getPipelineExecution();
             result.add(EnvironmentSummaryResponse.builder()
                     .id(e.getId())
                     .environmentName(e.getEnvironmentName())
@@ -129,11 +231,36 @@ public class EnvironmentService {
                     .gitBranch(e.getGitBranch())
                     .ttlHours(e.getTtlHours())
                     .status(e.getStatus().name())
-                    .previewUrl(e.getUrl())
+                    .previewUrl(resolveDeploymentPublicUrl(e))
                     .createdAt(e.getCreatedAt())
                     .expiresAt(e.getExpiresAt())
-                    .latestPipelineId(latest != null ? latest.getGitlabPipelineId() : null)
-                    .latestPipelineStatus(latest != null ? latest.getStatus().name() : null)
+                    .latestPipelineId(pipeline != null ? pipeline.getGitlabPipelineId() : null)
+                    .latestPipelineStatus(pipeline != null ? pipeline.getStatus().name() : null)
+                    .build());
+        }
+        return result;
+    }
+
+    /** Environnements de l’utilisateur, filtrés par application (pour le sélecteur d’env du dashboard). */
+    public List<EnvironmentSummaryResponse> getMyEnvironmentsForApplication(UUID appId) {
+        User user = getCurrentUser();
+        List<EphemeralEnvironment> list = environmentRepository
+                .findByRequestedByAndApplicationIdWithApplicationAndPipelineOrderByCreatedAtDesc(user, appId);
+        List<EnvironmentSummaryResponse> result = new ArrayList<>();
+        for (EphemeralEnvironment e : list) {
+            PipelineExecution pipeline = e.getPipelineExecution();
+            result.add(EnvironmentSummaryResponse.builder()
+                    .id(e.getId())
+                    .environmentName(e.getEnvironmentName())
+                    .gitRepositoryUrl(e.getApplication().getGitRepositoryUrl())
+                    .gitBranch(e.getGitBranch())
+                    .ttlHours(e.getTtlHours())
+                    .status(e.getStatus().name())
+                    .previewUrl(resolveDeploymentPublicUrl(e))
+                    .createdAt(e.getCreatedAt())
+                    .expiresAt(e.getExpiresAt())
+                    .latestPipelineId(pipeline != null ? pipeline.getGitlabPipelineId() : null)
+                    .latestPipelineStatus(pipeline != null ? pipeline.getStatus().name() : null)
                     .build());
         }
         return result;
@@ -149,34 +276,63 @@ public class EnvironmentService {
         User user = getCurrentUser();
         EphemeralEnvironment env = environmentRepository.findByIdAndRequestedBy(envId, user)
                 .orElseThrow(() -> new RuntimeException("Environnement non trouvé"));
-        PipelineExecution latest = pipelineExecutionRepository.findFirstByEnvironmentOrderByCreatedAtDesc(env)
-                .orElseThrow(() -> new RuntimeException("Aucun pipeline pour cet environnement"));
+
+        // 🔥 Récupération directe du pipeline (OneToOne)
+        PipelineExecution latest = env.getPipelineExecution();
+        if (latest == null) {
+            throw new RuntimeException("Aucun pipeline pour cet environnement");
+        }
+
         Long pipelineId = latest.getGitlabPipelineId();
         if (pipelineId == null || pipelineId <= 0) {
             throw new RuntimeException("ID pipeline GitLab invalide");
         }
-        Map<String, Object> summary = gitLabService.getPipelineSummary(pipelineId);
-        Map<String, JsonNode> reports = gitLabService.getAllSecurityReports(pipelineId);
-        return PipelineScanResponse.builder()
-                .pipelineId(pipelineId) // Long directement
-                .status((String) summary.get("status"))
-                .webUrl((String) summary.get("webUrl"))
-                .jobStatusCount(summary.get("jobStatusCount"))
-                .jobs(summary.get("jobs"))
-                .securityReports(reports)
-                .build();
+        try {
+            Map<String, Object> summary = gitLabService.getPipelineSummary(pipelineId);
+            pipelineStageSyncService.syncStagesForPipeline(pipelineId);
+            Map<String, JsonNode> reports = gitLabService.getAllSecurityReports(pipelineId);
+            return PipelineScanResponse.builder()
+                    .pipelineId(pipelineId)
+                    .status((String) summary.get("status"))
+                    .webUrl((String) summary.get("webUrl"))
+                    .jobStatusCount(summary.get("jobStatusCount"))
+                    .jobs(summary.get("jobs"))
+                    .securityReports(reports)
+                    .dataSource("gitlab")
+                    .build();
+        } catch (Exception e) {
+            log.warn("Erreur récupération pipeline GitLab {}: {}, fallback BDD (stages_json)", pipelineId, e.getMessage());
+            Object jobs = latest.getStagesJson() != null
+                    ? pipelineStageSyncService.getJobsFromStagesJson(latest)
+                    : List.<Map<String, Object>>of();
+            Object jobStatusCount = latest.getStagesJson() != null
+                    ? pipelineStageSyncService.getJobStatusCountFromStagesJson(latest)
+                    : Map.of(latest.getStatus().name(), 1L);
+            if (jobStatusCount instanceof Map && ((Map<?, ?>) jobStatusCount).isEmpty()) {
+                jobStatusCount = Map.of(latest.getStatus().name(), 1L);
+            }
+            return PipelineScanResponse.builder()
+                    .pipelineId(pipelineId)
+                    .status(latest.getStatus().name())
+                    .webUrl(latest.getStagesJson() != null ? (String) latest.getStagesJson().get("webUrl") : null)
+                    .jobStatusCount(jobStatusCount)
+                    .jobs(jobs)
+                    .securityReports(Map.of())
+                    .dataSource("database")
+                    .build();
+        }
     }
 
-    /**
-     * Résumé de sécurité agrégé (nombre de vulnérabilités par niveau) pour un environnement.
-     */
     public SecuritySummaryResponse getSecuritySummary(UUID envId) {
         User user = getCurrentUser();
         EphemeralEnvironment env = environmentRepository.findByIdAndRequestedBy(envId, user)
                 .orElseThrow(() -> new RuntimeException("Environnement non trouvé"));
 
-        PipelineExecution latest = pipelineExecutionRepository.findFirstByEnvironmentOrderByCreatedAtDesc(env)
-                .orElseThrow(() -> new RuntimeException("Aucun pipeline pour cet environnement"));
+        // 🔥 Récupération directe du pipeline
+        PipelineExecution latest = env.getPipelineExecution();
+        if (latest == null) {
+            throw new RuntimeException("Aucun pipeline pour cet environnement");
+        }
 
         Long pipelineId = latest.getGitlabPipelineId();
         if (pipelineId == null || pipelineId <= 0) {
@@ -185,7 +341,7 @@ public class EnvironmentService {
 
         Map<String, JsonNode> reports = gitLabService.getAllSecurityReports(pipelineId);
 
-        int[] counters = new int[5]; // 0=CRITICAL,1=HIGH,2=MEDIUM,3=LOW,4=INFO
+        int[] counters = new int[5];
         for (JsonNode report : reports.values()) {
             accumulateVulnerabilities(report, counters);
         }
@@ -203,26 +359,19 @@ public class EnvironmentService {
                 .build();
     }
 
-    /**
-     * Agrège les vulnérabilités par niveau à partir de différents formats de rapports possibles
-     * (GitLab security report, Trivy, etc.).
-     */
     private void accumulateVulnerabilities(JsonNode report, int[] counters) {
         if (report == null || report.isNull()) {
             return;
         }
 
-        // Format GitLab / standard : vulnerabilities[]
         if (report.has("vulnerabilities") && report.get("vulnerabilities").isArray()) {
             addFromArray(report.get("vulnerabilities"), "severity", counters);
         }
 
-        // Certains outils (Trivy) utilisent "Vulnerabilities"
         if (report.has("Vulnerabilities") && report.get("Vulnerabilities").isArray()) {
             addFromArray(report.get("Vulnerabilities"), "Severity", counters);
         }
 
-        // Format Trivy SARIF-like : results[].Vulnerabilities[]
         if (report.has("results") && report.get("results").isArray()) {
             for (JsonNode result : report.get("results")) {
                 if (result.has("Vulnerabilities") && result.get("Vulnerabilities").isArray()) {
@@ -242,14 +391,14 @@ public class EnvironmentService {
                 case "MEDIUM" -> counters[2]++;
                 case "LOW" -> counters[3]++;
                 case "INFO" -> counters[4]++;
-                default -> {
-                }
+                default -> {}
             }
         }
     }
 
     private EnvironmentSummaryResponse toSummary(EphemeralEnvironment e) {
-        PipelineExecution latest = pipelineExecutionRepository.findFirstByEnvironmentOrderByCreatedAtDesc(e).orElse(null);
+        // 🔥 Récupération directe du pipeline
+        PipelineExecution pipeline = e.getPipelineExecution();
         return EnvironmentSummaryResponse.builder()
                 .id(e.getId())
                 .environmentName(e.getEnvironmentName())
@@ -257,11 +406,11 @@ public class EnvironmentService {
                 .gitBranch(e.getGitBranch())
                 .ttlHours(e.getTtlHours())
                 .status(e.getStatus().name())
-                .previewUrl(e.getUrl())
+                .previewUrl(resolveDeploymentPublicUrl(e))
                 .createdAt(e.getCreatedAt())
                 .expiresAt(e.getExpiresAt())
-                    .latestPipelineId(latest != null ? latest.getGitlabPipelineId() : null)
-                .latestPipelineStatus(latest != null ? latest.getStatus().name() : null)
+                .latestPipelineId(pipeline != null ? pipeline.getGitlabPipelineId() : null)
+                .latestPipelineStatus(pipeline != null ? pipeline.getStatus().name() : null)
                 .build();
     }
 
