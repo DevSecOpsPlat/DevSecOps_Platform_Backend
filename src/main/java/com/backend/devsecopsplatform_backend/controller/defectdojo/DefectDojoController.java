@@ -5,6 +5,7 @@ import com.backend.devsecopsplatform_backend.controller.finding.FindingAiRemedia
 import com.backend.devsecopsplatform_backend.controller.finding.FindingChatRequest;
 import com.backend.devsecopsplatform_backend.service.AiAnalysisService;
 import com.backend.devsecopsplatform_backend.service.defectdojo.DefectDojoService;
+import com.backend.devsecopsplatform_backend.service.defectdojo.dto.DefectDojoDashboard2Response;
 import com.backend.devsecopsplatform_backend.service.defectdojo.dto.DefectDojoDashboardResponse;
 import com.backend.devsecopsplatform_backend.service.defectdojo.dto.DefectDojoFindingDetailResponse;
 import com.backend.devsecopsplatform_backend.service.defectdojo.dto.DefectDojoFindingsPageResponse;
@@ -27,6 +28,31 @@ public class DefectDojoController {
 
     private final DefectDojoService defectDojoService;
     private final AiAnalysisService aiAnalysisService;
+
+    @GetMapping("/dashboard2")
+    public ResponseEntity<DefectDojoDashboard2Response> dashboard2(
+            @RequestParam UUID applicationId,
+            @RequestParam(required = false) String branch
+    ) {
+        try {
+            return ResponseEntity.ok(defectDojoService.getDashboard2(applicationId, branch));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().build();
+        } catch (Exception e) {
+            log.error("Erreur dashboard2 DefectDojo app={} branch={}", applicationId, branch, e);
+            return ResponseEntity.internalServerError().body(
+                    DefectDojoDashboard2Response.builder()
+                            .configured(false)
+                            .scope("global")
+                            .message("Erreur lors de la récupération du dashboard : " + e.getMessage())
+                            .bySeverity(Map.of("Critical", 0, "High", 0, "Medium", 0, "Low", 0, "Info", 0))
+                            .byTool(Map.of())
+                            .topRecurrent(List.of())
+                            .trendPoints(List.of())
+                            .build()
+            );
+        }
+    }
 
     @GetMapping("/dashboard")
     public ResponseEntity<DefectDojoDashboardResponse> dashboard(
