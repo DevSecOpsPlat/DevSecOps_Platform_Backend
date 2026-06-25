@@ -87,15 +87,24 @@ public class ApplicationController {
      * Compteurs globaux (toutes exécutions de l’app), indépendants de la pagination de l’historique.
      */
     @GetMapping("/{id}/deployments/metrics")
-    public ResponseEntity<DeploymentMetricsDto> getDeploymentMetrics(@PathVariable UUID id) {
-        long total = pipelineExecutionRepository.countByApplicationId(id);
+    public ResponseEntity<DeploymentMetricsDto> getDeploymentMetrics(
+            @PathVariable UUID id,
+            @RequestParam(name = "branch", required = false) String branch
+    ) {
+        String normalizedBranch = (branch == null || branch.isBlank()) ? null : branch.trim();
+        long total = normalizedBranch == null
+                ? pipelineExecutionRepository.countByApplicationId(id)
+                : pipelineExecutionRepository.countByApplicationIdAndBranch(id, normalizedBranch);
         long success = 0;
         long failed = 0;
         long canceled = 0;
         long pending = 0;
         long running = 0;
         long skipped = 0;
-        for (Object[] row : pipelineExecutionRepository.countByApplicationIdGroupByStatus(id)) {
+        List<Object[]> rows = normalizedBranch == null
+                ? pipelineExecutionRepository.countByApplicationIdGroupByStatus(id)
+                : pipelineExecutionRepository.countByApplicationIdAndBranchGroupByStatus(id, normalizedBranch);
+        for (Object[] row : rows) {
             if (row[0] == null || row[1] == null) {
                 continue;
             }

@@ -95,6 +95,28 @@ public interface PipelineExecutionRepository extends JpaRepository<PipelineExecu
             from PipelineExecution pe
             join pe.environment env
             where env.application.id = :appId
+              and (:branch is null or env.gitBranch = :branch)
+            """)
+    long countByApplicationIdAndBranch(@Param("appId") UUID appId, @Param("branch") String branch);
+
+    @Query("""
+            select pe.status, count(pe)
+            from PipelineExecution pe
+            join pe.environment env
+            where env.application.id = :appId
+              and (:branch is null or env.gitBranch = :branch)
+            group by pe.status
+            """)
+    List<Object[]> countByApplicationIdAndBranchGroupByStatus(
+            @Param("appId") UUID appId,
+            @Param("branch") String branch
+    );
+
+    @Query("""
+            select count(pe)
+            from PipelineExecution pe
+            join pe.environment env
+            where env.application.id = :appId
             """)
     long countByApplicationId(@Param("appId") UUID appId);
 
