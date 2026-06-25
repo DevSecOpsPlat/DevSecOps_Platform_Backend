@@ -167,14 +167,14 @@ public class DefectDojoService {
         if (global) {
             Map<String, Integer> bySeverity = parallelCountBySeverityForProduct(productId);
             Map<String, Integer> byStatus = parallelCountByStatusLightForProduct(productId);
-            int open = byStatus.getOrDefault("active", 0);
+            int open = bySeverity.values().stream().mapToInt(Integer::intValue).sum();
             int closed = byStatus.getOrDefault("mitigated", 0);
             List<JsonNode> openSample = fetchOpenFindingsSample(productId, null, 150);
             Map<String, Integer> byTool = aggregateToolsFromProductTests(productId);
             if (byTool.isEmpty() && !openSample.isEmpty()) {
                 byTool = aggregateToolsFromFindings(openSample);
             }
-            DefectDojoDashboardCharts charts = buildDashboard2ChartsForGlobal(productId, bySeverity);
+            DefectDojoDashboardCharts charts = buildDashboard2ChartsForGlobal(productId, bySeverity, engagements);
 
             return DefectDojoDashboard2Response.builder()
                     .configured(true)
@@ -274,7 +274,8 @@ public class DefectDojoService {
 
         if (isGlobalBranch(branch)) {
             Map<String, Integer> bySeverity = parallelCountBySeverityForProduct(productId);
-            return buildDashboard2ChartsForGlobal(productId, bySeverity);
+            List<DefectDojoEngagementSummary> engagements = listEngagementsForProductLight(productId, productName);
+            return buildDashboard2ChartsForGlobal(productId, bySeverity, engagements);
         }
 
         String effectiveBranch = branch.trim();
@@ -960,14 +961,13 @@ public class DefectDojoService {
         return ordered;
     }
 
+    /** Comptages par sévérité au niveau produit — alignés sur la vue asset DefectDojo (hors doublons). */
     private Map<String, Integer> parallelCountBySeverityForProduct(int productId) {
         Map<String, Integer> counts = new ConcurrentHashMap<>();
         List<CompletableFuture<Void>> futures = new ArrayList<>();
         for (String sev : SEVERITIES) {
             futures.add(CompletableFuture.runAsync(() -> counts.put(sev, countFindingsForProduct(productId, Map.of(
                     "severity", sev,
-                    "active", "true",
-                    "is_mitigated", "false",
                     "duplicate", "false"
             ))), DD_IO_POOL));
         }
@@ -1764,8 +1764,6 @@ public class DefectDojoService {
         for (String sev : SEVERITIES) {
             counts.put(sev, countFindingsForProduct(productId, Map.of(
                     "severity", sev,
-                    "active", "true",
-                    "is_mitigated", "false",
                     "duplicate", "false"
             )));
         }
@@ -2159,24 +2157,38 @@ public class DefectDojoService {
         return byTool;
     }
 
-    /** Graphique Open by Severity — même source que getDashboard (scanSnapshots). */
+    /** Graphique Open by Severity — branche (engagement) ou vue globale produit. */
     private DefectDojoDashboardCharts buildDashboard2Charts(int engagementId, Map<String, Integer> bySeverity) {
-        // Snapshots déjà enrichis avec bySeverity réel par test
         List<DefectDojoScanSnapshot> scanSnapshots = buildScanSnapshotsFast(engagementId);
+        List<JsonNode> findings = fetchAllEngagementFindings(engagementId);
+        List<DefectDojoTimeSeriesPoint> openDayToDay = buildOpenDayToDayFromFindings(findings);
+        DefectDojoDetailedMetrics detailedMetrics = DefectDojoDetailedMetrics.builder()
+                .openDayToDayBySeverity(openDayToDay)
+                .build();
         return DefectDojoDashboardCharts.builder()
                 .scanSnapshots(scanSnapshots)
                 .bySeverity(bySeverity)
+                .detailedMetrics(detailedMetrics)
                 .build();
     }
 
     private DefectDojoDashboardCharts buildDashboard2ChartsForGlobal(
             int productId,
-            Map<String, Integer> bySeverity
+            Map<String, Integer> bySeverity,
+            List<DefectDojoEngagementSummary> engagements
     ) {
-        List<DefectDojoScanSnapshot> scanSnapshots = buildProductScanSnapshotsForChart(productId, 40);
+        List<JsonNode> findings = fetchAllProductFindings(productId);
+        List<DefectDojoTimeSeriesPoint> openDayToDay = buildOpenDayToDayFromFindings(findings);
+        List<DefectDojoScanSnapshot> scanSnapshots = (engagements != null && !engagements.isEmpty())
+                ? buildProductScanSnapshotsFast(engagements)
+                : buildProductScanSnapshotsForChart(productId, 50);
+        DefectDojoDetailedMetrics detailedMetrics = DefectDojoDetailedMetrics.builder()
+                .openDayToDayBySeverity(openDayToDay)
+                .build();
         return DefectDojoDashboardCharts.builder()
                 .scanSnapshots(scanSnapshots)
                 .bySeverity(bySeverity)
+                .detailedMetrics(detailedMetrics)
                 .build();
     }
 
@@ -2190,35 +2202,59 @@ public class DefectDojoService {
         return buildScanSnapshotsFromTestsPage(page, false);
     }
 
-    private static final int MAX_DAY_TO_DAY_POINTS = 90;
+    private static final int MAX_DAY_TO_DAY_POINTS = 365;
 
-    private List<DefectDojoTimeSeriesPoint> buildOpenDayToDayCumulative(List<JsonNode> openFindings) {
-        if (openFindings == null || openFindings.isEmpty()) {
+    /**
+     * Série « Open Day to Day by Severity » — stock cumulé jour par jour (créations / clôtures),
+     * avec un point pour chaque jour calendaire jusqu'à aujourd'hui.
+     */
+    private List<DefectDojoTimeSeriesPoint> buildOpenDayToDayFromFindings(List<JsonNode> findings) {
+        if (findings == null || findings.isEmpty()) {
             return List.of();
         }
-        TreeMap<String, List<JsonNode>> byDay = new TreeMap<>();
-        for (JsonNode f : openFindings) {
-            if (!f.path("active").asBoolean(false) || f.path("is_mitigated").asBoolean(false)) {
+        TreeMap<String, Map<String, Integer>> dailyDelta = new TreeMap<>();
+        for (JsonNode f : findings) {
+            if (f.path("duplicate").asBoolean(false) || f.path("false_p").asBoolean(false)) {
                 continue;
             }
-            String day = extractDay(f.path("created").asText(null));
-            if (day == null) {
-                continue;
+            String sev = normalizeSeverity(f.path("severity").asText("Info"));
+            String createdDay = extractDay(f.path("created").asText(null));
+            if (createdDay != null) {
+                dailyDelta.computeIfAbsent(createdDay, k -> new LinkedHashMap<>(emptySeverityMap()))
+                        .merge(sev, 1, Integer::sum);
             }
-            byDay.computeIfAbsent(day, k -> new ArrayList<>()).add(f);
+            if (f.path("is_mitigated").asBoolean(false) || !f.path("active").asBoolean(true)) {
+                String mitDay = extractDay(firstNonBlank(
+                        f.path("mitigated").asText(null),
+                        f.path("last_status_update").asText(null),
+                        f.path("last_reviewed").asText(null)
+                ));
+                if (mitDay != null) {
+                    dailyDelta.computeIfAbsent(mitDay, k -> new LinkedHashMap<>(emptySeverityMap()))
+                            .merge(sev, -1, Integer::sum);
+                }
+            }
         }
-        if (byDay.isEmpty()) {
+        if (dailyDelta.isEmpty()) {
             return List.of();
         }
 
-        List<String> timeline = expandDayRange(byDay.firstKey(), byDay.lastKey());
-        Map<String, Integer> cumulative = emptySeverityMap();
+        String start = dailyDelta.firstKey();
+        String end = java.time.LocalDate.now().toString();
+        String lastEvent = dailyDelta.lastKey();
+        if (lastEvent.compareTo(end) > 0) {
+            end = lastEvent;
+        }
+
+        List<String> timeline = expandDayRange(start, end);
+        Map<String, Integer> cumulative = new LinkedHashMap<>(emptySeverityMap());
         List<DefectDojoTimeSeriesPoint> points = new ArrayList<>();
         for (String day : timeline) {
-            List<JsonNode> dayFindings = byDay.get(day);
-            if (dayFindings != null) {
-                for (JsonNode f : dayFindings) {
-                    cumulative.merge(normalizeSeverity(f.path("severity").asText("Info")), 1, Integer::sum);
+            Map<String, Integer> delta = dailyDelta.get(day);
+            if (delta != null) {
+                for (Map.Entry<String, Integer> e : delta.entrySet()) {
+                    cumulative.merge(e.getKey(), e.getValue(), Integer::sum);
+                    cumulative.put(e.getKey(), Math.max(0, cumulative.getOrDefault(e.getKey(), 0)));
                 }
             }
             points.add(DefectDojoTimeSeriesPoint.builder()
@@ -2227,6 +2263,11 @@ public class DefectDojoService {
                     .build());
         }
         return points;
+    }
+
+    /** @deprecated remplacé par {@link #buildOpenDayToDayFromFindings} */
+    private List<DefectDojoTimeSeriesPoint> buildOpenDayToDayCumulative(List<JsonNode> openFindings) {
+        return buildOpenDayToDayFromFindings(openFindings);
     }
 
     private static List<String> expandDayRange(String startDay, String endDay) {
