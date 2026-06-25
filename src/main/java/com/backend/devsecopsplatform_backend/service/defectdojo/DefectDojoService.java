@@ -21,6 +21,10 @@ import org.springframework.web.client.RestTemplate;
 import org.springframework.web.util.UriComponentsBuilder;
 
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.stream.Collectors;
 
 @Service
@@ -29,6 +33,16 @@ import java.util.stream.Collectors;
 public class DefectDojoService {
 
     private static final List<String> SEVERITIES = List.of("Critical", "High", "Medium", "Low", "Info");
+
+    /** Pool I/O pour paralléliser les comptages DefectDojo (évite 10+ appels séquentiels lents). */
+    private static final ExecutorService DD_IO_POOL = Executors.newFixedThreadPool(
+            Math.min(6, Runtime.getRuntime().availableProcessors() + 2),
+            r -> {
+                Thread t = new Thread(r, "defectdojo-io");
+                t.setDaemon(true);
+                return t;
+            }
+    );
 
     private final DefectDojoProperties properties;
     private final ApplicationRepository applicationRepository;
@@ -47,7 +61,7 @@ public class DefectDojoService {
 
     private volatile String lastApiError;
 
-    public DefectDojoDashboardResponse getDashboard(UUID applicationId, String branch) {
+    public DefectDojoDashboardResponse getDashboard(UUID applicationId, String branch, String tags) {
         if (!properties.isConfigured()) {
             return DefectDojoDashboardResponse.builder()
                     .configured(false)
@@ -87,13 +101,13 @@ public class DefectDojoService {
         }
 
         int engagementId = engagement.path("id").asInt();
-        Map<String, Integer> bySeverity = countBySeverity(engagementId);
-        Map<String, Integer> byStatus = countByStatus(engagementId);
+        Map<String, Integer> bySeverity = countBySeverity(engagementId, tags);
+        Map<String, Integer> byStatus = countByStatus(engagementId, tags);
         int critical = bySeverity.getOrDefault("Critical", 0);
         int high = bySeverity.getOrDefault("High", 0);
         int totalActive = byStatus.getOrDefault("active", 0);
         int totalMitigated = byStatus.getOrDefault("mitigated", 0);
-        DefectDojoDashboardCharts charts = buildCharts(engagementId, bySeverity, byStatus, totalActive, totalMitigated);
+        DefectDojoDashboardCharts charts = buildCharts(engagementId, bySeverity, byStatus, totalActive, totalMitigated, tags);
 
         return baseResponse(productName, effectiveBranch, engagementName)
                 .configured(true)
@@ -109,9 +123,9 @@ public class DefectDojoService {
                 .totalActive(totalActive)
                 .totalMitigated(totalMitigated)
                 .totalFindings(totalActive + totalMitigated)
-                .metricCards(buildMetricCards(engagementId))
+                .metricCards(buildMetricCards(engagementId, tags))
                 .charts(charts)
-                .availableEngagements(listEngagementsForProduct(productId, productName))
+                .availableEngagements(listEngagementsForProductLight(productId, productName))
                 .deployRecommendation(buildRecommendation(critical, high))
                 .defectDojoBaseUrl(properties.normalizedBaseUrl())
                 .build();
@@ -151,12 +165,16 @@ public class DefectDojoService {
         List<String> branches = branchNamesFromEngagements(applicationId, productName, engagements);
 
         if (global) {
-            Map<String, Integer> bySeverity = countBySeverityForProduct(productId);
-            Map<String, Integer> byStatus = countByStatusForProduct(productId);
+            Map<String, Integer> bySeverity = parallelCountBySeverityForProduct(productId);
+            Map<String, Integer> byStatus = parallelCountByStatusLightForProduct(productId);
             int open = byStatus.getOrDefault("active", 0);
             int closed = byStatus.getOrDefault("mitigated", 0);
             List<JsonNode> openSample = fetchOpenFindingsSample(productId, null, 150);
-            Map<String, Integer> byTool = aggregateToolsFromFindings(openSample);
+            Map<String, Integer> byTool = aggregateToolsFromProductTests(productId);
+            if (byTool.isEmpty() && !openSample.isEmpty()) {
+                byTool = aggregateToolsFromFindings(openSample);
+            }
+            DefectDojoDashboardCharts charts = buildDashboard2ChartsForGlobal(productId, bySeverity);
 
             return DefectDojoDashboard2Response.builder()
                     .configured(true)
@@ -176,6 +194,7 @@ public class DefectDojoService {
                     .trendPoints(List.of())
                     .branches(branches)
                     .engagements(engagements)
+                    .charts(charts)
                     .defectDojoBaseUrl(properties.normalizedBaseUrl())
                     .build();
         }
@@ -197,12 +216,17 @@ public class DefectDojoService {
         }
 
         int engagementId = engagement.path("id").asInt();
-        Map<String, Integer> bySeverity = countBySeverity(engagementId);
-        Map<String, Integer> byStatus = countByStatus(engagementId);
+        Map<String, Integer> bySeverity = parallelCountBySeverity(engagementId, null);
+        Map<String, Integer> byStatus = parallelCountByStatusLight(engagementId, null);
         int open = byStatus.getOrDefault("active", 0);
         int closed = byStatus.getOrDefault("mitigated", 0);
-        List<JsonNode> openSample = fetchOpenFindingsSample(productId, engagementId, 150);
-        Map<String, Integer> byTool = aggregateToolsFromFindings(openSample);
+        List<JsonNode> openSample = fetchOpenFindingsSample(productId, engagementId, 50);
+        Map<String, Integer> byTool = aggregateToolsFromEngagement(engagementId);
+        if (byTool.isEmpty() && !openSample.isEmpty()) {
+            byTool = aggregateToolsFromFindings(openSample);
+        }
+
+        DefectDojoDashboardCharts charts = buildDashboard2Charts(engagementId, bySeverity);
 
         return DefectDojoDashboard2Response.builder()
                 .configured(true)
@@ -224,8 +248,48 @@ public class DefectDojoService {
                 .trendPoints(List.of())
                 .branches(branches)
                 .engagements(engagements)
+                .charts(charts)
                 .defectDojoBaseUrl(properties.normalizedBaseUrl())
                 .build();
+    }
+
+    /**
+     * Graphiques dashboard2 — branche ou vue globale (produit / toutes branches).
+     */
+    public DefectDojoDashboardCharts getDashboard2Charts(UUID applicationId, String branch) {
+        User user = currentUser();
+        Application app = applicationRepository.findByIdAndCreatedBy(applicationId, user)
+                .orElseThrow(() -> new IllegalArgumentException("Application introuvable ou accès refusé"));
+
+        String productName = extractRepoName(app.getGitRepositoryUrl());
+        JsonNode product = findProduct(productName);
+        if (product == null) {
+            return DefectDojoDashboardCharts.builder()
+                    .scanSnapshots(List.of())
+                    .bySeverity(emptySeverityMap())
+                    .build();
+        }
+
+        int productId = product.path("id").asInt();
+
+        if (isGlobalBranch(branch)) {
+            Map<String, Integer> bySeverity = parallelCountBySeverityForProduct(productId);
+            return buildDashboard2ChartsForGlobal(productId, bySeverity);
+        }
+
+        String effectiveBranch = branch.trim();
+        String engagementName = productName + "_" + effectiveBranch;
+        JsonNode engagement = findEngagement(productId, engagementName);
+        if (engagement == null) {
+            return DefectDojoDashboardCharts.builder()
+                    .scanSnapshots(List.of())
+                    .bySeverity(emptySeverityMap())
+                    .build();
+        }
+
+        int engagementId = engagement.path("id").asInt();
+        Map<String, Integer> bySeverity = parallelCountBySeverity(engagementId, null);
+        return buildDashboard2Charts(engagementId, bySeverity);
     }
 
     public DefectDojoFindingsPageResponse listFindings(
@@ -234,10 +298,11 @@ public class DefectDojoService {
             String category,
             String severity,
             int page,
-            int size
+            int size,
+            String tags
     ) {
         if (isGlobalBranch(branch)) {
-            return listFindingsForProduct(applicationId, category, severity, page, size);
+            return listFindingsForProduct(applicationId, category, severity, page, size, tags);
         }
         EngagementContext ctx = requireEngagement(applicationId, branch);
         String cat = category != null && !category.isBlank() ? category.trim().toLowerCase() : "open";
@@ -249,6 +314,7 @@ public class DefectDojoService {
         if (severity != null && !severity.isBlank()) {
             params.put("severity", normalizeSeverity(severity));
         }
+        applyTags(params, tags);
         params.put("ordering", orderingForCategory(cat));
         params.put("limit", String.valueOf(pageSize));
         params.put("offset", String.valueOf(offset));
@@ -343,6 +409,64 @@ public class DefectDojoService {
         return sb.toString();
     }
 
+    /**
+     * Comptage léger des vulnérabilités ouvertes par environnement (tag DefectDojo {@code env-<uuid>}).
+     */
+    public Map<String, Integer> getEnvironmentOpenCounts(UUID applicationId) {
+        User user = currentUser();
+        applicationRepository.findByIdAndCreatedBy(applicationId, user)
+                .orElseThrow(() -> new IllegalArgumentException("Application introuvable ou accès refusé"));
+
+        if (!properties.isConfigured()) {
+            return Map.of();
+        }
+
+        Application app = applicationRepository.findById(applicationId).orElse(null);
+        if (app == null) {
+            return Map.of();
+        }
+
+        String productName = extractRepoName(app.getGitRepositoryUrl());
+        JsonNode product = findProduct(productName);
+        if (product == null) {
+            return Map.of();
+        }
+
+        int productId = product.path("id").asInt();
+        List<EphemeralEnvironment> envs = environmentRepository
+                .findByRequestedByAndApplicationIdWithApplicationAndPipelineOrderByCreatedAtDesc(user, applicationId)
+                .stream()
+                .filter(EphemeralEnvironment::isActive)
+                .limit(4)
+                .toList();
+
+        Map<String, Integer> out = new ConcurrentHashMap<>();
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        for (EphemeralEnvironment env : envs) {
+            String envId = env.getId().toString();
+            String tag = environmentTag(env.getId());
+            futures.add(CompletableFuture.runAsync(() -> {
+                int count = countFindingsForProduct(productId, Map.of(
+                        "active", "true",
+                        "is_mitigated", "false",
+                        "duplicate", "false",
+                        "tags", tag
+                ));
+                out.put(envId, count);
+            }, DD_IO_POOL));
+        }
+        joinAll(futures);
+        Map<String, Integer> ordered = new LinkedHashMap<>();
+        for (EphemeralEnvironment env : envs) {
+            ordered.put(env.getId().toString(), out.getOrDefault(env.getId().toString(), 0));
+        }
+        return ordered;
+    }
+
+    public static String environmentTag(UUID environmentId) {
+        return "env-" + environmentId;
+    }
+
     public List<String> listBranches(UUID applicationId) {
         User user = currentUser();
         applicationRepository.findByIdAndCreatedBy(applicationId, user)
@@ -424,31 +548,31 @@ public class DefectDojoService {
         return new EngagementContext(app, productName, effectiveBranch, engagementName, productId, engagement.path("id").asInt());
     }
 
-    private List<DefectDojoMetricCard> buildMetricCards(int engagementId) {
+    private List<DefectDojoMetricCard> buildMetricCards(int engagementId, String tags) {
         List<DefectDojoMetricCard> cards = new ArrayList<>();
-        cards.add(metricCard("verified", "Verified Findings", engagementId, filtersForCategory("verified")));
-        cards.add(metricCard("open", "Open Findings", engagementId, filtersForCategory("open")));
-        cards.add(metricCard("risk_accepted", "Risk Accepted", engagementId, filtersForCategory("risk_accepted")));
-        cards.add(metricCard("closed", "Closed Findings", engagementId, filtersForCategory("closed")));
-        cards.add(metricCard("false_positive", "False Positive", engagementId, filtersForCategory("false_positive")));
-        cards.add(metricCard("out_of_scope", "Out of Scope", engagementId, filtersForCategory("out_of_scope")));
-        cards.add(metricCard("total", "Total Findings", engagementId, filtersForCategory("total")));
-        cards.add(metricCard("inactive", "Inactive Findings", engagementId, filtersForCategory("inactive")));
+        cards.add(metricCard("verified", "Verified Findings", engagementId, filtersForCategory("verified"), tags));
+        cards.add(metricCard("open", "Open Findings", engagementId, filtersForCategory("open"), tags));
+        cards.add(metricCard("risk_accepted", "Risk Accepted", engagementId, filtersForCategory("risk_accepted"), tags));
+        cards.add(metricCard("closed", "Closed Findings", engagementId, filtersForCategory("closed"), tags));
+        cards.add(metricCard("false_positive", "False Positive", engagementId, filtersForCategory("false_positive"), tags));
+        cards.add(metricCard("out_of_scope", "Out of Scope", engagementId, filtersForCategory("out_of_scope"), tags));
+        cards.add(metricCard("total", "Total Findings", engagementId, filtersForCategory("total"), tags));
+        cards.add(metricCard("inactive", "Inactive Findings", engagementId, filtersForCategory("inactive"), tags));
         return cards;
     }
 
-    private DefectDojoMetricCard metricCard(String key, String label, int engagementId, Map<String, String> baseFilters) {
+    private DefectDojoMetricCard metricCard(String key, String label, int engagementId, Map<String, String> baseFilters, String tags) {
         Map<String, Integer> bySev = new LinkedHashMap<>();
         int total = 0;
         for (String sev : SEVERITIES) {
             Map<String, String> p = new LinkedHashMap<>(baseFilters);
             p.put("severity", sev);
-            int c = countFindings(engagementId, p);
+            int c = countFindings(engagementId, p, tags);
             bySev.put(sev, c);
             total += c;
         }
         if ("total".equals(key)) {
-            total = countFindings(engagementId, baseFilters);
+            total = countFindings(engagementId, baseFilters, tags);
         }
         return DefectDojoMetricCard.builder().key(key).label(label).total(total).bySeverity(bySev).build();
     }
@@ -497,7 +621,7 @@ public class DefectDojoService {
         int id = f.path("id").asInt();
         JsonNode test = testDetail != null ? testDetail
                 : (f.path("test").isObject() ? f.path("test") : null);
-        String scanType = test != null ? test.path("scan_type").asText(null) : null;
+        String scanType = test != null ? resolveScanTypeFromTest(test) : null;
         String testTitle = test != null ? test.path("title").asText(null) : null;
         if (scanType == null || scanType.isBlank()) {
             JsonNode foundBy = f.path("found_by");
@@ -763,7 +887,7 @@ public class DefectDojoService {
                     .name(name)
                     .branchTag(branchTag)
                     .status(item.path("status").asText(null))
-                    .activeFindings(countFindings(id, Map.of("active", "true", "is_mitigated", "false")))
+                    .activeFindings(countFindings(id, Map.of("active", "true", "is_mitigated", "false"), null))
                     .url(engagementUiUrl(id))
                     .build());
         }
@@ -780,7 +904,7 @@ public class DefectDojoService {
                 .collect(Collectors.toList());
     }
 
-    private Map<String, Integer> countBySeverity(int engagementId) {
+    private Map<String, Integer> countBySeverity(int engagementId, String tags) {
         Map<String, Integer> counts = new LinkedHashMap<>();
         for (String sev : SEVERITIES) {
             counts.put(sev, countFindings(engagementId, Map.of(
@@ -788,27 +912,112 @@ public class DefectDojoService {
                     "active", "true",
                     "is_mitigated", "false",
                     "duplicate", "false"
-            )));
+            ), tags));
         }
         return counts;
     }
 
-    private Map<String, Integer> countByStatus(int engagementId) {
+    private Map<String, Integer> countByStatus(int engagementId, String tags) {
         Map<String, Integer> counts = new LinkedHashMap<>();
-        counts.put("active", countFindings(engagementId, Map.of("active", "true", "is_mitigated", "false", "duplicate", "false")));
-        counts.put("mitigated", countFindings(engagementId, Map.of("is_mitigated", "true")));
-        counts.put("verified", countFindings(engagementId, Map.of("verified", "true", "active", "true", "is_mitigated", "false")));
-        counts.put("falsePositive", countFindings(engagementId, Map.of("false_p", "true")));
-        counts.put("duplicate", countFindings(engagementId, Map.of("duplicate", "true")));
+        counts.put("active", countFindings(engagementId, Map.of(
+                "active", "true", "is_mitigated", "false", "duplicate", "false"), tags));
+        counts.put("mitigated", countFindings(engagementId, Map.of("is_mitigated", "true"), tags));
+        counts.put("verified", countFindings(engagementId, Map.of(
+                "verified", "true", "active", "true", "is_mitigated", "false"), tags));
+        counts.put("falsePositive", countFindings(engagementId, Map.of("false_p", "true"), tags));
+        counts.put("duplicate", countFindings(engagementId, Map.of("duplicate", "true"), tags));
         return counts;
     }
 
-    private int countFindings(int engagementId, Map<String, String> extraParams) {
+    private Map<String, Integer> parallelCountBySeverity(int engagementId, String tags) {
+        Map<String, Integer> counts = new ConcurrentHashMap<>();
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        for (String sev : SEVERITIES) {
+            futures.add(CompletableFuture.runAsync(() -> counts.put(sev, countFindings(engagementId, Map.of(
+                    "severity", sev,
+                    "active", "true",
+                    "is_mitigated", "false",
+                    "duplicate", "false"
+            ), tags)), DD_IO_POOL));
+        }
+        joinAll(futures);
+        return orderedSeverityCounts(counts);
+    }
+
+    /** Comptages actif/mitigé uniquement — suffisant pour dashboard2. */
+    private Map<String, Integer> parallelCountByStatusLight(int engagementId, String tags) {
+        Map<String, Integer> counts = new ConcurrentHashMap<>();
+        List<CompletableFuture<Void>> futures = List.of(
+                CompletableFuture.runAsync(() -> counts.put("active", countFindings(engagementId, Map.of(
+                        "active", "true", "is_mitigated", "false", "duplicate", "false"), tags)), DD_IO_POOL),
+                CompletableFuture.runAsync(() -> counts.put("mitigated", countFindings(engagementId, Map.of(
+                        "is_mitigated", "true"), tags)), DD_IO_POOL)
+        );
+        joinAll(futures);
+        Map<String, Integer> ordered = new LinkedHashMap<>();
+        ordered.put("active", counts.getOrDefault("active", 0));
+        ordered.put("mitigated", counts.getOrDefault("mitigated", 0));
+        return ordered;
+    }
+
+    private Map<String, Integer> parallelCountBySeverityForProduct(int productId) {
+        Map<String, Integer> counts = new ConcurrentHashMap<>();
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        for (String sev : SEVERITIES) {
+            futures.add(CompletableFuture.runAsync(() -> counts.put(sev, countFindingsForProduct(productId, Map.of(
+                    "severity", sev,
+                    "active", "true",
+                    "is_mitigated", "false",
+                    "duplicate", "false"
+            ))), DD_IO_POOL));
+        }
+        joinAll(futures);
+        return orderedSeverityCounts(counts);
+    }
+
+    private Map<String, Integer> parallelCountByStatusLightForProduct(int productId) {
+        Map<String, Integer> counts = new ConcurrentHashMap<>();
+        List<CompletableFuture<Void>> futures = List.of(
+                CompletableFuture.runAsync(() -> counts.put("active", countFindingsForProduct(productId, Map.of(
+                        "active", "true", "is_mitigated", "false", "duplicate", "false"))), DD_IO_POOL),
+                CompletableFuture.runAsync(() -> counts.put("mitigated", countFindingsForProduct(productId, Map.of(
+                        "is_mitigated", "true"))), DD_IO_POOL)
+        );
+        joinAll(futures);
+        Map<String, Integer> ordered = new LinkedHashMap<>();
+        ordered.put("active", counts.getOrDefault("active", 0));
+        ordered.put("mitigated", counts.getOrDefault("mitigated", 0));
+        return ordered;
+    }
+
+    private static Map<String, Integer> orderedSeverityCounts(Map<String, Integer> counts) {
+        Map<String, Integer> ordered = new LinkedHashMap<>();
+        for (String sev : SEVERITIES) {
+            ordered.put(sev, counts.getOrDefault(sev, 0));
+        }
+        return ordered;
+    }
+
+    private static void joinAll(List<CompletableFuture<Void>> futures) {
+        if (futures.isEmpty()) {
+            return;
+        }
+        CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new)).join();
+    }
+
+    private int countFindings(int engagementId, Map<String, String> extraParams, String tags) {
         Map<String, String> params = new LinkedHashMap<>(extraParams);
         params.put("test__engagement", String.valueOf(engagementId));
+        applyTags(params, tags);
         params.put("limit", "1");
         JsonNode page = get("/api/v2/findings/", params);
         return page != null ? page.path("count").asInt(0) : 0;
+    }
+
+    private static void applyTags(Map<String, String> params, String tags) {
+        if (tags != null && !tags.isBlank()) {
+            params.put("tags", tags.trim());
+        }
     }
 
     private int countFindingsForTest(int testId, Map<String, String> extraParams) {
@@ -863,9 +1072,10 @@ public class DefectDojoService {
             Map<String, Integer> bySeverityOpen,
             Map<String, Integer> byStatus,
             int openCount,
-            int closedCount
+            int closedCount,
+            String tags
     ) {
-        List<JsonNode> findings = fetchAllEngagementFindings(engagementId);
+        List<JsonNode> findings = fetchOpenFindingsSample(null, engagementId, 200, tags);
 
         Map<String, Integer> byTool = new LinkedHashMap<>();
         Map<String, Integer> byAnalysisType = new LinkedHashMap<>();
@@ -879,7 +1089,10 @@ public class DefectDojoService {
             }
         }
 
-        List<DefectDojoScanSnapshot> scanSnapshots = buildScanSnapshots(engagementId);
+        List<DefectDojoScanSnapshot> scanSnapshots = enrichSnapshotsSeverity(
+                buildScanSnapshotsFast(engagementId),
+                bySeverityOpen
+        );
         DefectDojoDetailedMetrics detailedMetrics = buildDetailedMetrics(findings, scanSnapshots);
 
         String lastScanDate = scanSnapshots.isEmpty() ? null
@@ -1159,7 +1372,10 @@ public class DefectDojoService {
             int testId = t.path("id").asInt();
             Map<String, Integer> bySev = countBySeverityForTest(testId, true);
             int total = bySev.values().stream().mapToInt(Integer::intValue).sum();
-            String scanType = t.path("scan_type").asText("Unknown");
+            String scanType = resolveScanTypeFromTest(t);
+            if (scanType == null) {
+                scanType = "Unknown";
+            }
             String timestamp = firstNonBlank(
                     t.path("created").asText(null),
                     t.path("updated").asText(null)
@@ -1181,14 +1397,41 @@ public class DefectDojoService {
 
     private static String resolveScanTypeFromFinding(JsonNode f) {
         JsonNode test = f.path("test");
-        if (test.isObject() && test.has("scan_type")) {
-            return test.path("scan_type").asText("Unknown");
+        if (test.isObject()) {
+            String fromTest = resolveScanTypeFromTest(test);
+            if (fromTest != null) {
+                return fromTest;
+            }
         }
         JsonNode foundBy = f.path("found_by");
         if (foundBy.isArray() && !foundBy.isEmpty()) {
             return foundBy.get(0).asText("Unknown");
         }
         return foundBy.asText("Unknown");
+    }
+
+    /** DefectDojo expose le nom du scanner via test_type_name (pas scan_type sur /tests/). */
+    private static String resolveScanTypeFromTest(JsonNode t) {
+        if (t == null || t.isMissingNode()) {
+            return null;
+        }
+        String name = t.path("test_type_name").asText(null);
+        if (name != null && !name.isBlank()) {
+            return name.trim();
+        }
+        name = t.path("test_type").path("name").asText(null);
+        if (name != null && !name.isBlank()) {
+            return name.trim();
+        }
+        name = t.path("scan_type").asText(null);
+        if (name != null && !name.isBlank()) {
+            return name.trim();
+        }
+        name = t.path("title").asText(null);
+        if (name != null && !name.isBlank()) {
+            return name.trim();
+        }
+        return null;
     }
 
     private static String classifyAnalysisType(String scanType) {
@@ -1261,7 +1504,7 @@ public class DefectDojoService {
             out.add(DefectDojoTestItem.builder()
                     .id(id)
                     .title(t.path("title").asText(null))
-                    .scanType(t.path("scan_type").asText(null))
+                    .scanType(resolveScanTypeFromTest(t))
                     .testType(t.path("test_type").asText(null))
                     .findingCount(t.path("finding_count").asInt(0))
                     .created(t.path("created").asText(null))
@@ -1440,7 +1683,8 @@ public class DefectDojoService {
             String category,
             String severity,
             int page,
-            int size
+            int size,
+            String tags
     ) {
         User user = currentUser();
         Application app = applicationRepository.findByIdAndCreatedBy(applicationId, user)
@@ -1467,6 +1711,7 @@ public class DefectDojoService {
         if (severity != null && !severity.isBlank()) {
             params.put("severity", normalizeSeverity(severity));
         }
+        applyTags(params, tags);
         params.put("ordering", orderingForCategory(cat));
         params.put("limit", String.valueOf(pageSize));
         params.put("offset", String.valueOf(offset));
@@ -1765,12 +2010,17 @@ public class DefectDojoService {
     }
 
     private List<JsonNode> fetchOpenFindingsSample(Integer productId, Integer engagementId, int limit) {
+        return fetchOpenFindingsSample(productId, engagementId, limit, null);
+    }
+
+    private List<JsonNode> fetchOpenFindingsSample(Integer productId, Integer engagementId, int limit, String tags) {
         Map<String, String> params = new LinkedHashMap<>(filtersForCategory("open"));
         if (engagementId != null) {
             params.put("test__engagement", String.valueOf(engagementId));
         } else if (productId != null) {
             params.put("test__engagement__product", String.valueOf(productId));
         }
+        applyTags(params, tags);
         params.put("limit", String.valueOf(Math.min(limit, 200)));
         params.put("ordering", "-numerical_severity,-id");
         JsonNode page = get("/api/v2/findings/", params);
@@ -1784,12 +2034,225 @@ public class DefectDojoService {
         return out;
     }
 
+    private List<DefectDojoScanSnapshot> enrichSnapshotsSeverity(
+            List<DefectDojoScanSnapshot> snapshots,
+            Map<String, Integer> bySeverityOpen
+    ) {
+        if (snapshots == null || snapshots.isEmpty()) {
+            return snapshots != null ? snapshots : List.of();
+        }
+        List<DefectDojoScanSnapshot> out = new ArrayList<>(snapshots);
+        DefectDojoScanSnapshot last = out.get(out.size() - 1);
+        out.set(out.size() - 1, DefectDojoScanSnapshot.builder()
+                .testId(last.getTestId())
+                .scanType(last.getScanType())
+                .label(last.getLabel())
+                .date(last.getDate())
+                .timestamp(last.getTimestamp())
+                .totalOpen(last.getTotalOpen())
+                .bySeverity(bySeverityOpen != null ? new LinkedHashMap<>(bySeverityOpen) : emptySeverityMap())
+                .build());
+        return out;
+    }
+
     private Map<String, Integer> aggregateToolsFromFindings(List<JsonNode> findings) {
         Map<String, Integer> byTool = new LinkedHashMap<>();
         for (JsonNode f : findings) {
             byTool.merge(resolveScanTypeFromFinding(f), 1, Integer::sum);
         }
         return byTool;
+    }
+
+    /** Noms de scan DefectDojo (scan_type) — aligné pipeline CI. */
+    private Map<String, Integer> aggregateToolsFromEngagement(int engagementId) {
+        JsonNode page = get("/api/v2/tests/", Map.of(
+                "engagement", String.valueOf(engagementId),
+                "limit", "100",
+                "ordering", "-id"
+        ));
+        return aggregateToolsFromTestsPage(page, false);
+    }
+
+    /** Vue globale : tous les tests du produit (toutes branches). */
+    private Map<String, Integer> aggregateToolsFromProductTests(int productId) {
+        JsonNode page = get("/api/v2/tests/", Map.of(
+                "test__engagement__product", String.valueOf(productId),
+                "limit", "100",
+                "ordering", "-id"
+        ));
+        return aggregateToolsFromTestsPage(page, true);
+    }
+
+    private Map<String, Integer> aggregateToolsFromTestsPage(JsonNode page, boolean includeZeroCounts) {
+        Map<String, Integer> byTool = new LinkedHashMap<>();
+        if (page == null || !page.has("results")) {
+            return byTool;
+        }
+        for (JsonNode t : page.path("results")) {
+            String scanType = resolveScanTypeFromTest(t);
+            if (scanType == null) {
+                continue;
+            }
+            int count = t.path("finding_count").asInt(0);
+            if (count == 0 && !includeZeroCounts) {
+                int testId = t.path("id").asInt();
+                count = countFindingsForTest(testId, Map.of(
+                        "active", "true",
+                        "is_mitigated", "false",
+                        "duplicate", "false"
+                ));
+            }
+            if (count > 0) {
+                byTool.merge(scanType, count, Integer::sum);
+            } else if (includeZeroCounts) {
+                byTool.putIfAbsent(scanType, 0);
+            }
+        }
+        return byTool;
+    }
+
+    private Map<String, Integer> aggregateToolsFromEngagements(List<DefectDojoEngagementSummary> engagements) {
+        Map<String, Integer> byTool = new LinkedHashMap<>();
+        int max = Math.min(engagements.size(), 12);
+        for (int i = 0; i < max; i++) {
+            DefectDojoEngagementSummary e = engagements.get(i);
+            if (e.getId() > 0) {
+                aggregateToolsFromEngagement(e.getId()).forEach((k, v) -> byTool.merge(k, v, Integer::sum));
+            }
+        }
+        return byTool;
+    }
+
+    /** Vue globale : noms de scanners uniquement (pas de cumul de findings). */
+    private Map<String, Integer> aggregateToolsPresenceFromEngagements(List<DefectDojoEngagementSummary> engagements) {
+        return aggregateToolsPresenceFromEngagements(engagements, 3);
+    }
+
+    private Map<String, Integer> aggregateToolsPresenceFromEngagements(
+            List<DefectDojoEngagementSummary> engagements,
+            int maxEngagements
+    ) {
+        LinkedHashSet<String> names = new LinkedHashSet<>();
+        int max = Math.min(engagements.size(), Math.max(1, maxEngagements));
+        for (int i = 0; i < max; i++) {
+            DefectDojoEngagementSummary e = engagements.get(i);
+            if (e.getId() > 0) {
+                aggregateToolsFromEngagement(e.getId()).keySet().forEach(names::add);
+            }
+        }
+        Map<String, Integer> byTool = new LinkedHashMap<>();
+        for (String name : names) {
+            byTool.put(name, 0);
+        }
+        return byTool;
+    }
+
+    private Map<String, Integer> aggregateToolsPresenceFromFindings(List<JsonNode> findings) {
+        LinkedHashSet<String> names = new LinkedHashSet<>();
+        for (JsonNode f : findings) {
+            names.add(resolveScanTypeFromFinding(f));
+        }
+        Map<String, Integer> byTool = new LinkedHashMap<>();
+        for (String name : names) {
+            byTool.put(name, 0);
+        }
+        return byTool;
+    }
+
+    /** Graphique Open by Severity — même source que getDashboard (scanSnapshots). */
+    private DefectDojoDashboardCharts buildDashboard2Charts(int engagementId, Map<String, Integer> bySeverity) {
+        // Snapshots déjà enrichis avec bySeverity réel par test
+        List<DefectDojoScanSnapshot> scanSnapshots = buildScanSnapshotsFast(engagementId);
+        return DefectDojoDashboardCharts.builder()
+                .scanSnapshots(scanSnapshots)
+                .bySeverity(bySeverity)
+                .build();
+    }
+
+    private DefectDojoDashboardCharts buildDashboard2ChartsForGlobal(
+            int productId,
+            Map<String, Integer> bySeverity
+    ) {
+        List<DefectDojoScanSnapshot> scanSnapshots = buildProductScanSnapshotsForChart(productId, 40);
+        return DefectDojoDashboardCharts.builder()
+                .scanSnapshots(scanSnapshots)
+                .bySeverity(bySeverity)
+                .build();
+    }
+
+    /** Tests DefectDojo agrégés au niveau produit (toutes branches / engagements). */
+    private List<DefectDojoScanSnapshot> buildProductScanSnapshotsForChart(int productId, int limit) {
+        JsonNode page = get("/api/v2/tests/", Map.of(
+                "test__engagement__product", String.valueOf(productId),
+                "limit", String.valueOf(Math.min(Math.max(limit, 1), 50)),
+                "ordering", "created"
+        ));
+        return buildScanSnapshotsFromTestsPage(page, false);
+    }
+
+    private static final int MAX_DAY_TO_DAY_POINTS = 90;
+
+    private List<DefectDojoTimeSeriesPoint> buildOpenDayToDayCumulative(List<JsonNode> openFindings) {
+        if (openFindings == null || openFindings.isEmpty()) {
+            return List.of();
+        }
+        TreeMap<String, List<JsonNode>> byDay = new TreeMap<>();
+        for (JsonNode f : openFindings) {
+            if (!f.path("active").asBoolean(false) || f.path("is_mitigated").asBoolean(false)) {
+                continue;
+            }
+            String day = extractDay(f.path("created").asText(null));
+            if (day == null) {
+                continue;
+            }
+            byDay.computeIfAbsent(day, k -> new ArrayList<>()).add(f);
+        }
+        if (byDay.isEmpty()) {
+            return List.of();
+        }
+
+        List<String> timeline = expandDayRange(byDay.firstKey(), byDay.lastKey());
+        Map<String, Integer> cumulative = emptySeverityMap();
+        List<DefectDojoTimeSeriesPoint> points = new ArrayList<>();
+        for (String day : timeline) {
+            List<JsonNode> dayFindings = byDay.get(day);
+            if (dayFindings != null) {
+                for (JsonNode f : dayFindings) {
+                    cumulative.merge(normalizeSeverity(f.path("severity").asText("Info")), 1, Integer::sum);
+                }
+            }
+            points.add(DefectDojoTimeSeriesPoint.builder()
+                    .period(day)
+                    .bySeverity(new LinkedHashMap<>(cumulative))
+                    .build());
+        }
+        return points;
+    }
+
+    private static List<String> expandDayRange(String startDay, String endDay) {
+        if (startDay == null || endDay == null) {
+            return List.of();
+        }
+        try {
+            java.time.LocalDate start = java.time.LocalDate.parse(startDay);
+            java.time.LocalDate end = java.time.LocalDate.parse(endDay);
+            if (end.isBefore(start)) {
+                java.time.LocalDate tmp = start;
+                start = end;
+                end = tmp;
+            }
+            long span = java.time.temporal.ChronoUnit.DAYS.between(start, end) + 1;
+            if (span > MAX_DAY_TO_DAY_POINTS) {
+                start = end.minusDays(MAX_DAY_TO_DAY_POINTS - 1L);
+            }
+            List<String> days = new ArrayList<>();
+            for (java.time.LocalDate d = start; !d.isAfter(end); d = d.plusDays(1)) {
+                days.add(d.toString());
+            }
+            return days;
+        } catch (Exception e) {
+            return List.of(startDay, endDay);
+        }
     }
 
     private List<DefectDojoScanSnapshot> buildProductScanSnapshotsFast(List<DefectDojoEngagementSummary> engagements) {
@@ -1809,18 +2272,59 @@ public class DefectDojoService {
     private List<DefectDojoScanSnapshot> buildScanSnapshotsFast(int engagementId) {
         JsonNode page = get("/api/v2/tests/", Map.of(
                 "engagement", String.valueOf(engagementId),
-                "limit", "50",
+                "limit", "25",
                 "ordering", "created"
         ));
+        return buildScanSnapshotsFromTestsPage(page, false);
+    }
+
+    private List<DefectDojoScanSnapshot> buildScanSnapshotsFromTestsPage(JsonNode page, boolean resolveFindingDates) {
         if (page == null) {
             return List.of();
         }
-        List<DefectDojoScanSnapshot> out = new ArrayList<>();
+
+        List<JsonNode> tests = new ArrayList<>();
         for (JsonNode t : page.path("results")) {
+            tests.add(t);
+        }
+
+        Map<Integer, Map<String, Integer>> severityByTest = new ConcurrentHashMap<>();
+        Map<Integer, Integer> totalByTest = new ConcurrentHashMap<>();
+
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        for (JsonNode t : tests) {
             int testId = t.path("id").asInt();
-            int total = t.path("finding_count").asInt(0);
-            String scanType = t.path("scan_type").asText("Unknown");
-            String timestamp = resolveTestTimestamp(t, testId);
+            futures.add(CompletableFuture.runAsync(() -> {
+                Map<String, Integer> bySev = new LinkedHashMap<>();
+                int total = 0;
+                for (String sev : SEVERITIES) {
+                    int c = countFindingsForTest(testId, Map.of(
+                            "severity", sev,
+                            "active", "true",
+                            "is_mitigated", "false",
+                            "duplicate", "false"
+                    ));
+                    bySev.put(sev, c);
+                    total += c;
+                }
+                severityByTest.put(testId, bySev);
+                totalByTest.put(testId, total);
+            }, DD_IO_POOL));
+        }
+        joinAll(futures);
+
+        List<DefectDojoScanSnapshot> out = new ArrayList<>();
+        for (JsonNode t : tests) {
+            int testId = t.path("id").asInt();
+            Map<String, Integer> bySev = severityByTest.getOrDefault(testId, emptySeverityMap());
+            int total = totalByTest.getOrDefault(testId, 0);
+            String scanType = resolveScanTypeFromTest(t);
+            if (scanType == null) {
+                scanType = "Unknown";
+            }
+            String timestamp = resolveFindingDates
+                    ? resolveTestTimestamp(t, testId)
+                    : resolveTestTimestampLight(t);
             String date = extractDay(timestamp);
             String label = formatScanLabel(scanType, timestamp);
             out.add(DefectDojoScanSnapshot.builder()
@@ -1830,18 +2334,35 @@ public class DefectDojoService {
                     .date(date)
                     .timestamp(timestamp)
                     .totalOpen(total)
-                    .bySeverity(emptySeverityMap())
+                    .bySeverity(bySev)
                     .build());
         }
         return out;
     }
 
+    // Ancienne surcharge conservée pour compatibilité interne
+    private List<DefectDojoScanSnapshot> buildScanSnapshotsFast(int engagementId, int limit, boolean resolveFindingDates) {
+        JsonNode page = get("/api/v2/tests/", Map.of(
+                "engagement", String.valueOf(engagementId),
+                "limit", String.valueOf(limit),
+                "ordering", "created"
+        ));
+        return buildScanSnapshotsFromTestsPage(page, resolveFindingDates);
+    }
+
     private String resolveTestTimestamp(JsonNode test, int testId) {
+        return firstNonBlank(
+                resolveTestTimestampLight(test),
+                fetchEarliestFindingCreated(testId)
+        );
+    }
+
+    /** Sans appel API findings/test — utilisé par dashboard2 pour éviter des centaines de requêtes. */
+    private static String resolveTestTimestampLight(JsonNode test) {
         return firstNonBlank(
                 test.path("target_end").asText(null),
                 test.path("target_start").asText(null),
                 test.path("updated").asText(null),
-                fetchEarliestFindingCreated(testId),
                 test.path("created").asText(null)
         );
     }
