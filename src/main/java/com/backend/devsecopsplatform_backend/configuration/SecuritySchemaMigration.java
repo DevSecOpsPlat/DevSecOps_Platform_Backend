@@ -27,6 +27,8 @@ public class SecuritySchemaMigration {
         alignAlertsTypeCheck();
         alignAuditLogActionCheck();
         ensureBlockedIpsTable();
+        addPipelineQualityGateColumn();
+        ensureQualityGateSnapshotsTable();
         backfillLegacyUsers();
         log.info("Schéma sécurité vérifié (users, login_attempts, alerts, audit_log, blocked_ips).");
     }
@@ -172,6 +174,46 @@ public class SecuritySchemaMigration {
         jdbcTemplate.execute("CREATE INDEX IF NOT EXISTS idx_blocked_ip_until ON blocked_ips (blocked_until)");
         jdbcTemplate.execute("CREATE INDEX IF NOT EXISTS idx_blocked_ip_active ON blocked_ips (active)");
         log.info("Table blocked_ips vérifiée.");
+    }
+
+    private void addPipelineQualityGateColumn() {
+        jdbcTemplate.execute("""
+                DO $$
+                BEGIN
+                  IF EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'pipeline_executions'
+                  ) THEN
+                    ALTER TABLE pipeline_executions ADD COLUMN IF NOT EXISTS quality_gate_json JSONB;
+                  END IF;
+                END $$
+                """);
+    }
+
+    private void ensureQualityGateSnapshotsTable() {
+        jdbcTemplate.execute("""
+                CREATE TABLE IF NOT EXISTS quality_gate_snapshots (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    application_id UUID NOT NULL,
+                    environment_id UUID NOT NULL,
+                    pipeline_execution_id UUID NOT NULL UNIQUE,
+                    branch VARCHAR(255) NOT NULL,
+                    gitlab_pipeline_id BIGINT,
+                    source VARCHAR(32) NOT NULL,
+                    evaluated_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    payload JSONB NOT NULL
+                )
+                """);
+        jdbcTemplate.execute("""
+                CREATE INDEX IF NOT EXISTS idx_qg_snap_env_created
+                    ON quality_gate_snapshots (environment_id, created_at DESC)
+                """);
+        jdbcTemplate.execute("""
+                CREATE INDEX IF NOT EXISTS idx_qg_snap_app_branch_created
+                    ON quality_gate_snapshots (application_id, branch, created_at DESC)
+                """);
+        log.info("Table quality_gate_snapshots vérifiée.");
     }
 
     private void backfillLegacyUsers() {

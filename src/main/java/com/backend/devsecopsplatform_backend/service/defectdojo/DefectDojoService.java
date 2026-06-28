@@ -136,7 +136,16 @@ public class DefectDojoService {
      * Ne dépend pas d'un pipeline en cours — données DefectDojo immédiates (0 si absent).
      */
     public DefectDojoDashboard2Response getDashboard2(UUID applicationId, String branch) {
+        return getDashboard2(applicationId, branch, null);
+    }
+
+    /**
+     * Dashboard v2 filtré par branche et optionnellement par environnement éphémère
+     * (tag DefectDojo {@code env-<uuid>} — aligné import CI {@code tags=env-${ENVIRONMENT_ID}}).
+     */
+    public DefectDojoDashboard2Response getDashboard2(UUID applicationId, String branch, UUID environmentId) {
         User user = currentUser();
+        String envTag = environmentId != null ? environmentTag(environmentId) : null;
         Application app = applicationRepository.findByIdAndCreatedBy(applicationId, user)
                 .orElseThrow(() -> new IllegalArgumentException("Application introuvable ou accès refusé"));
 
@@ -216,21 +225,40 @@ public class DefectDojoService {
         }
 
         int engagementId = engagement.path("id").asInt();
-        Map<String, Integer> bySeverity = parallelCountBySeverity(engagementId, null);
-        Map<String, Integer> byStatus = parallelCountByStatusLight(engagementId, null);
-        int open = byStatus.getOrDefault("active", 0);
-        int closed = byStatus.getOrDefault("mitigated", 0);
-        List<JsonNode> openSample = fetchOpenFindingsSample(productId, engagementId, 50);
-        Map<String, Integer> byTool = aggregateToolsFromEngagement(engagementId);
-        if (byTool.isEmpty() && !openSample.isEmpty()) {
-            byTool = aggregateToolsFromFindings(openSample);
+        Map<String, Integer> bySeverity;
+        Map<String, Integer> byTool;
+        List<JsonNode> openSample;
+        int open;
+        int closed = 0;
+
+        Map<String, Integer> byStatus;
+        if (envTag != null) {
+            bySeverity = parallelCountBySeverityForTaggedTests(engagementId, envTag);
+            byTool = aggregateToolsFromEngagementWithTag(engagementId, envTag);
+            open = bySeverity.values().stream().mapToInt(Integer::intValue).sum();
+            openSample = fetchOpenFindingsSampleForTaggedTests(productId, engagementId, envTag, 200);
+            if (byTool.isEmpty() && !openSample.isEmpty()) {
+                byTool = aggregateToolsFromFindings(openSample);
+            }
+            byStatus = Map.of("active", open, "mitigated", closed);
+        } else {
+            bySeverity = parallelCountBySeverity(engagementId, null);
+            byStatus = parallelCountByStatusLight(engagementId, null);
+            open = byStatus.getOrDefault("active", 0);
+            closed = byStatus.getOrDefault("mitigated", 0);
+            openSample = fetchOpenFindingsSample(productId, engagementId, 50);
+            byTool = aggregateToolsFromEngagement(engagementId);
+            if (byTool.isEmpty() && !openSample.isEmpty()) {
+                byTool = aggregateToolsFromFindings(openSample);
+            }
         }
 
         DefectDojoDashboardCharts charts = buildDashboard2Charts(engagementId, bySeverity);
 
         return DefectDojoDashboard2Response.builder()
                 .configured(true)
-                .scope("branch")
+                .scope(envTag != null ? "environment" : "branch")
+                .environmentTag(envTag)
                 .applicationName(app.getName())
                 .productName(productName)
                 .productId(productId)
@@ -2050,6 +2078,70 @@ public class DefectDojoService {
                 .totalOpen(last.getTotalOpen())
                 .bySeverity(bySeverityOpen != null ? new LinkedHashMap<>(bySeverityOpen) : emptySeverityMap())
                 .build());
+        return out;
+    }
+
+    /** Tests DefectDojo tagués env-{uuid} (aligné import CI). */
+    private JsonNode fetchTestsWithTag(int engagementId, String tag) {
+        if (tag == null || tag.isBlank()) {
+            return null;
+        }
+        return get("/api/v2/tests/", Map.of(
+                "engagement", String.valueOf(engagementId),
+                "tags", tag.trim(),
+                "limit", "100",
+                "ordering", "-id"
+        ));
+    }
+
+    private Map<String, Integer> aggregateToolsFromEngagementWithTag(int engagementId, String tag) {
+        JsonNode page = fetchTestsWithTag(engagementId, tag);
+        return aggregateToolsFromTestsPage(page, false);
+    }
+
+    private Map<String, Integer> parallelCountBySeverityForTaggedTests(int engagementId, String tag) {
+        JsonNode page = fetchTestsWithTag(engagementId, tag);
+        Map<String, Integer> total = emptySeverityMap();
+        if (page == null || !page.has("results")) {
+            return total;
+        }
+        for (JsonNode t : page.path("results")) {
+            int testId = t.path("id").asInt();
+            if (testId <= 0) continue;
+            countBySeverityForTest(testId, true).forEach((sev, count) ->
+                    total.merge(sev, count, Integer::sum));
+        }
+        return total;
+    }
+
+    private List<JsonNode> fetchOpenFindingsSampleForTaggedTests(
+            Integer productId,
+            int engagementId,
+            String tag,
+            int limit
+    ) {
+        JsonNode page = fetchTestsWithTag(engagementId, tag);
+        if (page == null || !page.has("results")) {
+            return List.of();
+        }
+        List<JsonNode> out = new ArrayList<>();
+        for (JsonNode t : page.path("results")) {
+            int testId = t.path("id").asInt();
+            if (testId <= 0) continue;
+            Map<String, String> params = new LinkedHashMap<>(filtersForCategory("open"));
+            params.put("test", String.valueOf(testId));
+            params.put("limit", String.valueOf(Math.min(limit, 200)));
+            params.put("ordering", "-numerical_severity,-id");
+            JsonNode findingsPage = get("/api/v2/findings/", params);
+            if (findingsPage != null && findingsPage.has("results")) {
+                for (JsonNode f : findingsPage.path("results")) {
+                    out.add(f);
+                    if (out.size() >= limit) {
+                        return out;
+                    }
+                }
+            }
+        }
         return out;
     }
 

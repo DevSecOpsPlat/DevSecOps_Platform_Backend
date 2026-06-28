@@ -14,8 +14,11 @@ public class DefectDojoDashboard2Response {
     private boolean configured;
     private String message;
 
-    /** global | branch */
+    /** global | branch | environment */
     private String scope;
+
+    /** Tag DefectDojo {@code env-<uuid>} quand le filtre environnement est actif. */
+    private String environmentTag;
 
     private String applicationName;
     private String productName;

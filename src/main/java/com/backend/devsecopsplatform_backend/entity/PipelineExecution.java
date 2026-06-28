@@ -52,6 +52,11 @@ public class PipelineExecution {
     @Column(name = "stages_json", columnDefinition = "jsonb")
     private Map<String, Object> stagesJson;
 
+    /** Verdict CI security-validation + métriques summary.json (quality-gate.json). */
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(name = "quality_gate_json", columnDefinition = "jsonb")
+    private Map<String, Object> qualityGateJson;
+
     @Column(name = "started_at")
     @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd'T'HH:mm:ss")
     private LocalDateTime startedAt;

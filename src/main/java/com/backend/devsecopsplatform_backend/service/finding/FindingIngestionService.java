@@ -7,6 +7,7 @@ import com.backend.devsecopsplatform_backend.repository.PipelineExecutionReposit
 import com.backend.devsecopsplatform_backend.repository.SecurityScanRepository;
 import com.backend.devsecopsplatform_backend.repository.VulnerabilityRecommendationRepository;
 import com.backend.devsecopsplatform_backend.service.GitLabService;
+import com.backend.devsecopsplatform_backend.service.qualitygate.PipelineArtifactsIngestedEvent;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -14,11 +15,13 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.gitlab4j.api.models.Job;
 import org.gitlab4j.api.models.JobStatus;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
+import java.time.Instant;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.zip.ZipEntry;
@@ -44,6 +47,7 @@ public class FindingIngestionService {
     private final SecurityScanRepository securityScanRepository;
     private final VulnerabilityRecommendationRepository vulnerabilityRecommendationRepository;
     private final ObjectMapper objectMapper;
+    private final ApplicationEventPublisher eventPublisher;
 
     @Transactional
     public Map<String, Object> ingestFromAggregateArtifacts(Long pipelineId) {
@@ -68,6 +72,7 @@ public class FindingIngestionService {
         int autoFixedFindings = 0;
         int createdSecurityScans = 0;
         int createdRecommendations = 0;
+        boolean summaryStored = false;
         List<String> parsed = new ArrayList<>();
 
         try (InputStream zipStream = gitLabService.downloadAllJobArtifacts(agg.getId());
@@ -97,6 +102,19 @@ public class FindingIngestionService {
 
                 parsedFiles++;
                 parsed.add(name);
+
+                if (isPipelineSummaryArtifact(name)) {
+                    try {
+                        Map<String, Object> summaryMap = objectMapper.convertValue(
+                                root, new TypeReference<Map<String, Object>>() {});
+                        persistSummaryOnExecution(execution, summaryMap);
+                        summaryStored = true;
+                        log.info("summary.json persisté pour pipeline #{}", pipelineId);
+                    } catch (Exception e) {
+                        log.warn("Impossible de persister summary.json pour pipeline #{}: {}", pipelineId, e.getMessage());
+                    }
+                    continue;
+                }
 
                 List<NormalizedFinding> findings = parseReport(name, root);
                 for (NormalizedFinding nf : findings) {
@@ -183,11 +201,15 @@ public class FindingIngestionService {
             log.warn("⚠️ SecurityScans ignored (pipelineId={}): {}", pipelineId, e.getMessage());
         }
 
+        eventPublisher.publishEvent(new PipelineArtifactsIngestedEvent(execution.getId(), pipelineId));
+        log.info("Événement ingestion artifacts publié pour pipeline #{}", pipelineId);
+
         return Map.of(
                 "pipelineId", pipelineId,
                 "job", AGGREGATE_JOB_NAME,
                 "parsedFiles", parsedFiles,
                 "parsed", parsed,
+                "summaryStored", summaryStored,
                 "createdFindings", createdFindings,
                 "createdOccurrences", createdOccurrences,
                 "autoFixedFindings", autoFixedFindings,
@@ -999,6 +1021,27 @@ public class FindingIngestionService {
 
     private static String nullToEmpty(String v) {
         return v == null ? "" : v;
+    }
+
+    private static boolean isPipelineSummaryArtifact(String name) {
+        if (name == null) return false;
+        String n = name.replace('\\', '/').toLowerCase(Locale.ROOT);
+        return n.endsWith("final-report/summary.json") || n.endsWith("/summary.json");
+    }
+
+    @SuppressWarnings("unchecked")
+    private void persistSummaryOnExecution(PipelineExecution execution, Map<String, Object> summary) {
+        Map<String, Object> gate = execution.getQualityGateJson();
+        if (gate == null) {
+            gate = new LinkedHashMap<>();
+        }
+        gate.put("summary", summary);
+        gate.put("summarySavedAt", Instant.now().toString());
+        if (summary.get("pipeline_id") != null) {
+            gate.put("pipelineId", String.valueOf(summary.get("pipeline_id")));
+        }
+        execution.setQualityGateJson(gate);
+        pipelineExecutionRepository.save(execution);
     }
 
     private record NormalizedFinding(

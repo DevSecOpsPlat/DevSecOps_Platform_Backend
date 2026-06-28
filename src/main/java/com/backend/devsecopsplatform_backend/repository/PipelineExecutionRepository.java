@@ -128,4 +128,50 @@ public interface PipelineExecutionRepository extends JpaRepository<PipelineExecu
             group by pe.status
             """)
     List<Object[]> countByApplicationIdGroupByStatus(@Param("appId") UUID appId);
+
+    @Query("""
+            SELECT pe FROM PipelineExecution pe
+            JOIN FETCH pe.environment env
+            WHERE env.application.id = :appId
+              AND (:branch IS NULL OR env.gitBranch = :branch)
+            ORDER BY pe.createdAt DESC
+            """)
+    List<PipelineExecution> findByApplicationIdAndBranchOrderByCreatedAtDesc(
+            @Param("appId") UUID appId,
+            @Param("branch") String branch,
+            Pageable pageable
+    );
+
+    @Query("""
+            SELECT pe FROM PipelineExecution pe
+            JOIN FETCH pe.environment env
+            WHERE env.id = :environmentId
+              AND env.application.id = :appId
+            """)
+    Optional<PipelineExecution> findByEnvironmentIdAndApplicationId(
+            @Param("environmentId") UUID environmentId,
+            @Param("appId") UUID appId
+    );
+
+    @Query("""
+            SELECT pe FROM PipelineExecution pe
+            JOIN FETCH pe.environment env
+            JOIN FETCH env.application app
+            LEFT JOIN FETCH app.createdBy
+            LEFT JOIN FETCH env.requestedBy
+            WHERE env.id = :environmentId
+              AND app.id = :appId
+            """)
+    Optional<PipelineExecution> findByEnvironmentIdAndApplicationIdWithDetails(
+            @Param("environmentId") UUID environmentId,
+            @Param("appId") UUID appId
+    );
+
+    @Query("""
+            SELECT pe FROM PipelineExecution pe
+            JOIN FETCH pe.environment env
+            JOIN FETCH env.application app
+            WHERE pe.id = :id
+            """)
+    Optional<PipelineExecution> findByIdWithEnvironmentAndApplication(@Param("id") UUID id);
 }

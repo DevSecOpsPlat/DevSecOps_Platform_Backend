@@ -4,6 +4,7 @@ import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
 import com.backend.devsecopsplatform_backend.entity.PipelineStatus;
 import com.backend.devsecopsplatform_backend.entity.EnvironmentStatus;
 import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
+import com.backend.devsecopsplatform_backend.service.qualitygate.QualityGateService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -31,6 +32,7 @@ public class PipelineStageSyncService {
 
     private final GitLabService gitLabService;
     private final PipelineExecutionRepository pipelineExecutionRepository;
+    private final QualityGateService qualityGateService;
 
     /**
      * Met à jour les stages en base pour un pipeline donné (appel API GitLab puis sauvegarde).
@@ -137,6 +139,10 @@ public class PipelineStageSyncService {
 
             pipelineExecutionRepository.save(execution);
             log.info("✅ Stages synchronisés en BDD pour le pipeline #{} ({} jobs)", pipelineId, stagesJson.get("totalJobs"));
+
+            if (newStatus != null && newStatus.isFinished()) {
+                qualityGateService.captureSnapshotIfAbsent(execution);
+            }
             return true;
         } catch (Exception e) {
             log.warn("⚠️ Impossible de synchroniser les stages pour le pipeline #{}: {}", pipelineId, e.getMessage());

@@ -457,6 +457,51 @@ public class AiAnalysisService {
         }
     }
 
+    /**
+     * Conseil personnalisé pour le dashboard Quality Gate (texte libre, Ollama/Groq/etc.).
+     */
+    public String generateQualityGateInsight(String contextJson) {
+        if (!aiEnabled) {
+            return null;
+        }
+        String provider = (aiProvider != null) ? aiProvider.strip().toLowerCase() : "groq";
+        if (!isProviderConfigured(provider)) {
+            if (isProviderConfigured("ollama")) {
+                provider = "ollama";
+            } else {
+                return null;
+            }
+        }
+        if (contextJson == null || contextJson.isBlank()) {
+            return null;
+        }
+        String truncated = contextJson.length() > 12_000
+                ? contextJson.substring(0, 12_000) + "\n[...tronqué]"
+                : contextJson;
+        String system = """
+                Tu es un expert DevSecOps. On te fournit le résultat JSON d'un quality gate CI/CD (pipeline, DefectDojo, SonarQube).
+                Rédige en français une analyse personnalisée et pédagogique (prose, pas de JSON) avec :
+                1) Pourquoi ce verdict de déploiement et le score 0–100 (securityScore.score / grade) s'ils sont présents
+                2) Les violations bloquantes vs les simples alertes, en citant les seuils quand pertinent
+                3) Trois actions prioritaires numérotées, concrètes et chiffrées pour l'équipe
+                4) Ce qui est urgent vs ce qui peut attendre l'après-déploiement éphémère
+                5) Une lecture des dimensions Software Quality SonarQube (Security / Reliability / Maintainability) si présentes
+                Utilise les chiffres réels du JSON (bySeverity DefectDojo, scoreBreakdown, softwareQuality). Sois direct et utile.
+                """;
+        List<ChatTurn> turns = List.of(new ChatTurn("user", "Quality gate JSON :\n" + truncated));
+        try {
+            return callFindingChatWithFallback(
+                    provider,
+                    buildChatMessagesForApi(system, turns),
+                    system,
+                    turns
+            );
+        } catch (Exception e) {
+            log.warn("IA quality gate: {}", e.getMessage());
+            return null;
+        }
+    }
+
     private String buildFindingChatSystemPrompt(String findingContext, String remediationBlock, String codeSnippetSection) {
         boolean secretCtx = isLikelySecretOrCredentialFinding(findingContext);
         String secretChat = secretCtx ? """

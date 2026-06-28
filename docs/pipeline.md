@@ -22,8 +22,8 @@ variables:
   DOCKERFILE_PATH:    "./Dockerfile"
   DEFECTDOJO_URL:     ""
   DEFECTDOJO_TOKEN:   ""
-  SONAR_TOKEN:        ""
-  SONAR_ADMIN_TOKEN:  ""
+  SONAR_HOST_URL:     ""   # URL de ton SonarQube self-hosted (ex: https://xxxx.trycloudflare.com)
+  SONAR_TOKEN:        ""   # Token généré dans SonarQube Admin
   DOCKER_USERNAME:    ""
   DOCKER_ACCESS_TOKEN: ""
   ENVIRONMENT_URL:    ""
@@ -36,7 +36,6 @@ variables:
   K8S_SSH_USER:       "ubuntu"
   SSH_PRIVATE_KEY:    ""
   TTL_HOURS:          "4"
-  # Quality gate thresholds (overridable per-pipeline)
   SCA_CRITICAL_THRESHOLD:       "5"
   SCA_HIGH_THRESHOLD:           "20"
   CONTAINER_CRITICAL_THRESHOLD: "0"
@@ -44,21 +43,20 @@ variables:
   SEMGREP_HIGH_THRESHOLD:       "10"
   SEMGREP_MEDIUM_THRESHOLD:     "50"
   IAC_FAILED_THRESHOLD:         "10"
-  # Set to "true" to use Kaniko instead of docker-socket mount
   USE_KANIKO: "false"
 
 # ══════════════════════════════════════════════════════════════════
-# STAGE 1 · SETUP  —  Clone + language detection
+# STAGE 1 · SETUP — Clone + détection langages
 # ══════════════════════════════════════════════════════════════════
 hello-world:
   stage: setup
   image: alpine:latest
   retry: 2
   script:
-    - echo "🚀 EnviroTest Optimized Security Pipeline"
-    - echo "Environment  = $ENVIRONMENT_ID"
-    - echo "Repository   = $GIT_REPO_URL"
-    - echo "Branch       = $GIT_BRANCH"
+    - echo "EnviroTest Security Pipeline"
+    - echo "Environment = $ENVIRONMENT_ID"
+    - echo "Repository  = $GIT_REPO_URL"
+    - echo "Branch      = $GIT_BRANCH"
 
 clone-repository:
   stage: setup
@@ -68,8 +66,8 @@ clone-repository:
   before_script:
     - apk add --no-cache git bash
   script:
-    - echo "📦 Cloning repository..."
-    - test -n "$GIT_REPO_URL" || (echo "❌ GIT_REPO_URL is required" && exit 1)
+    - echo "Cloning repository..."
+    - test -n "$GIT_REPO_URL" || (echo "GIT_REPO_URL is required" && exit 1)
     - |
       if [ -n "$GITHUB_TOKEN" ]; then
         AUTH_URL=$(echo "$GIT_REPO_URL" | sed "s|https://|https://oauth2:${GITHUB_TOKEN}@|")
@@ -78,10 +76,8 @@ clone-repository:
       fi
       git clone --depth 1 --branch "$GIT_BRANCH" "$AUTH_URL" user-repo
     - chmod -R 777 user-repo
-    - echo "🔍 Detecting project languages and infrastructure..."
     - touch build.env
 
-    # ── Languages ──
     - if [ -f "user-repo/package.json" ];                                                   then echo "LANG_NODE=true"   >> build.env; else echo "LANG_NODE=false"   >> build.env; fi
     - if [ -f "user-repo/requirements.txt" ] || [ -f "user-repo/Pipfile" ] || [ -f "user-repo/setup.py" ]; then echo "LANG_PYTHON=true" >> build.env; else echo "LANG_PYTHON=false" >> build.env; fi
     - if [ -f "user-repo/pom.xml" ] || [ -f "user-repo/build.gradle" ];                    then echo "LANG_JAVA=true"   >> build.env; else echo "LANG_JAVA=false"   >> build.env; fi
@@ -92,7 +88,6 @@ clone-repository:
     - if find user-repo -maxdepth 2 -name "*.csproj" -o -name "*.fsproj" | grep -q .;      then echo "LANG_DOTNET=true" >> build.env; else echo "LANG_DOTNET=false" >> build.env; fi
     - if find user-repo -name "*.c" -o -name "*.cpp" -o -name "*.h" | grep -q .;           then echo "LANG_CPP=true"    >> build.env; else echo "LANG_CPP=false"    >> build.env; fi
 
-    # ── Framework ──
     - |
       if [ -f "user-repo/angular.json" ]; then
         echo "FRAMEWORK=angular" >> build.env
@@ -108,13 +103,11 @@ clone-repository:
         echo "FRAMEWORK=unknown" >> build.env
       fi
 
-    # ── Infrastructure markers ──
     - if [ -f "user-repo/Dockerfile" ];                                   then echo "HAS_DOCKERFILE=true"  >> build.env; else echo "HAS_DOCKERFILE=false"  >> build.env; fi
     - if find user-repo -name "*.tf" | grep -q .;                         then echo "HAS_TERRAFORM=true"   >> build.env; else echo "HAS_TERRAFORM=false"   >> build.env; fi
     - if find user-repo -name "*.tf" -o -name "*.yaml" -o -name "*.yml" | grep -q .; then echo "HAS_IAC=true" >> build.env; else echo "HAS_IAC=false" >> build.env; fi
 
     - cat build.env
-    - echo "✅ Detection complete"
   artifacts:
     paths:
       - user-repo/
@@ -124,9 +117,20 @@ clone-repository:
     expire_in: 1 day
 
 # ══════════════════════════════════════════════════════════════════
-# STAGE 2 · CODE-ANALYSIS  —  SonarCloud (quality + SAST)
+# STAGE 2 · CODE-ANALYSIS — SonarQube self-hosted + community branch plugin
+#
+# Stratégie Option C : UN seul projet par repo, toutes les branches
+# dans ce projet grace au community branch plugin.
+# PROJECT_KEY = slug du repo (sans branche)
+# sonar.branch.name = nom de la branche scannée
+#
+# Résultat dans SonarQube :
+#   Projet : Angular
+#   ├── Branche : main
+#   ├── Branche : test
+#   └── Branche : feature/auth
 # ══════════════════════════════════════════════════════════════════
-sonarcloud-setup:
+sonarqube-setup:
   stage: code-analysis
   image: alpine:latest
   needs: ["clone-repository"]
@@ -134,58 +138,81 @@ sonarcloud-setup:
     - apk add --no-cache curl jq
   script:
     - |
-      PROJECT_KEY=$(echo "${GIT_REPO_URL}" | sed -E 's|https?://||; s|\.git$||; s|/|_|g; s|[^a-zA-Z0-9_]|_|g')
-      ORG="amanibennaceur-group"
-      echo "📋 ProjectKey = ${PROJECT_KEY}"
+      if [ -z "$SONAR_HOST_URL" ] || [ -z "$SONAR_TOKEN" ]; then
+        echo "SONAR_HOST_URL ou SONAR_TOKEN non configuré — skip"
+        echo "PROJECT_KEY=" >> project.env
+        exit 0
+      fi
 
-      EXISTS=$(curl -s -u "${SONAR_ADMIN_TOKEN}:" \
-        "https://sonarcloud.io/api/projects/search?organization=${ORG}&projects=${PROJECT_KEY}" \
+      # PROJECT_KEY = slug du repo uniquement (pas de branche)
+      REPO_NAME=$(echo "${GIT_REPO_URL}" | sed -E 's|.*/||; s|\.git$||')
+      PROJECT_KEY=$(echo "${GIT_REPO_URL}" \
+        | sed -E 's|https?://||; s|\.git$||; s|/|_|g; s|[^a-zA-Z0-9_]|_|g')
+
+      echo "Repo name   = ${REPO_NAME}"
+      echo "Project key = ${PROJECT_KEY}"
+      echo "Branch      = ${GIT_BRANCH}"
+      echo "SonarQube   = ${SONAR_HOST_URL}"
+
+      # Créer le projet s'il n'existe pas encore
+      EXISTS=$(curl -s -u "${SONAR_TOKEN}:" \
+        "${SONAR_HOST_URL}/api/projects/search?projects=${PROJECT_KEY}" \
         | jq -r '.components | length')
 
       if [ "$EXISTS" -eq 0 ]; then
-        echo "📦 Creating SonarCloud project..."
-        curl -s -X POST -u "${SONAR_ADMIN_TOKEN}:" \
-          "https://sonarcloud.io/api/projects/create" \
-          -d "project=${PROJECT_KEY}&name=${PROJECT_KEY}&organization=${ORG}"
+        echo "Creation du projet SonarQube ${PROJECT_KEY}..."
+        HTTP=$(curl -s -o /tmp/sonar_create.json -w "%{http_code}" \
+          -X POST -u "${SONAR_TOKEN}:" \
+          "${SONAR_HOST_URL}/api/projects/create" \
+          -d "project=${PROJECT_KEY}&name=${REPO_NAME}&visibility=private")
+        echo "HTTP $HTTP — $(cat /tmp/sonar_create.json)"
       else
-        echo "✅ Project already exists"
+        echo "Projet deja existant: ${PROJECT_KEY}"
       fi
 
-      curl -s -X POST -u "${SONAR_ADMIN_TOKEN}:" \
-        "https://sonarcloud.io/api/qualitygates/select" \
-        -d "projectKey=${PROJECT_KEY}&gateName=Sonar way"
+      # Quality gate par defaut
+      curl -s -X POST -u "${SONAR_TOKEN}:" \
+        "${SONAR_HOST_URL}/api/qualitygates/select" \
+        -d "projectKey=${PROJECT_KEY}&gateName=Sonar way" \
+        | jq -r 'if .errors then .errors else "Quality gate attache" end'
 
       echo "PROJECT_KEY=${PROJECT_KEY}" >> project.env
+      echo "SONAR_DASHBOARD_URL=${SONAR_HOST_URL}/dashboard?id=${PROJECT_KEY}&branch=${GIT_BRANCH}" >> project.env
+      echo "Dashboard: ${SONAR_HOST_URL}/dashboard?id=${PROJECT_KEY}&branch=${GIT_BRANCH}"
   artifacts:
     reports:
       dotenv: project.env
     expire_in: 1 hour
   allow_failure: true
 
-sonarcloud-scan:
+sonarqube-scan:
   stage: code-analysis
   image: sonarsource/sonar-scanner-cli:latest
   needs:
     - job: clone-repository
-    - job: sonarcloud-setup
+    - job: sonarqube-setup
   script:
-    - echo "🔍 SonarCloud Scan — ProjectKey = ${PROJECT_KEY}"
+    - |
+      if [ -z "$SONAR_HOST_URL" ] || [ -z "$SONAR_TOKEN" ] || [ -z "$PROJECT_KEY" ]; then
+        echo "SonarQube non configure — skip"
+        exit 0
+      fi
+    - echo "SonarQube Scan — project=${PROJECT_KEY} branch=${GIT_BRANCH}"
     - cd user-repo
     - |
       sonar-scanner \
         -Dsonar.projectKey="${PROJECT_KEY}" \
-        -Dsonar.organization="amanibennaceur-group" \
         -Dsonar.sources=. \
-        -Dsonar.host.url="https://sonarcloud.io" \
-        -Dsonar.token="$SONAR_TOKEN" \
+        -Dsonar.host.url="${SONAR_HOST_URL}" \
+        -Dsonar.token="${SONAR_TOKEN}" \
+        -Dsonar.branch.name="${GIT_BRANCH}" \
         -Dsonar.exclusions="**/node_modules/**,**/dist/**,**/target/**,**/build/**" \
         -Dsonar.scm.provider=git
+      echo "Dashboard: ${SONAR_HOST_URL}/dashboard?id=${PROJECT_KEY}&branch=${GIT_BRANCH}"
   allow_failure: true
 
 # ══════════════════════════════════════════════════════════════════
-# STAGE 3 · SCA  —  Trivy FS only (replaces 8 language-specific tools)
-#   ✅ Covers: npm, pip, maven, gradle, go.mod, Gemfile, composer,
-#              Cargo.toml, NuGet — all in one unified scan
+# STAGE 3 · SCA — Trivy FS
 # ══════════════════════════════════════════════════════════════════
 trivy-fs-scan:
   stage: sca
@@ -195,7 +222,7 @@ trivy-fs-scan:
     - apk add --no-cache curl
     - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
   script:
-    - echo "🔍 Trivy FS — Universal SCA (all ecosystems in one pass)"
+    - echo "Trivy FS — Universal SCA"
     - mkdir -p reports/trivy
     - |
       trivy fs \
@@ -204,13 +231,10 @@ trivy-fs-scan:
         --output reports/trivy/trivy-fs.json \
         user-repo/ || true
     - |
-      # Quick summary for CI logs
-      if command -v jq >/dev/null 2>&1; then
-        apk add --no-cache jq 2>/dev/null || true
-        CRIT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' reports/trivy/trivy-fs.json 2>/dev/null || echo 0)
-        HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' reports/trivy/trivy-fs.json 2>/dev/null || echo 0)
-        echo "📊 Trivy FS: CRITICAL=$CRIT HIGH=$HIGH"
-      fi
+      apk add --no-cache jq 2>/dev/null || true
+      CRIT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' reports/trivy/trivy-fs.json 2>/dev/null || echo 0)
+      HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' reports/trivy/trivy-fs.json 2>/dev/null || echo 0)
+      echo "Trivy FS: CRITICAL=$CRIT HIGH=$HIGH"
   artifacts:
     paths:
       - reports/trivy/trivy-fs.json
@@ -225,10 +249,9 @@ syft-license-scan:
     - apk add --no-cache curl
     - curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
   script:
-    - echo "📄 Syft — License compliance (all ecosystems)"
+    - echo "Syft — License compliance"
     - mkdir -p reports/license
     - syft dir:user-repo --output spdx-json=reports/license/sbom-spdx.json || true
-    - echo "✅ SBOM + license report generated"
   artifacts:
     paths:
       - reports/license/sbom-spdx.json
@@ -236,16 +259,14 @@ syft-license-scan:
   allow_failure: true
 
 # ══════════════════════════════════════════════════════════════════
-# STAGE 4 · SAST  —  Semgrep (replaces Bandit/Gosec/ESLint/SpotBugs/Brakeman/PHPStan/Cppcheck)
-#   ✅ Semgrep auto mode covers 30+ languages with 1000+ curated rules
-#   ✅ SonarCloud (stage 2) already handles deeper AST-level analysis
+# STAGE 4 · SAST — Semgrep + Hadolint
 # ══════════════════════════════════════════════════════════════════
 semgrep-sast:
   stage: sast
   image: returntocorp/semgrep:latest
   needs: ["clone-repository"]
   script:
-    - echo "🔍 Semgrep — Universal SAST (all languages, auto rule selection)"
+    - echo "Semgrep — Universal SAST"
     - mkdir -p reports/sast
     - |
       semgrep scan \
@@ -257,7 +278,7 @@ semgrep-sast:
       apk add --no-cache jq 2>/dev/null || true
       HIGH=$(jq '[.results[]? | select(.extra.severity=="ERROR")] | length' reports/sast/semgrep.json 2>/dev/null || echo 0)
       MED=$(jq '[.results[]? | select(.extra.severity=="WARNING")] | length' reports/sast/semgrep.json 2>/dev/null || echo 0)
-      echo "📊 Semgrep: HIGH/ERROR=$HIGH MEDIUM/WARNING=$MED"
+      echo "Semgrep: HIGH=$HIGH MEDIUM=$MED"
   artifacts:
     paths:
       - reports/sast/semgrep.json
@@ -269,11 +290,11 @@ hadolint-dockerfile:
   image: hadolint/hadolint:latest-debian
   needs: ["clone-repository"]
   script:
-    - echo "🔍 Hadolint — Dockerfile security lint"
+    - echo "Hadolint — Dockerfile security lint"
     - mkdir -p reports/sast
     - |
       if [ "$HAS_DOCKERFILE" != "true" ]; then
-        echo "⏭️  Skipping — No Dockerfile"
+        echo "Skipping — No Dockerfile"
         echo "[]" > reports/sast/hadolint.json
         exit 0
       fi
@@ -285,7 +306,7 @@ hadolint-dockerfile:
   allow_failure: true
 
 # ══════════════════════════════════════════════════════════════════
-# STAGE 5 · SECRETS-IAC  —  Gitleaks + Checkov (parallel)
+# STAGE 5 · SECRETS-IAC — Gitleaks + Checkov
 # ══════════════════════════════════════════════════════════════════
 gitleaks-secrets:
   stage: secrets-iac
@@ -296,7 +317,7 @@ gitleaks-secrets:
     - curl -sSfL https://github.com/zricethezav/gitleaks/releases/download/v8.18.2/gitleaks_8.18.2_linux_x64.tar.gz | tar xz
     - mv gitleaks /usr/local/bin/
   script:
-    - echo "🔑 Gitleaks — Secrets detection (filesystem)"
+    - echo "Gitleaks — Secrets detection"
     - mkdir -p reports/secrets
     - |
       gitleaks detect \
@@ -309,7 +330,7 @@ gitleaks-secrets:
         echo "[]" > reports/secrets/gitleaks.json
       fi
       COUNT=$(jq '. | if type=="array" then length else 0 end' reports/secrets/gitleaks.json 2>/dev/null || echo 0)
-      echo "🔑 Secrets found: $COUNT"
+      echo "Secrets found: $COUNT"
   artifacts:
     paths:
       - reports/secrets/gitleaks.json
@@ -325,11 +346,11 @@ checkov-iac:
   before_script:
     - pip install checkov --quiet
   script:
-    - echo "🏗️ Checkov — IaC scan (Terraform + K8s + Helm + Dockerfiles + GH Actions)"
+    - echo "Checkov — IaC scan"
     - mkdir -p reports/iac
     - |
       if [ "$HAS_IAC" != "true" ]; then
-        echo "⏭️  Skipping — No IaC files detected"
+        echo "Skipping — No IaC files detected"
         echo '{"results":{"passed_checks":[],"failed_checks":[]}}' > reports/iac/results_json.json
         exit 0
       fi
@@ -345,7 +366,7 @@ checkov-iac:
   allow_failure: true
 
 # ══════════════════════════════════════════════════════════════════
-# STAGE 6 · BUILD  —  Docker image (socket mount, Kaniko fallback)
+# STAGE 6 · BUILD — Docker image
 # ══════════════════════════════════════════════════════════════════
 build-docker-image:
   stage: build
@@ -358,20 +379,20 @@ build-docker-image:
     DOCKER_HOST: unix:///var/run/docker.sock
     DOCKER_TLS_CERTDIR: ""
   script:
-    - echo "🏗️ Building Docker image"
+    - echo "Building Docker image"
     - |
       if [ "$USE_KANIKO" = "true" ]; then
-        echo "ℹ️  USE_KANIKO=true — skipping socket build (Kaniko job will handle it)"
+        echo "USE_KANIKO=true — skipping socket build"
         exit 0
       fi
-    - until docker info 2>/dev/null; do echo "⏳ Waiting for Docker daemon..."; sleep 3; done
+    - until docker info 2>/dev/null; do echo "Waiting for Docker daemon..."; sleep 3; done
     - cd user-repo
     - IMAGE_NAME="${DOCKER_USERNAME}/envirotest-app:${ENVIRONMENT_ID}"
     - docker build -f ${DOCKERFILE_PATH} -t ${IMAGE_NAME} .
     - docker save -o ../image.tar ${IMAGE_NAME}
     - cd ..
     - echo "IMAGE_NAME=${IMAGE_NAME}" > image_name.env
-    - echo " Image built=${IMAGE_NAME}"
+    - echo "Image built ${IMAGE_NAME}"
   artifacts:
     paths:
       - image.tar
@@ -379,7 +400,6 @@ build-docker-image:
     expire_in: 2 hours
   allow_failure: false
 
-# Kaniko fallback — only runs when USE_KANIKO=true
 build-docker-image-kaniko:
   stage: build
   image:
@@ -391,7 +411,7 @@ build-docker-image-kaniko:
   rules:
     - if: '$USE_KANIKO == "true"'
   script:
-    - echo "🏗️ Kaniko build (no Docker daemon required)"
+    - echo "Kaniko build"
     - IMAGE_NAME="${DOCKER_USERNAME}/envirotest-app:${ENVIRONMENT_ID}"
     - echo "${DOCKER_ACCESS_TOKEN}" | /kaniko/executor \
         --context=dir://user-repo \
@@ -409,11 +429,11 @@ build-docker-image-kaniko:
   allow_failure: false
 
 # ══════════════════════════════════════════════════════════════════
-# STAGE 7 · CONTAINER-SCAN  —  Grype (replaces Trivy Image)
+# STAGE 7 · CONTAINER-SCAN — Anchore Grype
 # ══════════════════════════════════════════════════════════════════
 grype-image-scan:
   stage: container-scan
-  image: alpine:latest          # ← alpine à la place de anchore/grype:latest
+  image: alpine:latest
   retry: 2
   needs:
     - job: build-docker-image
@@ -422,26 +442,23 @@ grype-image-scan:
     - job: build-docker-image-kaniko
       artifacts: true
       optional: true
-  before_script:                # ← installe grype dans alpine
+  before_script:
     - apk add --no-cache curl jq
     - curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
   script:
-    - echo "🐳 Grype — Container vulnerability scan"
+    - echo "Grype — Container vulnerability scan"
     - mkdir -p reports/container-scan
     - |
       if [ ! -f image.tar ]; then
-        echo "⏭️  No image.tar artifact — skipping container scan"
+        echo "No image.tar — skipping container scan"
         echo '{"matches":[]}' > reports/container-scan/grype-image.json
         exit 0
       fi
-    - ls -lh image.tar   # debug : confirme que le fichier est là
     - grype docker-archive:$(pwd)/image.tar -o json > reports/container-scan/grype-image.json || true
     - |
       CRIT=$(jq '[.matches[]?.vulnerability?.severity? | select(.=="Critical")] | length' reports/container-scan/grype-image.json 2>/dev/null || echo 0)
-      CRIT=${CRIT:-0}
       HIGH=$(jq '[.matches[]?.vulnerability?.severity? | select(.=="High")] | length' reports/container-scan/grype-image.json 2>/dev/null || echo 0)
-      HIGH=${HIGH:-0}
-      echo "📊 Grype: CRITICAL=$CRIT HIGH=$HIGH"
+      echo "Grype: CRITICAL=$CRIT HIGH=$HIGH"
   artifacts:
     paths:
       - reports/container-scan/grype-image.json
@@ -449,7 +466,7 @@ grype-image-scan:
   allow_failure: true
 
 # ══════════════════════════════════════════════════════════════════
-# STAGE 8 · PUSH-IMAGE  —  Docker Hub push
+# STAGE 8 · PUSH-IMAGE — Docker Hub
 # ══════════════════════════════════════════════════════════════════
 push-docker-image:
   stage: push-image
@@ -468,19 +485,19 @@ push-docker-image:
   script:
     - |
       if [ ! -f image.tar ]; then
-        echo "⏭️  No image.tar — skipping push"
+        echo "No image.tar — skipping push"
         exit 0
       fi
-    - until docker info 2>/dev/null; do echo "⏳ Waiting for Docker..."; sleep 3; done
+    - until docker info 2>/dev/null; do echo "Waiting for Docker..."; sleep 3; done
     - docker load -i image.tar
     - . image_name.env
     - echo "$DOCKER_ACCESS_TOKEN" | docker login -u "$DOCKER_USERNAME" --password-stdin
     - docker push ${IMAGE_NAME}
-    - echo "✅ Pushed ${IMAGE_NAME}"
+    - echo "Pushed ${IMAGE_NAME}"
   allow_failure: true
 
 # ══════════════════════════════════════════════════════════════════
-# STAGE 9 · DEPLOY-K8S  —  Ephemeral Kubernetes environment
+# STAGE 9 · DEPLOY-K8S — Environnement éphémère Kubernetes
 # ══════════════════════════════════════════════════════════════════
 deploy-to-kubernetes:
   stage: deploy-k8s
@@ -518,9 +535,8 @@ deploy-to-kubernetes:
       EOF
     - export KUBECONFIG=$(pwd)/kubeconfig.yaml
   script:
-    - echo "🚀 Deploying to namespace ${K8S_NAMESPACE}"
+    - echo "Deploying to namespace ${K8S_NAMESPACE}"
     - kubectl create namespace ${K8S_NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
-
     - |
       cat > deployment.yaml << EOF
       apiVersion: apps/v1
@@ -550,7 +566,6 @@ deploy-to-kubernetes:
               ports:
               - containerPort: 80
       EOF
-
     - |
       cat > service.yaml << EOF
       apiVersion: v1
@@ -566,7 +581,6 @@ deploy-to-kubernetes:
         - port: 80
           targetPort: 80
       EOF
-
     - |
       cat > ingress.yaml << EOF
       apiVersion: networking.k8s.io/v1
@@ -589,18 +603,16 @@ deploy-to-kubernetes:
                   port:
                     number: 80
       EOF
-
     - kubectl apply -f deployment.yaml
     - kubectl apply -f service.yaml
     - kubectl apply -f ingress.yaml
     - kubectl rollout status deployment/app-${ENVIRONMENT_ID} -n ${K8S_NAMESPACE} --timeout=5m
-
     - |
       INGRESS_PORT=$(kubectl get svc -n ingress-nginx ingress-nginx-controller \
         -o jsonpath='{.spec.ports[?(@.name=="http")].nodePort}' 2>/dev/null || echo "80")
       APP_URL="http://app-${ENVIRONMENT_ID}.${K8S_MASTER_IP}.nip.io:${INGRESS_PORT}"
       echo "APP_URL=${APP_URL}" > app_url.env
-      echo "✅ Deployed: ${APP_URL}"
+      echo "Deployed: ${APP_URL}"
   artifacts:
     reports:
       dotenv: app_url.env
@@ -610,9 +622,7 @@ deploy-to-kubernetes:
   allow_failure: true
 
 # ══════════════════════════════════════════════════════════════════
-# STAGE 10 · DAST  —  OWASP ZAP Baseline (runs against live env)
-#   Only executes when deploy-to-kubernetes succeeded and APP_URL is set.
-#   Baseline mode = passive scan (no active attacks) — safe for ephemeral envs.
+# STAGE 10 · DAST — OWASP ZAP
 # ══════════════════════════════════════════════════════════════════
 owasp-zap-dast:
   stage: zap-scan
@@ -624,19 +634,18 @@ owasp-zap-dast:
   before_script:
     - apk add --no-cache jq 2>/dev/null || apt-get install -y -qq jq 2>/dev/null || true
   script:
-    - echo " OWASP ZAP Baseline DAST Target ${APP_URL}"
+    - echo "OWASP ZAP Baseline DAST — Target ${APP_URL}"
     - mkdir -p reports/dast
     - |
       if [ -z "$APP_URL" ]; then
-        echo "⏭️  APP_URL not set — skipping DAST (deploy likely failed)"
+        echo "APP_URL not set — skipping DAST"
         echo '{"site":[]}' > reports/dast/zap-report.json
         exit 0
       fi
     - |
-      # Wait for app to be healthy before scanning
       MAX=10; N=0
       until curl -sf --max-time 5 "${APP_URL}" >/dev/null 2>&1 || [ $N -ge $MAX ]; do
-        echo "⏳ Waiting for app to respond... ($N/$MAX)"; sleep 10; N=$((N+1))
+        echo "Waiting for app... ($N/$MAX)"; sleep 10; N=$((N+1))
       done
     - |
       zap-baseline.py \
@@ -647,7 +656,7 @@ owasp-zap-dast:
     - |
       ALERTS=$(jq '[.site[]?.alerts[]?] | length' reports/dast/zap-report.json 2>/dev/null || echo 0)
       HIGH_DAST=$(jq '[.site[]?.alerts[]? | select(.riskcode=="3")] | length' reports/dast/zap-report.json 2>/dev/null || echo 0)
-      echo "📊 DAST: Total alerts=$ALERTS High=$HIGH_DAST"
+      echo "DAST: Total=$ALERTS High=$HIGH_DAST"
   artifacts:
     paths:
       - reports/dast/zap-report.xml
@@ -655,7 +664,7 @@ owasp-zap-dast:
   allow_failure: true
 
 # ══════════════════════════════════════════════════════════════════
-# STAGE 11 · REPORTING  —  Aggregate + DefectDojo import
+# STAGE 11 · REPORTING — Agrégation + DefectDojo
 # ══════════════════════════════════════════════════════════════════
 aggregate-report:
   stage: reporting
@@ -668,19 +677,18 @@ aggregate-report:
     - hadolint-dockerfile
     - gitleaks-secrets
     - checkov-iac
-    - grype-image-scan        # remplacé trivy-image-scan
+    - grype-image-scan
     - owasp-zap-dast
   before_script:
     - apk add --no-cache jq
   script:
-    - echo "📊 Aggregating all scan results..."
+    - echo "Aggregating all scan results..."
     - mkdir -p final-report
     - source build.env 2>/dev/null || true
 
-    # ── Artifact validation ──
     - |
       echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-      echo "📦 ARTIFACT VALIDATION"
+      echo "ARTIFACT VALIDATION"
       echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
       MISSING=0; EMPTY=0; TOTAL=0
 
@@ -688,75 +696,44 @@ aggregate-report:
         local file="$1" name="$2"
         TOTAL=$((TOTAL + 1))
         if [ ! -f "$file" ]; then
-          echo "   ❌ $name — MISSING"
+          echo "MISSING: $name"
           MISSING=$((MISSING + 1))
         elif [ ! -s "$file" ]; then
-          echo "   ⚠️  $name — EMPTY"
+          echo "EMPTY: $name"
           EMPTY=$((EMPTY + 1))
         else
-          echo "   ✅ $name — OK ($(wc -c < "$file") bytes)"
+          echo "OK: $name ($(wc -c < "$file") bytes)"
         fi
       }
 
-      check_file "reports/trivy/trivy-fs.json"              "Trivy FS (SCA)"
-      check_file "reports/license/sbom-spdx.json"           "Syft SBOM (Licenses)"
-      check_file "reports/sast/semgrep.json"                "Semgrep (SAST)"
-      check_file "reports/sast/hadolint.json"               "Hadolint (Dockerfile)"
-      check_file "reports/secrets/gitleaks.json"            "Gitleaks (Secrets)"
-      check_file "reports/iac/results_json.json"                 "Checkov (IaC)"
-      check_file "reports/container-scan/grype-image.json"  "Grype Image (Container)"
-      check_file "reports/dast/zap-report.json"             "OWASP ZAP (DAST)"
-
-      echo ""
-      echo "Total: $TOTAL | ✅ OK: $((TOTAL-MISSING-EMPTY)) | ❌ Missing: $MISSING | ⚠️ Empty: $EMPTY"
+      check_file "reports/trivy/trivy-fs.json"             "Trivy FS (SCA)"
+      check_file "reports/license/sbom-spdx.json"          "Syft SBOM (Licenses)"
+      check_file "reports/sast/semgrep.json"               "Semgrep (SAST)"
+      check_file "reports/sast/hadolint.json"              "Hadolint (Dockerfile)"
+      check_file "reports/secrets/gitleaks.json"           "Gitleaks (Secrets)"
+      check_file "reports/iac/results_json.json"           "Checkov (IaC)"
+      check_file "reports/container-scan/grype-image.json" "Grype Image (Container)"
+      check_file "reports/dast/zap-report.json"            "OWASP ZAP (DAST)"
+      echo "Total: $TOTAL | OK: $((TOTAL-MISSING-EMPTY)) | Missing: $MISSING | Empty: $EMPTY"
       echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    # ── Extract metrics ──
     - |
-      # SCA — Trivy FS
-      SCA_CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' reports/trivy/trivy-fs.json 2>/dev/null || echo 0)
-      SCA_CRITICAL=${SCA_CRITICAL:-0}
-      SCA_HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' reports/trivy/trivy-fs.json 2>/dev/null || echo 0)
-      SCA_HIGH=${SCA_HIGH:-0}
-      SCA_MEDIUM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' reports/trivy/trivy-fs.json 2>/dev/null || echo 0)
-      SCA_MEDIUM=${SCA_MEDIUM:-0}
-      SCA_LOW=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' reports/trivy/trivy-fs.json 2>/dev/null || echo 0)
-      SCA_LOW=${SCA_LOW:-0}
+      SCA_CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' reports/trivy/trivy-fs.json 2>/dev/null || echo 0); SCA_CRITICAL=${SCA_CRITICAL:-0}
+      SCA_HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' reports/trivy/trivy-fs.json 2>/dev/null || echo 0); SCA_HIGH=${SCA_HIGH:-0}
+      SCA_MEDIUM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' reports/trivy/trivy-fs.json 2>/dev/null || echo 0); SCA_MEDIUM=${SCA_MEDIUM:-0}
+      SCA_LOW=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' reports/trivy/trivy-fs.json 2>/dev/null || echo 0); SCA_LOW=${SCA_LOW:-0}
+      CONTAINER_CRITICAL=$(jq '[.matches[]?.vulnerability?.severity? | select(.=="Critical")] | length' reports/container-scan/grype-image.json 2>/dev/null || echo 0); CONTAINER_CRITICAL=${CONTAINER_CRITICAL:-0}
+      CONTAINER_HIGH=$(jq '[.matches[]?.vulnerability?.severity? | select(.=="High")] | length' reports/container-scan/grype-image.json 2>/dev/null || echo 0); CONTAINER_HIGH=${CONTAINER_HIGH:-0}
+      SECRETS=$(jq '. | if type=="array" then length else 0 end' reports/secrets/gitleaks.json 2>/dev/null || echo 0); SECRETS=${SECRETS:-0}
+      SEMGREP_HIGH=$(jq '[.results[]? | select(.extra.severity=="ERROR")] | length' reports/sast/semgrep.json 2>/dev/null || echo 0); SEMGREP_HIGH=${SEMGREP_HIGH:-0}
+      SEMGREP_MEDIUM=$(jq '[.results[]? | select(.extra.severity=="WARNING")] | length' reports/sast/semgrep.json 2>/dev/null || echo 0); SEMGREP_MEDIUM=${SEMGREP_MEDIUM:-0}
+      SEMGREP_INFO=$(jq '[.results[]? | select(.extra.severity=="INFO")] | length' reports/sast/semgrep.json 2>/dev/null || echo 0); SEMGREP_INFO=${SEMGREP_INFO:-0}
+      HADOLINT_ERRORS=$(jq 'length' reports/sast/hadolint.json 2>/dev/null || echo 0); HADOLINT_ERRORS=${HADOLINT_ERRORS:-0}
+      CHECKOV_FAILED=$(jq '.results.failed_checks | length' reports/iac/results_json.json 2>/dev/null || echo 0); CHECKOV_FAILED=${CHECKOV_FAILED:-0}
+      DAST_HIGH=$(jq '[.site[]?.alerts[]? | select(.riskcode=="3")] | length' reports/dast/zap-report.json 2>/dev/null || echo 0); DAST_HIGH=${DAST_HIGH:-0}
+      DAST_MEDIUM=$(jq '[.site[]?.alerts[]? | select(.riskcode=="2")] | length' reports/dast/zap-report.json 2>/dev/null || echo 0); DAST_MEDIUM=${DAST_MEDIUM:-0}
+      DAST_LOW=$(jq '[.site[]?.alerts[]? | select(.riskcode=="1")] | length' reports/dast/zap-report.json 2>/dev/null || echo 0); DAST_LOW=${DAST_LOW:-0}
 
-      # Container — Grype
-      CONTAINER_CRITICAL=$(jq '[.matches[]?.vulnerability?.severity? | select(.=="Critical")] | length' reports/container-scan/grype-image.json 2>/dev/null || echo 0)
-      CONTAINER_CRITICAL=${CONTAINER_CRITICAL:-0}
-      CONTAINER_HIGH=$(jq '[.matches[]?.vulnerability?.severity? | select(.=="High")] | length' reports/container-scan/grype-image.json 2>/dev/null || echo 0)
-      CONTAINER_HIGH=${CONTAINER_HIGH:-0}
-
-      # Secrets
-      SECRETS=$(jq '. | if type=="array" then length else 0 end' reports/secrets/gitleaks.json 2>/dev/null || echo 0)
-      SECRETS=${SECRETS:-0}
-
-      # SAST — Semgrep
-      SEMGREP_HIGH=$(jq '[.results[]? | select(.extra.severity=="ERROR")] | length' reports/sast/semgrep.json 2>/dev/null || echo 0)
-      SEMGREP_HIGH=${SEMGREP_HIGH:-0}
-      SEMGREP_MEDIUM=$(jq '[.results[]? | select(.extra.severity=="WARNING")] | length' reports/sast/semgrep.json 2>/dev/null || echo 0)
-      SEMGREP_MEDIUM=${SEMGREP_MEDIUM:-0}
-      SEMGREP_INFO=$(jq '[.results[]? | select(.extra.severity=="INFO")] | length' reports/sast/semgrep.json 2>/dev/null || echo 0)
-      SEMGREP_INFO=${SEMGREP_INFO:-0}
-
-      # Hadolint
-      HADOLINT_ERRORS=$(jq 'length' reports/sast/hadolint.json 2>/dev/null || echo 0)
-      HADOLINT_ERRORS=${HADOLINT_ERRORS:-0}
-
-      # IaC
-      CHECKOV_FAILED=$(jq '.results.failed_checks | length' reports/iac/results_json.json 2>/dev/null || echo 0)
-      CHECKOV_FAILED=${CHECKOV_FAILED:-0}
-
-      # DAST
-      DAST_HIGH=$(jq '[.site[]?.alerts[]? | select(.riskcode=="3")] | length' reports/dast/zap-report.json 2>/dev/null || echo 0)
-      DAST_HIGH=${DAST_HIGH:-0}
-      DAST_MEDIUM=$(jq '[.site[]?.alerts[]? | select(.riskcode=="2")] | length' reports/dast/zap-report.json 2>/dev/null || echo 0)
-      DAST_MEDIUM=${DAST_MEDIUM:-0}
-      DAST_LOW=$(jq '[.site[]?.alerts[]? | select(.riskcode=="1")] | length' reports/dast/zap-report.json 2>/dev/null || echo 0)
-      DAST_LOW=${DAST_LOW:-0}
-    # ── Build final summary.json ──
     - |
       cat > final-report/summary.json << EOF
       {
@@ -780,37 +757,19 @@ aggregate-report:
         "framework": "${FRAMEWORK:-unknown}",
         "has_dockerfile": ${HAS_DOCKERFILE:-false},
         "has_iac": ${HAS_IAC:-false},
-        "sca": {
-          "critical": ${SCA_CRITICAL},
-          "high":     ${SCA_HIGH},
-          "medium":   ${SCA_MEDIUM},
-          "low":      ${SCA_LOW}
-        },
-        "container": {
-          "critical": ${CONTAINER_CRITICAL},
-          "high":     ${CONTAINER_HIGH}
-        },
+        "sca":       { "critical": ${SCA_CRITICAL},       "high": ${SCA_HIGH}, "medium": ${SCA_MEDIUM}, "low": ${SCA_LOW} },
+        "container": { "critical": ${CONTAINER_CRITICAL}, "high": ${CONTAINER_HIGH} },
         "secrets": ${SECRETS},
         "sast": {
-          "semgrep_high":   ${SEMGREP_HIGH},
-          "semgrep_medium": ${SEMGREP_MEDIUM},
-          "semgrep_info":   ${SEMGREP_INFO},
-          "hadolint_errors": ${HADOLINT_ERRORS}
+          "semgrep_high": ${SEMGREP_HIGH}, "semgrep_medium": ${SEMGREP_MEDIUM},
+          "semgrep_info": ${SEMGREP_INFO}, "hadolint_errors": ${HADOLINT_ERRORS}
         },
-        "dast": {
-          "high":   ${DAST_HIGH},
-          "medium": ${DAST_MEDIUM},
-          "low":    ${DAST_LOW}
-        },
-        "iac": {
-          "checkov_failed": ${CHECKOV_FAILED}
-        },
+        "dast": { "high": ${DAST_HIGH}, "medium": ${DAST_MEDIUM}, "low": ${DAST_LOW} },
+        "iac":  { "checkov_failed": ${CHECKOV_FAILED} },
         "status": "completed",
         "reports_url": "$CI_JOB_URL/artifacts"
       }
       EOF
-
-    - echo "📄 Summary generated:"
     - cat final-report/summary.json
   artifacts:
     paths:
@@ -827,9 +786,9 @@ import-defectdojo:
     - apk add --no-cache curl jq python3
   script:
     - |
-      echo "📤 DefectDojo import"
+      echo "DefectDojo import"
       if [ -z "$DEFECTDOJO_URL" ] || [ -z "$DEFECTDOJO_TOKEN" ]; then
-        echo "⚠️  DefectDojo not configured — skipping"
+        echo "DefectDojo not configured — skipping"
         exit 0
       fi
 
@@ -837,261 +796,412 @@ import-defectdojo:
       PRODUCT_NAME="${REPO_NAME}"
       ENGAGEMENT_NAME="${REPO_NAME}_${GIT_BRANCH}"
 
-      echo "Product    : $PRODUCT_NAME"
-      echo "Engagement : $ENGAGEMENT_NAME"
-
-      # ── Product type (création auto si inexistant) ──
       PROD_TYPE_ID=$(curl -s -H "Authorization: ${DEFECTDOJO_TOKEN}" \
         "${DEFECTDOJO_URL}/api/v2/product_types/" | jq -r '.results[0].id // empty')
-
       if [ -z "$PROD_TYPE_ID" ] || [ "$PROD_TYPE_ID" = "null" ]; then
-        echo "🆕 No product type — creating one..."
         PROD_TYPE_ID=$(curl -s -X POST "${DEFECTDOJO_URL}/api/v2/product_types/" \
-          -H "Authorization: ${DEFECTDOJO_TOKEN}" \
-          -H "Content-Type: application/json" \
-          -d '{"name":"Default CI/CD","description":"Created automatically for all projects"}' \
-          | jq -r '.id // empty')
-        if [ -z "$PROD_TYPE_ID" ] || [ "$PROD_TYPE_ID" = "null" ]; then
-          echo "❌ Failed to create product type"
-          exit 1
-        fi
-        echo "✅ Product type created: $PROD_TYPE_ID"
+          -H "Authorization: ${DEFECTDOJO_TOKEN}" -H "Content-Type: application/json" \
+          -d '{"name":"Default CI/CD","description":"Created automatically"}' | jq -r '.id // empty')
       fi
 
-      # ── Get/create product ──
       PRODUCT_ID=$(curl -s -H "Authorization: ${DEFECTDOJO_TOKEN}" \
         "${DEFECTDOJO_URL}/api/v2/products/?name=${PRODUCT_NAME}" | jq -r '.results[0].id // empty')
-
       if [ -z "$PRODUCT_ID" ] || [ "$PRODUCT_ID" = "null" ]; then
-        echo "🆕 Creating product '$PRODUCT_NAME'..."
         PRODUCT_ID=$(curl -s -X POST "${DEFECTDOJO_URL}/api/v2/products/" \
-          -H "Authorization: ${DEFECTDOJO_TOKEN}" \
-          -H "Content-Type: application/json" \
+          -H "Authorization: ${DEFECTDOJO_TOKEN}" -H "Content-Type: application/json" \
           -d "{\"name\":\"$PRODUCT_NAME\",\"description\":\"${GIT_REPO_URL}\",\"prod_type\":$PROD_TYPE_ID}" \
           | jq -r '.id')
-        echo "✅ Product created: $PRODUCT_ID"
-      else
-        echo "✅ Product exists: $PRODUCT_ID"
+        echo "Product created: $PRODUCT_ID"
       fi
-      [ -z "$PRODUCT_ID" ] || [ "$PRODUCT_ID" = "null" ] && echo "❌ Failed to get product ID" && exit 1
+      [ -z "$PRODUCT_ID" ] || [ "$PRODUCT_ID" = "null" ] && echo "Failed to get product ID" && exit 1
 
-      # ── Get/create engagement ──
       TODAY=$(date +%Y-%m-%d)
       END_DATE=$(date -d "+30 days" +%Y-%m-%d 2>/dev/null || date -v+30d +%Y-%m-%d 2>/dev/null || echo "$TODAY")
 
       ENGAGEMENT_ID=$(curl -s -H "Authorization: ${DEFECTDOJO_TOKEN}" \
         "${DEFECTDOJO_URL}/api/v2/engagements/?product=${PRODUCT_ID}&name=${ENGAGEMENT_NAME}" \
         | jq -r '.results[0].id // empty')
-
       if [ -z "$ENGAGEMENT_ID" ] || [ "$ENGAGEMENT_ID" = "null" ]; then
-        echo "🆕 Creating engagement '$ENGAGEMENT_NAME'..."
         ENGAGEMENT_ID=$(curl -s -X POST "${DEFECTDOJO_URL}/api/v2/engagements/" \
-          -H "Authorization: ${DEFECTDOJO_TOKEN}" \
-          -H "Content-Type: application/json" \
+          -H "Authorization: ${DEFECTDOJO_TOKEN}" -H "Content-Type: application/json" \
           -d "{\"name\":\"$ENGAGEMENT_NAME\",\"product\":$PRODUCT_ID,\"target_start\":\"$TODAY\",\"target_end\":\"$END_DATE\",\"status\":\"In Progress\",\"engagement_type\":\"CI/CD\",\"branch_tag\":\"$GIT_BRANCH\"}" \
           | jq -r '.id')
-        echo "✅ Engagement created: $ENGAGEMENT_ID"
-      else
-        echo "✅ Engagement exists: $ENGAGEMENT_ID"
+        echo "Engagement created: $ENGAGEMENT_ID"
       fi
-      [ -z "$ENGAGEMENT_ID" ] || [ "$ENGAGEMENT_ID" = "null" ] && echo "❌ Failed to get engagement" && exit 1
+      [ -z "$ENGAGEMENT_ID" ] || [ "$ENGAGEMENT_ID" = "null" ] && echo "Failed to get engagement" && exit 1
 
-      # ── smart_import avec déduplication ──
       smart_import() {
         local FILE="$1" SCAN_TYPE="$2" LABEL="$3"
-
         if [ ! -f "$FILE" ] || [ ! -s "$FILE" ]; then
-          echo "⏭️  [$LABEL] — missing or empty"
-          return
+          echo "[$LABEL] missing or empty"; return
         fi
-
-        ENCODED_TYPE=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$SCAN_TYPE" 2>/dev/null \
-          || echo "$SCAN_TYPE" | sed 's/ /%20/g')
-
-        # ── 1. Récupérer tous les tests existants pour ce scan_type ──
+        ENCODED_TYPE=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$SCAN_TYPE" 2>/dev/null || echo "$SCAN_TYPE" | sed 's/ /%20/g')
         ALL_TESTS=$(curl -s -H "Authorization: ${DEFECTDOJO_TOKEN}" \
           "${DEFECTDOJO_URL}/api/v2/tests/?engagement=${ENGAGEMENT_ID}&scan_type=${ENCODED_TYPE}&limit=100" \
           | jq -r '.results[].id' | sort -n)
-
         COUNT=$(echo "$ALL_TESTS" | grep -c . 2>/dev/null || echo 0)
-
-        # ── 2. Supprimer tous les tests sauf le plus récent ──
         if [ "$COUNT" -gt 1 ]; then
           LATEST=$(echo "$ALL_TESTS" | tail -1)
           for ID in $ALL_TESTS; do
-            if [ "$ID" != "$LATEST" ]; then
-              echo "   🗑️  Deleting old test ID $ID for [$LABEL]"
-              curl -s -X DELETE -H "Authorization: ${DEFECTDOJO_TOKEN}" \
-                "${DEFECTDOJO_URL}/api/v2/tests/${ID}/" >/dev/null
-            fi
+            [ "$ID" != "$LATEST" ] && curl -s -X DELETE -H "Authorization: ${DEFECTDOJO_TOKEN}" "${DEFECTDOJO_URL}/api/v2/tests/${ID}/" >/dev/null
           done
         fi
-
-        # ── 3. Récupérer l'ID du test restant (s'il existe) ──
         TEST_ID=$(curl -s -H "Authorization: ${DEFECTDOJO_TOKEN}" \
           "${DEFECTDOJO_URL}/api/v2/tests/?engagement=${ENGAGEMENT_ID}&scan_type=${ENCODED_TYPE}" \
           | jq -r '.results[0].id // empty')
-
-        # ── 4. Importer ou réimporter ──
         if [ -z "$TEST_ID" ] || [ "$TEST_ID" = "null" ]; then
-          echo "🆕 IMPORT [$LABEL] — first scan on this engagement..."
           HTTP_CODE=$(curl -s -o /tmp/dojo_resp.json -w "%{http_code}" -X POST \
-            "${DEFECTDOJO_URL}/api/v2/import-scan/" \
-            -H "Authorization: ${DEFECTDOJO_TOKEN}" \
-            -F "product_name=$PRODUCT_NAME" \
-            -F "engagement_name=$ENGAGEMENT_NAME" \
-            -F "scan_type=$SCAN_TYPE" \
-            -F "file=@$FILE" \
-            -F "auto_create_context=true" \
-            -F "close_old_findings=false" \
-            -F "deduplication_on_engagement=true")
+            "${DEFECTDOJO_URL}/api/v2/import-scan/" -H "Authorization: ${DEFECTDOJO_TOKEN}" \
+            -F "product_name=$PRODUCT_NAME" -F "engagement_name=$ENGAGEMENT_NAME" \
+            -F "scan_type=$SCAN_TYPE" -F "file=@$FILE" -F "tags=env-${ENVIRONMENT_ID}" \
+            -F "auto_create_context=true" -F "close_old_findings=false" -F "deduplication_on_engagement=true")
         else
-          echo "🔄 REIMPORT [$LABEL] — test_id=$TEST_ID..."
           HTTP_CODE=$(curl -s -o /tmp/dojo_resp.json -w "%{http_code}" -X POST \
-            "${DEFECTDOJO_URL}/api/v2/reimport-scan/" \
-            -H "Authorization: ${DEFECTDOJO_TOKEN}" \
-            -F "test=$TEST_ID" \
-            -F "scan_type=$SCAN_TYPE" \
-            -F "file=@$FILE" \
-            -F "close_old_findings=true" \
-            -F "deduplication_on_engagement=true")
+            "${DEFECTDOJO_URL}/api/v2/reimport-scan/" -H "Authorization: ${DEFECTDOJO_TOKEN}" \
+            -F "test=$TEST_ID" -F "scan_type=$SCAN_TYPE" -F "file=@$FILE" \
+            -F "tags=env-${ENVIRONMENT_ID}" -F "close_old_findings=true" -F "deduplication_on_engagement=true")
         fi
-
         if [ "$HTTP_CODE" -ge 400 ]; then
-          echo "   ❌ [$LABEL] HTTP $HTTP_CODE — $(cat /tmp/dojo_resp.json)"
+          echo "[$LABEL] HTTP $HTTP_CODE FAILED — $(cat /tmp/dojo_resp.json)"
         else
-          echo "   ✅ [$LABEL] HTTP $HTTP_CODE — $(jq -r '.test // .detail // "success"' /tmp/dojo_resp.json)"
+          echo "[$LABEL] HTTP $HTTP_CODE OK"
         fi
       }
 
-      echo ""
       echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-      echo "📦 SCA"
-      smart_import "reports/trivy/trivy-fs.json"             "Trivy Scan"               "Trivy FS"
-
-      echo "🔎 SAST"
-      smart_import "reports/sast/semgrep.json"               "Semgrep JSON Report"      "Semgrep"
+      smart_import "reports/trivy/trivy-fs.json"             "Trivy Scan"                "Trivy FS"
+      smart_import "reports/sast/semgrep.json"               "Semgrep JSON Report"       "Semgrep"
       smart_import "reports/sast/hadolint.json"              "Hadolint Dockerfile check" "Hadolint"
-
-      echo "🔑 Secrets"
-      smart_import "reports/secrets/gitleaks.json"           "Gitleaks Scan"            "Gitleaks"
-
-      echo "🏗️  IaC"
-      smart_import "reports/iac/results_json.json"                "Checkov Scan"             "Checkov"
-
-      echo "🐳 Container"
-      # Utilisation de "Grype Scan" (reconnu par DefectDojo)
-      smart_import "reports/container-scan/grype-image.json" "Anchore Grype"               "Grype Image"
-
-      echo "🕷️  DAST"
-      smart_import "reports/dast/zap-report.xml" "ZAP Scan" "OWASP ZAP"
-
-      echo ""
+      smart_import "reports/secrets/gitleaks.json"           "Gitleaks Scan"             "Gitleaks"
+      smart_import "reports/iac/results_json.json"           "Checkov Scan"              "Checkov"
+      smart_import "reports/container-scan/grype-image.json" "Anchore Grype"             "Grype Image"
+      smart_import "reports/dast/zap-report.xml"             "ZAP Scan"                  "OWASP ZAP"
       echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-      echo "✅ DefectDojo import complete"
-      echo "🔗 ${DEFECTDOJO_URL}/product/${PRODUCT_ID}/finding/open"
+      echo "DefectDojo import complete"
   allow_failure: true
 
 # ══════════════════════════════════════════════════════════════════
-# STAGE 12 · SECURITY-VALIDATION  —  Quality gate + backend verdict
+# STAGE 12 · SECURITY-VALIDATION — Quality gate complet
+#   Agrège : CI scans + SonarQube self-hosted
 # ══════════════════════════════════════════════════════════════════
 security-validation:
   stage: security-validation
   image: alpine:latest
   needs:
-    - aggregate-report
-    - import-defectdojo
+    - job: aggregate-report
+      artifacts: true
+    - job: import-defectdojo
+    - job: sonarqube-setup
+      artifacts: true
   before_script:
     - apk add --no-cache jq curl
   script:
+    # ── 1. Lecture du summary CI ──────────────────────────────────
     - |
-      echo "🔒 SECURITY QUALITY GATE"
-      echo "═══════════════════════════════════════════════"
+      [ ! -f final-report/summary.json ] && echo "summary.json not found" && exit 1
 
-      [ ! -f final-report/summary.json ] && echo "❌ summary.json not found" && exit 1
-
-      # Read metrics
-      SCA_CRITICAL=$(jq '.sca.critical'          final-report/summary.json)
-      SCA_HIGH=$(jq '.sca.high'                  final-report/summary.json)
-      SCA_MEDIUM=$(jq '.sca.medium'              final-report/summary.json)
+      SCA_CRITICAL=$(jq '.sca.critical'             final-report/summary.json)
+      SCA_HIGH=$(jq '.sca.high'                     final-report/summary.json)
+      SCA_MEDIUM=$(jq '.sca.medium'                 final-report/summary.json)
+      SCA_LOW=$(jq '.sca.low'                       final-report/summary.json)
       CONTAINER_CRITICAL=$(jq '.container.critical' final-report/summary.json)
-      CONTAINER_HIGH=$(jq '.container.high'      final-report/summary.json)
-      SECRETS=$(jq '.secrets'                    final-report/summary.json)
-      SEMGREP_HIGH=$(jq '.sast.semgrep_high'     final-report/summary.json)
-      SEMGREP_MEDIUM=$(jq '.sast.semgrep_medium' final-report/summary.json)
-      CHECKOV_FAILED=$(jq '.iac.checkov_failed'  final-report/summary.json)
-      DAST_HIGH=$(jq '.dast.high'                final-report/summary.json)
-      DAST_MEDIUM=$(jq '.dast.medium'            final-report/summary.json)
+      CONTAINER_HIGH=$(jq '.container.high'         final-report/summary.json)
+      SECRETS=$(jq '.secrets'                       final-report/summary.json)
+      SEMGREP_HIGH=$(jq '.sast.semgrep_high'        final-report/summary.json)
+      SEMGREP_MEDIUM=$(jq '.sast.semgrep_medium'    final-report/summary.json)
+      SEMGREP_INFO=$(jq '.sast.semgrep_info'        final-report/summary.json)
+      HADOLINT=$(jq '.sast.hadolint_errors'         final-report/summary.json)
+      CHECKOV_FAILED=$(jq '.iac.checkov_failed'     final-report/summary.json)
+      DAST_HIGH=$(jq '.dast.high'                   final-report/summary.json)
+      DAST_MEDIUM=$(jq '.dast.medium'               final-report/summary.json)
+      DAST_LOW=$(jq '.dast.low'                     final-report/summary.json)
 
-      # Print table
+    # ── 2. Métriques SonarQube self-hosted ───────────────────────
+    - |
+      SONAR_BUGS=0; SONAR_VULNERABILITIES=0; SONAR_CODE_SMELLS=0
+      SONAR_COVERAGE="N/A"; SONAR_DUPLICATIONS="N/A"
+      SONAR_SECURITY_HOTSPOTS=0
+      SONAR_QUALITY_GATE="N/A"; SONAR_QUALITY_GATE_LABEL="N/A"
+      SONAR_RELIABILITY_RATING="N/A"; SONAR_SECURITY_RATING="N/A"
+      SONAR_MAINTAINABILITY_RATING="N/A"; SONAR_NCLOC="N/A"
+      SONAR_BLOCKERS=0; SONAR_CRITICALS=0; SONAR_MAJORS=0; SONAR_MINORS=0
+      SONAR_AVAILABLE=false
+
+      if [ -n "$SONAR_HOST_URL" ] && [ -n "$SONAR_TOKEN" ] && [ -n "$PROJECT_KEY" ]; then
+        echo "Fetching SonarQube metrics — project=${PROJECT_KEY} branch=${GIT_BRANCH}"
+
+        # Quality Gate — on interroge sur la branche
+        QG_RESP=$(curl -s -u "${SONAR_TOKEN}:" \
+          "${SONAR_HOST_URL}/api/qualitygates/project_status?projectKey=${PROJECT_KEY}&branch=${GIT_BRANCH}" \
+          2>/dev/null || echo '{}')
+        SONAR_QUALITY_GATE=$(echo "$QG_RESP" | jq -r '.projectStatus.status // "N/A"')
+
+        case "$SONAR_QUALITY_GATE" in
+          OK)    SONAR_QUALITY_GATE_LABEL="PASSED" ;;
+          ERROR) SONAR_QUALITY_GATE_LABEL="FAILED" ;;
+          WARN)  SONAR_QUALITY_GATE_LABEL="WARNING" ;;
+          NONE)  SONAR_QUALITY_GATE_LABEL="NOT SET" ;;
+          *)     SONAR_QUALITY_GATE_LABEL="$SONAR_QUALITY_GATE" ;;
+        esac
+
+        # Métriques détaillées — sur la branche
+        METRICS="bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density,security_hotspots,reliability_rating,security_rating,sqale_rating,blocker_violations,critical_violations,major_violations,minor_violations,ncloc"
+
+        METRICS_RESP=$(curl -s -u "${SONAR_TOKEN}:" \
+          "${SONAR_HOST_URL}/api/measures/component?component=${PROJECT_KEY}&branch=${GIT_BRANCH}&metricKeys=${METRICS}" \
+          2>/dev/null || echo '{}')
+
+        get_metric() {
+          echo "$METRICS_RESP" | jq -r \
+            --arg key "$1" \
+            '.component.measures[] | select(.metric==$key) | .value // "N/A"' \
+            2>/dev/null || echo "N/A"
+        }
+
+        SONAR_BUGS=$(get_metric "bugs")
+        SONAR_VULNERABILITIES=$(get_metric "vulnerabilities")
+        SONAR_CODE_SMELLS=$(get_metric "code_smells")
+        SONAR_COVERAGE=$(get_metric "coverage")
+        SONAR_DUPLICATIONS=$(get_metric "duplicated_lines_density")
+        SONAR_SECURITY_HOTSPOTS=$(get_metric "security_hotspots")
+        SONAR_NCLOC=$(get_metric "ncloc")
+        SONAR_BLOCKERS=$(get_metric "blocker_violations")
+        SONAR_CRITICALS=$(get_metric "critical_violations")
+        SONAR_MAJORS=$(get_metric "major_violations")
+        SONAR_MINORS=$(get_metric "minor_violations")
+
+        rating_label() {
+          case "$1" in
+            1|1.0) echo "A" ;; 2|2.0) echo "B" ;; 3|3.0) echo "C" ;;
+            4|4.0) echo "D" ;; 5|5.0) echo "E" ;; *) echo "N/A" ;;
+          esac
+        }
+        SONAR_RELIABILITY_RATING=$(rating_label "$(get_metric 'reliability_rating')")
+        SONAR_SECURITY_RATING=$(rating_label "$(get_metric 'security_rating')")
+        SONAR_MAINTAINABILITY_RATING=$(rating_label "$(get_metric 'sqale_rating')")
+
+        [ "$SONAR_COVERAGE" != "N/A" ]    && SONAR_COVERAGE="${SONAR_COVERAGE}%"
+        [ "$SONAR_DUPLICATIONS" != "N/A" ] && SONAR_DUPLICATIONS="${SONAR_DUPLICATIONS}%"
+
+        SONAR_AVAILABLE=true
+        echo "SonarQube metrics OK — Quality Gate: ${SONAR_QUALITY_GATE_LABEL}"
+      else
+        echo "SonarQube non configure — metriques ignorees"
+      fi
+
+    # ── 3. Rapport complet ────────────────────────────────────────
+    - |
       echo ""
-      echo "┌────────────────────────────────────────────────────────┐"
-      echo "│              SCAN RESULTS SUMMARY                     │"
-      echo "├────────────────────────────────────────────────────────┤"
-      printf "│ %-35s : %-16s │\n" "🔴 SCA Critical"           "$SCA_CRITICAL"
-      printf "│ %-35s : %-16s │\n" "🟠 SCA High"               "$SCA_HIGH"
-      printf "│ %-35s : %-16s │\n" "🟡 SCA Medium"             "$SCA_MEDIUM"
-      printf "│ %-35s : %-16s │\n" "🐳 Container Critical"     "$CONTAINER_CRITICAL"
-      printf "│ %-35s : %-16s │\n" "🐳 Container High"         "$CONTAINER_HIGH"
-      printf "│ %-35s : %-16s │\n" "🔑 Secrets"                "$SECRETS"
-      printf "│ %-35s : %-16s │\n" "📝 Semgrep High"           "$SEMGREP_HIGH"
-      printf "│ %-35s : %-16s │\n" "📝 Semgrep Medium"         "$SEMGREP_MEDIUM"
-      printf "│ %-35s : %-16s │\n" "🏗️  Checkov Failed"        "$CHECKOV_FAILED"
-      printf "│ %-35s : %-16s │\n" "🕷️  DAST High"             "$DAST_HIGH"
-      printf "│ %-35s : %-16s │\n" "🕷️  DAST Medium"           "$DAST_MEDIUM"
-      echo "└────────────────────────────────────────────────────────┘"
+      echo "╔══════════════════════════════════════════════════════════════╗"
+      echo "║         ENVIROTEST — SECURITY VALIDATION REPORT             ║"
+      echo "╠══════════════════════════════════════════════════════════════╣"
+      printf "║  %-20s : %-37s ║\n" "Environment"  "$ENVIRONMENT_ID"
+      printf "║  %-20s : %-37s ║\n" "Branch"       "$GIT_BRANCH"
+      printf "║  %-20s : %-37s ║\n" "Pipeline"     "$CI_PIPELINE_ID"
+      printf "║  %-20s : %-37s ║\n" "Date"         "$(date -u '+%Y-%m-%d %H:%M UTC')"
+      echo "╚══════════════════════════════════════════════════════════════╝"
 
-      # ── Gate evaluation ──
+      echo ""
+      echo "┌──────────────────────────────────────────────────────────────┐"
+      echo "│  SCA — Dependances & packages  (Trivy FS)                   │"
+      echo "├──────────────────────────────────────────────────────────────┤"
+      printf "│   %-30s %10s                │\n" "Critical"  "$SCA_CRITICAL"
+      printf "│   %-30s %10s                │\n" "High"      "$SCA_HIGH"
+      printf "│   %-30s %10s                │\n" "Medium"    "$SCA_MEDIUM"
+      printf "│   %-30s %10s                │\n" "Low"       "$SCA_LOW"
+      echo "└──────────────────────────────────────────────────────────────┘"
+
+      echo "┌──────────────────────────────────────────────────────────────┐"
+      echo "│  Container — Image Docker  (Anchore Grype)                  │"
+      echo "├──────────────────────────────────────────────────────────────┤"
+      printf "│   %-30s %10s                │\n" "Critical"  "$CONTAINER_CRITICAL"
+      printf "│   %-30s %10s                │\n" "High"      "$CONTAINER_HIGH"
+      echo "└──────────────────────────────────────────────────────────────┘"
+
+      echo "┌──────────────────────────────────────────────────────────────┐"
+      echo "│  Secrets — Credentials exposes  (Gitleaks)                  │"
+      echo "├──────────────────────────────────────────────────────────────┤"
+      printf "│   %-30s %10s                │\n" "Secrets detectes" "$SECRETS"
+      echo "└──────────────────────────────────────────────────────────────┘"
+
+      echo "┌──────────────────────────────────────────────────────────────┐"
+      echo "│  SAST — Code source  (Semgrep + Hadolint)                   │"
+      echo "├──────────────────────────────────────────────────────────────┤"
+      printf "│   %-30s %10s                │\n" "Semgrep High (ERROR)"    "$SEMGREP_HIGH"
+      printf "│   %-30s %10s                │\n" "Semgrep Medium (WARNING)" "$SEMGREP_MEDIUM"
+      printf "│   %-30s %10s                │\n" "Semgrep Info"            "$SEMGREP_INFO"
+      printf "│   %-30s %10s                │\n" "Hadolint errors"         "$HADOLINT"
+      echo "└──────────────────────────────────────────────────────────────┘"
+
+      echo "┌──────────────────────────────────────────────────────────────┐"
+      echo "│  IaC — Infrastructure as Code  (Checkov)                    │"
+      echo "├──────────────────────────────────────────────────────────────┤"
+      printf "│   %-30s %10s                │\n" "Checks echoues" "$CHECKOV_FAILED"
+      echo "└──────────────────────────────────────────────────────────────┘"
+
+      echo "┌──────────────────────────────────────────────────────────────┐"
+      echo "│  DAST — Application live  (OWASP ZAP)                       │"
+      echo "├──────────────────────────────────────────────────────────────┤"
+      printf "│   %-30s %10s                │\n" "High"    "$DAST_HIGH"
+      printf "│   %-30s %10s                │\n" "Medium"  "$DAST_MEDIUM"
+      printf "│   %-30s %10s                │\n" "Low"     "$DAST_LOW"
+      echo "└──────────────────────────────────────────────────────────────┘"
+
+      echo "┌──────────────────────────────────────────────────────────────┐"
+      echo "│  SonarQube — Qualite & securite du code                     │"
+      echo "├──────────────────────────────────────────────────────────────┤"
+      if [ "$SONAR_AVAILABLE" = "true" ]; then
+        printf "│   %-30s %10s                │\n" "Quality Gate"           "${SONAR_QUALITY_GATE_LABEL}"
+        echo "│   ─────────────────────────────────────────────────────── │"
+        printf "│   %-30s %10s                │\n" "Bugs"                   "$SONAR_BUGS"
+        printf "│   %-30s %10s                │\n" "Vulnerabilities"        "$SONAR_VULNERABILITIES"
+        printf "│   %-30s %10s                │\n" "Security Hotspots"      "$SONAR_SECURITY_HOTSPOTS"
+        printf "│   %-30s %10s                │\n" "Code Smells"            "$SONAR_CODE_SMELLS"
+        echo "│   ─────────────────────────────────────────────────────── │"
+        printf "│   %-30s %10s                │\n" "Blocker violations"     "$SONAR_BLOCKERS"
+        printf "│   %-30s %10s                │\n" "Critical violations"    "$SONAR_CRITICALS"
+        printf "│   %-30s %10s                │\n" "Major violations"       "$SONAR_MAJORS"
+        printf "│   %-30s %10s                │\n" "Minor violations"       "$SONAR_MINORS"
+        echo "│   ─────────────────────────────────────────────────────── │"
+        printf "│   %-30s %10s                │\n" "Coverage"               "$SONAR_COVERAGE"
+        printf "│   %-30s %10s                │\n" "Duplications"           "$SONAR_DUPLICATIONS"
+        printf "│   %-30s %10s                │\n" "Lines of code"          "$SONAR_NCLOC"
+        echo "│   ─────────────────────────────────────────────────────── │"
+        printf "│   %-30s %10s                │\n" "Reliability rating"     "$SONAR_RELIABILITY_RATING"
+        printf "│   %-30s %10s                │\n" "Security rating"        "$SONAR_SECURITY_RATING"
+        printf "│   %-30s %10s                │\n" "Maintainability rating" "$SONAR_MAINTAINABILITY_RATING"
+        printf "│   %-30s                           │\n" "Dashboard: ${SONAR_HOST_URL}/dashboard?id=${PROJECT_KEY}&branch=${GIT_BRANCH}"
+      else
+        printf "│   %-55s │\n" "Non disponible (SONAR_HOST_URL ou SONAR_TOKEN manquant)"
+      fi
+      echo "└──────────────────────────────────────────────────────────────┘"
+
+    # ── 4. Evaluation du quality gate ────────────────────────────
+    - |
       GATE_PASSED=true
       WARNINGS=""
+      BLOCKING_REASONS=""
 
-      fail()    { echo "   ❌ BLOCKING: $1"; GATE_PASSED=false; }
-      pass()    { echo "   ✅ OK: $1"; }
-      warn()    { WARNINGS="${WARNINGS}  - $1\n"; }
-
-      echo ""
-      echo "📋 GATE CHECKS"
-      echo "───────────────────────────────────────────────"
-
-      # Absolute blockers
-      [ "$SECRETS" -gt 0 ]                                           && fail "Secrets detected ($SECRETS)"            || pass "No secrets"
-      [ "$SCA_CRITICAL" -gt "${SCA_CRITICAL_THRESHOLD}" ]           && fail "SCA Critical $SCA_CRITICAL > ${SCA_CRITICAL_THRESHOLD}" || pass "SCA Critical OK"
-      [ "$SCA_HIGH" -gt "${SCA_HIGH_THRESHOLD}" ]                   && fail "SCA High $SCA_HIGH > ${SCA_HIGH_THRESHOLD}" || pass "SCA High OK"
-      [ "$CONTAINER_CRITICAL" -gt "${CONTAINER_CRITICAL_THRESHOLD}" ] && fail "Container Critical $CONTAINER_CRITICAL > ${CONTAINER_CRITICAL_THRESHOLD}" || pass "Container Critical OK"
-      [ "$CONTAINER_HIGH" -gt "${CONTAINER_HIGH_THRESHOLD}" ]       && fail "Container High $CONTAINER_HIGH > ${CONTAINER_HIGH_THRESHOLD}" || pass "Container High OK"
-      [ "$SEMGREP_HIGH" -gt "${SEMGREP_HIGH_THRESHOLD}" ]           && fail "Semgrep High $SEMGREP_HIGH > ${SEMGREP_HIGH_THRESHOLD}" || pass "Semgrep High OK"
-      [ "$CHECKOV_FAILED" -gt "${IAC_FAILED_THRESHOLD}" ]           && fail "Checkov $CHECKOV_FAILED > ${IAC_FAILED_THRESHOLD}" || pass "IaC OK"
-      [ "$DAST_HIGH" -gt 5 ]                                         && fail "DAST High $DAST_HIGH > 5"               || pass "DAST High OK"
-
-      # Warnings
-      [ "$SEMGREP_MEDIUM" -gt "${SEMGREP_MEDIUM_THRESHOLD}" ]       && warn "Semgrep Medium: $SEMGREP_MEDIUM"
-      [ "$SCA_MEDIUM" -gt 50 ]                                       && warn "SCA Medium: $SCA_MEDIUM"
-      [ "$DAST_MEDIUM" -gt 10 ]                                      && warn "DAST Medium: $DAST_MEDIUM"
+      fail() {
+        echo "BLOCKING : $1"
+        GATE_PASSED=false
+        BLOCKING_REASONS="${BLOCKING_REASONS}  - $1\n"
+      }
+      pass() { echo "OK       : $1"; }
+      warn() {
+        echo "WARNING  : $1"
+        WARNINGS="${WARNINGS}  - $1\n"
+      }
 
       echo ""
-      echo "═══════════════════════════════════════════════"
-      echo "🏁 FINAL VERDICT"
-      echo "═══════════════════════════════════════════════"
+      echo "┌──────────────────────────────────────────────────────────────┐"
+      echo "│  GATE CHECKS                                                 │"
+      echo "├──────────────────────────────────────────────────────────────┤"
+
+      [ "$SECRETS" -gt 0 ] \
+        && fail "Secrets exposes detectes ($SECRETS)" \
+        || pass "Aucun secret expose"
+
+      [ "$SCA_CRITICAL" -gt "${SCA_CRITICAL_THRESHOLD}" ] \
+        && fail "SCA Critical: $SCA_CRITICAL > seuil ${SCA_CRITICAL_THRESHOLD}" \
+        || pass "SCA Critical ($SCA_CRITICAL <= ${SCA_CRITICAL_THRESHOLD})"
+
+      [ "$SCA_HIGH" -gt "${SCA_HIGH_THRESHOLD}" ] \
+        && fail "SCA High: $SCA_HIGH > seuil ${SCA_HIGH_THRESHOLD}" \
+        || pass "SCA High ($SCA_HIGH <= ${SCA_HIGH_THRESHOLD})"
+
+      [ "$SCA_MEDIUM" -gt 50 ] \
+        && warn "SCA Medium eleve: $SCA_MEDIUM (> 50)"
+
+      [ "$CONTAINER_CRITICAL" -gt "${CONTAINER_CRITICAL_THRESHOLD}" ] \
+        && fail "Container Critical: $CONTAINER_CRITICAL > seuil ${CONTAINER_CRITICAL_THRESHOLD}" \
+        || pass "Container Critical ($CONTAINER_CRITICAL <= ${CONTAINER_CRITICAL_THRESHOLD})"
+
+      [ "$CONTAINER_HIGH" -gt "${CONTAINER_HIGH_THRESHOLD}" ] \
+        && fail "Container High: $CONTAINER_HIGH > seuil ${CONTAINER_HIGH_THRESHOLD}" \
+        || pass "Container High ($CONTAINER_HIGH <= ${CONTAINER_HIGH_THRESHOLD})"
+
+      [ "$SEMGREP_HIGH" -gt "${SEMGREP_HIGH_THRESHOLD}" ] \
+        && fail "Semgrep High: $SEMGREP_HIGH > seuil ${SEMGREP_HIGH_THRESHOLD}" \
+        || pass "Semgrep High ($SEMGREP_HIGH <= ${SEMGREP_HIGH_THRESHOLD})"
+
+      [ "$SEMGREP_MEDIUM" -gt "${SEMGREP_MEDIUM_THRESHOLD}" ] \
+        && warn "Semgrep Medium: $SEMGREP_MEDIUM (> ${SEMGREP_MEDIUM_THRESHOLD})"
+
+      [ "$CHECKOV_FAILED" -gt "${IAC_FAILED_THRESHOLD}" ] \
+        && fail "Checkov: $CHECKOV_FAILED checks echoues > seuil ${IAC_FAILED_THRESHOLD}" \
+        || pass "IaC Checkov ($CHECKOV_FAILED <= ${IAC_FAILED_THRESHOLD})"
+
+      [ "$DAST_HIGH" -gt 5 ] \
+        && fail "DAST High: $DAST_HIGH > 5" \
+        || pass "DAST High ($DAST_HIGH <= 5)"
+
+      [ "$DAST_MEDIUM" -gt 10 ] \
+        && warn "DAST Medium: $DAST_MEDIUM (> 10)"
+
+      if [ "$SONAR_AVAILABLE" = "true" ]; then
+        if [ "$SONAR_QUALITY_GATE" = "ERROR" ]; then
+          fail "SonarQube Quality Gate FAILED (bugs=$SONAR_BUGS, vulns=$SONAR_VULNERABILITIES, security=$SONAR_SECURITY_RATING)"
+        elif [ "$SONAR_QUALITY_GATE" = "WARN" ]; then
+          warn "SonarQube Quality Gate WARNING"
+        elif [ "$SONAR_QUALITY_GATE" = "OK" ]; then
+          pass "SonarQube Quality Gate PASSED (reliability=$SONAR_RELIABILITY_RATING, security=$SONAR_SECURITY_RATING)"
+        else
+          warn "SonarQube Quality Gate indisponible ($SONAR_QUALITY_GATE)"
+        fi
+
+        if [ "$SONAR_SECURITY_HOTSPOTS" != "N/A" ] && [ "$SONAR_SECURITY_HOTSPOTS" -gt 0 ] 2>/dev/null; then
+          warn "SonarQube: $SONAR_SECURITY_HOTSPOTS security hotspot(s) a reviser"
+        fi
+
+        COVERAGE_NUM=$(echo "$SONAR_COVERAGE" | tr -d '%')
+        if [ "$COVERAGE_NUM" != "N/A" ] && [ -n "$COVERAGE_NUM" ]; then
+          COV_INT=$(echo "$COVERAGE_NUM" | cut -d'.' -f1)
+          [ "$COV_INT" -lt 50 ] 2>/dev/null && warn "SonarQube: couverture de tests faible (${SONAR_COVERAGE})"
+        fi
+      else
+        warn "SonarQube non evalue (non configure)"
+      fi
+
+      echo "└──────────────────────────────────────────────────────────────┘"
+
+    # ── 5. Verdict final ─────────────────────────────────────────
+    - |
+      echo ""
+      echo "╔══════════════════════════════════════════════════════════════╗"
+      echo "║                    VERDICT FINAL                            ║"
+      echo "╠══════════════════════════════════════════════════════════════╣"
 
       if [ "$GATE_PASSED" = "true" ]; then
         if [ -n "$WARNINGS" ]; then
-          echo "⚠️  Warnings:"
-          printf "%b" "$WARNINGS"
-          echo "✅ Gate PASSED (with warnings) — DEPLOY_WITH_WARNINGS"
           RECOMMENDATION="DEPLOY_WITH_WARNINGS"
+          echo "║  DEPLOIEMENT AVEC RESERVES                                  ║"
+          echo "╠══════════════════════════════════════════════════════════════╣"
+          printf "%b" "$WARNINGS" | while IFS= read -r line; do
+            printf "║  %-60s ║\n" "$line"
+          done
         else
-          echo "✅ Gate PASSED — RECOMMANDE"
           RECOMMENDATION="RECOMMANDE"
+          echo "║  DEPLOIEMENT RECOMMANDE — Tous les checks sont passes        ║"
         fi
       else
-        echo "❌ Gate FAILED — NON_RECOMMANDE"
         RECOMMENDATION="NON_RECOMMANDE"
+        echo "║  DEPLOIEMENT BLOQUE — Checks critiques en echec              ║"
+        echo "╠══════════════════════════════════════════════════════════════╣"
+        printf "%b" "$BLOCKING_REASONS" | while IFS= read -r line; do
+          printf "║  %-60s ║\n" "$line"
+        done
       fi
 
-      echo "$RECOMMENDATION" > final-report/recommendation.txt
-      echo "📄 Recommendation: $RECOMMENDATION"
+      echo "╠══════════════════════════════════════════════════════════════╣"
+      printf "║  %-20s : %-37s ║\n" "Recommandation" "$RECOMMENDATION"
+      printf "║  %-20s : %-37s ║\n" "Environment"    "$ENVIRONMENT_ID"
+      printf "║  %-20s : %-37s ║\n" "Branch"         "$GIT_BRANCH"
+      echo "╚══════════════════════════════════════════════════════════════╝"
 
-    # ── Notify backend ──
+      echo "$RECOMMENDATION" > final-report/recommendation.txt
+
+    # ── 6. Notification backend ───────────────────────────────────
     - |
       if [ -n "$BACKEND_URL" ]; then
         RECOMMENDATION=$(cat final-report/recommendation.txt)
@@ -1099,14 +1209,21 @@ security-validation:
           -H "Content-Type: application/json" \
           -H "Authorization: Bearer ${API_TOKEN}" \
           -d "{
-            \"environment_id\": \"$ENVIRONMENT_ID\",
-            \"recommendation\": \"$RECOMMENDATION\",
-            \"critical\":           $(jq '.sca.critical'          final-report/summary.json),
-            \"high\":               $(jq '.sca.high'              final-report/summary.json),
-            \"secrets\":            $(jq '.secrets'               final-report/summary.json),
-            \"container_critical\": $(jq '.container.critical'    final-report/summary.json),
-            \"dast_high\":          $(jq '.dast.high'             final-report/summary.json)
-          }" || echo "⚠️  Backend notification failed"
+            \"environment_id\":        \"$ENVIRONMENT_ID\",
+            \"recommendation\":        \"$RECOMMENDATION\",
+            \"git_branch\":            \"$GIT_BRANCH\",
+            \"critical\":              $SCA_CRITICAL,
+            \"high\":                  $SCA_HIGH,
+            \"secrets\":               $SECRETS,
+            \"container_critical\":    $CONTAINER_CRITICAL,
+            \"dast_high\":             $DAST_HIGH,
+            \"sonar_quality_gate\":    \"$SONAR_QUALITY_GATE\",
+            \"sonar_bugs\":            \"$SONAR_BUGS\",
+            \"sonar_vulnerabilities\": \"$SONAR_VULNERABILITIES\",
+            \"sonar_hotspots\":        \"$SONAR_SECURITY_HOTSPOTS\",
+            \"sonar_coverage\":        \"$SONAR_COVERAGE\",
+            \"sonar_security_rating\": \"$SONAR_SECURITY_RATING\"
+          }" || echo "Backend notification failed (non-blocking)"
       fi
   artifacts:
     paths:
@@ -1115,7 +1232,7 @@ security-validation:
     expire_in: 7 days
 
 # ══════════════════════════════════════════════════════════════════
-# STAGE 13 · SCHEDULE-DELETE  —  TTL cleanup of ephemeral image
+# STAGE 13 · SCHEDULE-DELETE — Suppression TTL image Docker
 # ══════════════════════════════════════════════════════════════════
 delete-docker-image:
   stage: schedule-delete
@@ -1138,15 +1255,12 @@ delete-docker-image:
         TOKEN=\$(curl -s -X POST -H 'Content-Type: application/json' \
           -d \"{\\\"username\\\":\\\"${DOCKER_USERNAME}\\\",\\\"password\\\":\\\"${DOCKER_ACCESS_TOKEN}\\\"}\" \
           https://hub.docker.com/v2/users/login/ | jq -r .token)
-
-        curl -s -X DELETE \
-          -H \"Authorization: JWT \${TOKEN}\" \
+        curl -s -X DELETE -H \"Authorization: JWT \${TOKEN}\" \
           \"https://hub.docker.com/v2/repositories/${DOCKER_USERNAME}/envirotest-app/tags/${ENVIRONMENT_ID}/\"
-
         rm -- \"\$0\"
         EOFSCRIPT
         chmod +x ~/delete-image-${ENVIRONMENT_ID}.sh
         echo \"~/delete-image-${ENVIRONMENT_ID}.sh\" | at now + ${TTL_HOURS} hours
       "
-      echo "🗑️  Image deletion scheduled in ${TTL_HOURS}h"
+      echo "Image deletion scheduled in ${TTL_HOURS}h"
   allow_failure: true

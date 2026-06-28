@@ -34,6 +34,22 @@ public interface EphemeralEnvironmentRepository extends JpaRepository<EphemeralE
                                                                    LocalDateTime before);
     List<EphemeralEnvironment> findByApplication_Id(UUID applicationId);
 
+    List<EphemeralEnvironment> findByApplication_IdAndGitBranchOrderByCreatedAtDesc(
+            UUID applicationId, String gitBranch);
+
+    Optional<EphemeralEnvironment> findByIdAndApplication_Id(UUID id, UUID applicationId);
+
+    @Query("""
+            select distinct e from EphemeralEnvironment e
+            left join fetch e.pipelineExecution
+            where e.application.id = :applicationId
+              and (:branch is null or e.gitBranch = :branch)
+            order by e.createdAt desc
+            """)
+    List<EphemeralEnvironment> findByApplicationWithPipeline(
+            @Param("applicationId") UUID applicationId,
+            @Param("branch") String branch);
+
     @Query("""
             select distinct e from EphemeralEnvironment e
             join fetch e.application a
