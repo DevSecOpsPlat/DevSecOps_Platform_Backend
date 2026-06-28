@@ -29,6 +29,7 @@ variables:
   ENVIRONMENT_URL:    ""
   BACKEND_URL:        ""
   API_TOKEN:          ""
+  PIPELINE_SECRET:    ""
   K8S_API_URL:        ""
   K8S_TOKEN:          ""
   K8S_NAMESPACE:      "envirotest-${ENVIRONMENT_ID}"
@@ -139,12 +140,12 @@ sonarqube-setup:
   script:
     - |
       if [ -z "$SONAR_HOST_URL" ] || [ -z "$SONAR_TOKEN" ]; then
-        echo "SONAR_HOST_URL ou SONAR_TOKEN non configuré — skip"
+        echo "SONAR_HOST_URL or SONAR_TOKEN not set — skip"
         echo "PROJECT_KEY=" >> project.env
         exit 0
       fi
 
-      # PROJECT_KEY = slug du repo uniquement (pas de branche)
+      # Build project key
       REPO_NAME=$(echo "${GIT_REPO_URL}" | sed -E 's|.*/||; s|\.git$||')
       PROJECT_KEY=$(echo "${GIT_REPO_URL}" \
         | sed -E 's|https?://||; s|\.git$||; s|/|_|g; s|[^a-zA-Z0-9_]|_|g')
@@ -154,27 +155,54 @@ sonarqube-setup:
       echo "Branch      = ${GIT_BRANCH}"
       echo "SonarQube   = ${SONAR_HOST_URL}"
 
-      # Créer le projet s'il n'existe pas encore
-      EXISTS=$(curl -s -u "${SONAR_TOKEN}:" \
-        "${SONAR_HOST_URL}/api/projects/search?projects=${PROJECT_KEY}" \
-        | jq -r '.components | length')
+      # Check if project exists — with error handling
+      RESPONSE=$(curl -s -w "\n%{http_code}" -u "${SONAR_TOKEN}:" \
+        "${SONAR_HOST_URL}/api/projects/search?projects=${PROJECT_KEY}" 2>&1) || true
+      HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+      BODY=$(echo "$RESPONSE" | head -n-1)
 
-      if [ "$EXISTS" -eq 0 ]; then
-        echo "Creation du projet SonarQube ${PROJECT_KEY}..."
-        HTTP=$(curl -s -o /tmp/sonar_create.json -w "%{http_code}" \
-          -X POST -u "${SONAR_TOKEN}:" \
-          "${SONAR_HOST_URL}/api/projects/create" \
-          -d "project=${PROJECT_KEY}&name=${REPO_NAME}&visibility=private")
-        echo "HTTP $HTTP — $(cat /tmp/sonar_create.json)"
-      else
-        echo "Projet deja existant: ${PROJECT_KEY}"
+      # Debug: print response (mask token)
+      echo "HTTP status: $HTTP_CODE"
+      echo "Response body (first 200 chars): ${BODY:0:200}"
+
+      if [ "$HTTP_CODE" != "200" ]; then
+        echo "ERROR: SonarQube API returned HTTP $HTTP_CODE"
+        echo "PROJECT_KEY=" >> project.env
+        exit 0
       fi
 
-      # Quality gate par defaut
+      # Validate JSON
+      if ! echo "$BODY" | jq -e . >/dev/null 2>&1; then
+        echo "ERROR: Response is not valid JSON"
+        echo "PROJECT_KEY=" >> project.env
+        exit 0
+      fi
+
+      EXISTS=$(echo "$BODY" | jq -r '.components | length // 0')
+      echo "Existing projects: $EXISTS"
+
+      if [ "$EXISTS" -eq 0 ]; then
+        echo "Creating SonarQube project ${PROJECT_KEY}..."
+        CREATE_RESP=$(curl -s -w "\n%{http_code}" -X POST -u "${SONAR_TOKEN}:" \
+          "${SONAR_HOST_URL}/api/projects/create" \
+          -d "project=${PROJECT_KEY}&name=${REPO_NAME}&visibility=private")
+        CREATE_HTTP=$(echo "$CREATE_RESP" | tail -n1)
+        CREATE_BODY=$(echo "$CREATE_RESP" | head -n-1)
+        if [ "$CREATE_HTTP" != "200" ]; then
+          echo "Project creation failed: HTTP $CREATE_HTTP"
+          echo "Response: $CREATE_BODY"
+        else
+          echo "Project created successfully"
+        fi
+      else
+        echo "Project already exists: ${PROJECT_KEY}"
+      fi
+
+      # Set quality gate (ignore errors)
       curl -s -X POST -u "${SONAR_TOKEN}:" \
         "${SONAR_HOST_URL}/api/qualitygates/select" \
         -d "projectKey=${PROJECT_KEY}&gateName=Sonar way" \
-        | jq -r 'if .errors then .errors else "Quality gate attache" end'
+        | jq -r 'if .errors then .errors else "Quality gate attached" end' 2>/dev/null || echo "Quality gate set failed"
 
       echo "PROJECT_KEY=${PROJECT_KEY}" >> project.env
       echo "SONAR_DASHBOARD_URL=${SONAR_HOST_URL}/dashboard?id=${PROJECT_KEY}&branch=${GIT_BRANCH}" >> project.env
@@ -359,6 +387,32 @@ checkov-iac:
         --output json \
         --output-file-path reports/iac/ \
         --soft-fail || true
+
+      # Checkov génère parfois results_json.json, parfois checkov_results.json
+      # Normaliser en un seul fichier attendu par aggregate-report
+      if [ ! -f reports/iac/results_json.json ]; then
+        if [ -f reports/iac/checkov_results.json ]; then
+          cp reports/iac/checkov_results.json reports/iac/results_json.json
+          echo "Renamed checkov_results.json -> results_json.json"
+        elif ls reports/iac/*.json 2>/dev/null | head -1 | grep -q .; then
+          FIRST=$(ls reports/iac/*.json | head -1)
+          cp "$FIRST" reports/iac/results_json.json
+          echo "Copied $FIRST -> results_json.json"
+        else
+          echo "Aucun fichier JSON Checkov trouvé — fichier vide créé"
+          echo '{"results":{"passed_checks":[],"failed_checks":[]}}' > reports/iac/results_json.json
+        fi
+      fi
+
+      # Debug : afficher le nb de checks échoués
+      IS_ARRAY=$(jq 'if type=="array" then "yes" else "no" end' reports/iac/results_json.json 2>/dev/null || echo "no")
+      if [ "$IS_ARRAY" = "yes" ]; then
+        FAILED=$(jq '[.[].results.failed_checks // [] | length] | add // 0' reports/iac/results_json.json 2>/dev/null || echo 0)
+      else
+        FAILED=$(jq '.results.failed_checks | length' reports/iac/results_json.json 2>/dev/null || echo 0)
+      fi
+      echo "Checkov failed checks: $FAILED (format: $IS_ARRAY)"
+      ls -lh reports/iac/
   artifacts:
     paths:
       - reports/iac/
@@ -392,7 +446,7 @@ build-docker-image:
     - docker save -o ../image.tar ${IMAGE_NAME}
     - cd ..
     - echo "IMAGE_NAME=${IMAGE_NAME}" > image_name.env
-    - echo "Image built ${IMAGE_NAME}"
+    - echo "Image built $IMAGE_NAME"
   artifacts:
     paths:
       - image.tar
@@ -412,15 +466,16 @@ build-docker-image-kaniko:
     - if: '$USE_KANIKO == "true"'
   script:
     - echo "Kaniko build"
-    - IMAGE_NAME="${DOCKER_USERNAME}/envirotest-app:${ENVIRONMENT_ID}"
-    - echo "${DOCKER_ACCESS_TOKEN}" | /kaniko/executor \
+    - |
+      IMAGE_NAME="${DOCKER_USERNAME}/envirotest-app:${ENVIRONMENT_ID}"
+      echo "${DOCKER_ACCESS_TOKEN}" | /kaniko/executor \
         --context=dir://user-repo \
         --dockerfile=user-repo/${DOCKERFILE_PATH} \
         --destination="${IMAGE_NAME}" \
         --no-push \
         --tarPath=/workspace/image.tar
-    - echo "IMAGE_NAME=${IMAGE_NAME}" > image_name.env
-    - cp /workspace/image.tar image.tar
+      echo "IMAGE_NAME=${IMAGE_NAME}" > image_name.env
+      cp /workspace/image.tar image.tar
   artifacts:
     paths:
       - image.tar
@@ -729,7 +784,14 @@ aggregate-report:
       SEMGREP_MEDIUM=$(jq '[.results[]? | select(.extra.severity=="WARNING")] | length' reports/sast/semgrep.json 2>/dev/null || echo 0); SEMGREP_MEDIUM=${SEMGREP_MEDIUM:-0}
       SEMGREP_INFO=$(jq '[.results[]? | select(.extra.severity=="INFO")] | length' reports/sast/semgrep.json 2>/dev/null || echo 0); SEMGREP_INFO=${SEMGREP_INFO:-0}
       HADOLINT_ERRORS=$(jq 'length' reports/sast/hadolint.json 2>/dev/null || echo 0); HADOLINT_ERRORS=${HADOLINT_ERRORS:-0}
-      CHECKOV_FAILED=$(jq '.results.failed_checks | length' reports/iac/results_json.json 2>/dev/null || echo 0); CHECKOV_FAILED=${CHECKOV_FAILED:-0}
+      # Checkov peut générer un objet {results:{failed_checks:[]}} ou un tableau [{results:{failed_checks:[]}}]
+      IS_ARRAY=$(jq 'if type=="array" then "yes" else "no" end' reports/iac/results_json.json 2>/dev/null || echo "no")
+      if [ "$IS_ARRAY" = "yes" ]; then
+        CHECKOV_FAILED=$(jq '[.[].results.failed_checks // [] | length] | add // 0' reports/iac/results_json.json 2>/dev/null || echo 0)
+      else
+        CHECKOV_FAILED=$(jq '.results.failed_checks | length' reports/iac/results_json.json 2>/dev/null || echo 0)
+      fi
+      CHECKOV_FAILED=${CHECKOV_FAILED:-0}
       DAST_HIGH=$(jq '[.site[]?.alerts[]? | select(.riskcode=="3")] | length' reports/dast/zap-report.json 2>/dev/null || echo 0); DAST_HIGH=${DAST_HIGH:-0}
       DAST_MEDIUM=$(jq '[.site[]?.alerts[]? | select(.riskcode=="2")] | length' reports/dast/zap-report.json 2>/dev/null || echo 0); DAST_MEDIUM=${DAST_MEDIUM:-0}
       DAST_LOW=$(jq '[.site[]?.alerts[]? | select(.riskcode=="1")] | length' reports/dast/zap-report.json 2>/dev/null || echo 0); DAST_LOW=${DAST_LOW:-0}
@@ -945,11 +1007,24 @@ security-validation:
         esac
 
         # Métriques détaillées — sur la branche
-        METRICS="bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density,security_hotspots,reliability_rating,security_rating,sqale_rating,blocker_violations,critical_violations,major_violations,minor_violations,ncloc"
+        # Appel 1 : métriques classiques (compatibles toutes versions SonarQube)
+        METRICS_CLASSIC="bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density,security_hotspots,reliability_rating,security_rating,sqale_rating,blocker_violations,critical_violations,major_violations,minor_violations,ncloc"
 
         METRICS_RESP=$(curl -s -u "${SONAR_TOKEN}:" \
-          "${SONAR_HOST_URL}/api/measures/component?component=${PROJECT_KEY}&branch=${GIT_BRANCH}&metricKeys=${METRICS}" \
+          "${SONAR_HOST_URL}/api/measures/component?component=${PROJECT_KEY}&branch=${GIT_BRANCH}&metricKeys=${METRICS_CLASSIC}" \
           2>/dev/null || echo '{}')
+
+        MEASURE_COUNT=$(echo "$METRICS_RESP" | jq '.component.measures | length' 2>/dev/null || echo 0)
+        echo "Measures reçues (avec branch): $MEASURE_COUNT"
+
+        if [ "$MEASURE_COUNT" = "0" ] || [ "$MEASURE_COUNT" = "null" ] || echo "$METRICS_RESP" | jq -e '.errors' >/dev/null 2>&1; then
+          echo "Retry sans branch..."
+          METRICS_RESP=$(curl -s -u "${SONAR_TOKEN}:" \
+            "${SONAR_HOST_URL}/api/measures/component?component=${PROJECT_KEY}&metricKeys=${METRICS_CLASSIC}" \
+            2>/dev/null || echo '{}')
+          MEASURE_COUNT=$(echo "$METRICS_RESP" | jq '.component.measures | length' 2>/dev/null || echo 0)
+          echo "Measures reçues (sans branch): $MEASURE_COUNT"
+        fi
 
         get_metric() {
           echo "$METRICS_RESP" | jq -r \
@@ -958,6 +1033,48 @@ security-validation:
             2>/dev/null || echo "N/A"
         }
 
+        # Appel 2 : Software Quality (SonarQube 10.4+) — optionnel, échec silencieux
+        SONAR_SQ_SECURITY_ISSUES="N/A"; SONAR_SQ_RELIABILITY_ISSUES="N/A"; SONAR_SQ_MAINTAINABILITY_ISSUES="N/A"
+        SONAR_SQ_SECURITY_RATING="N/A"; SONAR_SQ_RELIABILITY_RATING="N/A"; SONAR_SQ_MAINTAINABILITY_RATING="N/A"
+        SONAR_SQ_HIGH="N/A"; SONAR_SQ_MEDIUM="N/A"; SONAR_SQ_LOW="N/A"
+
+        METRICS_SQ="software_quality_security_issues,software_quality_reliability_issues,software_quality_maintainability_issues,software_quality_security_rating,software_quality_reliability_rating,software_quality_maintainability_rating"
+
+        SQ_RESP=$(curl -s -u "${SONAR_TOKEN}:" \
+          "${SONAR_HOST_URL}/api/measures/component?component=${PROJECT_KEY}&branch=${GIT_BRANCH}&metricKeys=${METRICS_SQ}" \
+          2>/dev/null || echo '{}')
+
+        if ! echo "$SQ_RESP" | jq -e '.errors' >/dev/null 2>&1; then
+          get_sq() {
+            echo "$SQ_RESP" | jq -r --arg key "$1" \
+              '.component.measures[] | select(.metric==$key) | .value // "N/A"' 2>/dev/null || echo "N/A"
+          }
+          SONAR_SQ_SECURITY_ISSUES=$(get_sq "software_quality_security_issues")
+          SONAR_SQ_RELIABILITY_ISSUES=$(get_sq "software_quality_reliability_issues")
+          SONAR_SQ_MAINTAINABILITY_ISSUES=$(get_sq "software_quality_maintainability_issues")
+          sq_rating_label() {
+            case "$1" in
+              1|1.0) echo "A" ;; 2|2.0) echo "B" ;; 3|3.0) echo "C" ;;
+              4|4.0) echo "D" ;; 5|5.0) echo "E" ;; *) echo "N/A" ;;
+            esac
+          }
+          SONAR_SQ_SECURITY_RATING=$(sq_rating_label "$(get_sq 'software_quality_security_rating')")
+          SONAR_SQ_RELIABILITY_RATING=$(sq_rating_label "$(get_sq 'software_quality_reliability_rating')")
+          SONAR_SQ_MAINTAINABILITY_RATING=$(sq_rating_label "$(get_sq 'software_quality_maintainability_rating')")
+
+          METRICS_SEV="software_quality_high_severity_issues,software_quality_medium_severity_issues,software_quality_low_severity_issues"
+          SEV_RESP=$(curl -s -u "${SONAR_TOKEN}:" \
+            "${SONAR_HOST_URL}/api/measures/component?component=${PROJECT_KEY}&branch=${GIT_BRANCH}&metricKeys=${METRICS_SEV}" \
+            2>/dev/null || echo '{}')
+          if ! echo "$SEV_RESP" | jq -e '.errors' >/dev/null 2>&1; then
+            SONAR_SQ_HIGH=$(echo "$SEV_RESP" | jq -r --arg k "software_quality_high_severity_issues" '.component.measures[] | select(.metric==$k) | .value // "N/A"' 2>/dev/null || echo "N/A")
+            SONAR_SQ_MEDIUM=$(echo "$SEV_RESP" | jq -r --arg k "software_quality_medium_severity_issues" '.component.measures[] | select(.metric==$k) | .value // "N/A"' 2>/dev/null || echo "N/A")
+            SONAR_SQ_LOW=$(echo "$SEV_RESP" | jq -r --arg k "software_quality_low_severity_issues" '.component.measures[] | select(.metric==$k) | .value // "N/A"' 2>/dev/null || echo "N/A")
+          fi
+          echo "Software Quality chargé"
+        else
+          echo "Software Quality non disponible (SonarQube < 10.4)"
+        fi
         SONAR_BUGS=$(get_metric "bugs")
         SONAR_VULNERABILITIES=$(get_metric "vulnerabilities")
         SONAR_CODE_SMELLS=$(get_metric "code_smells")
@@ -970,6 +1087,14 @@ security-validation:
         SONAR_MAJORS=$(get_metric "major_violations")
         SONAR_MINORS=$(get_metric "minor_violations")
 
+        # Software Quality metrics (SonarQube 10+)
+        SONAR_SQ_SECURITY=$(get_metric "software_quality_security_issues")
+        SONAR_SQ_RELIABILITY=$(get_metric "software_quality_reliability_issues")
+        SONAR_SQ_MAINTAINABILITY=$(get_metric "software_quality_maintainability_issues")
+        SONAR_SQ_SECURITY_HIGH=$(get_metric "software_quality_high_severity_issues")
+        SONAR_SQ_SECURITY_MEDIUM=$(get_metric "software_quality_medium_severity_issues")
+        SONAR_SQ_SECURITY_LOW=$(get_metric "software_quality_low_severity_issues")
+
         rating_label() {
           case "$1" in
             1|1.0) echo "A" ;; 2|2.0) echo "B" ;; 3|3.0) echo "C" ;;
@@ -979,6 +1104,11 @@ security-validation:
         SONAR_RELIABILITY_RATING=$(rating_label "$(get_metric 'reliability_rating')")
         SONAR_SECURITY_RATING=$(rating_label "$(get_metric 'security_rating')")
         SONAR_MAINTAINABILITY_RATING=$(rating_label "$(get_metric 'sqale_rating')")
+
+        # Software Quality ratings (SonarQube 10+)
+        SONAR_SQ_SECURITY_RATING=$(rating_label "$(get_metric 'software_quality_security_rating')")
+        SONAR_SQ_RELIABILITY_RATING=$(rating_label "$(get_metric 'software_quality_reliability_rating')")
+        SONAR_SQ_MAINTAINABILITY_RATING=$(rating_label "$(get_metric 'software_quality_maintainability_rating')")
 
         [ "$SONAR_COVERAGE" != "N/A" ]    && SONAR_COVERAGE="${SONAR_COVERAGE}%"
         [ "$SONAR_DUPLICATIONS" != "N/A" ] && SONAR_DUPLICATIONS="${SONAR_DUPLICATIONS}%"
@@ -1070,6 +1200,19 @@ security-validation:
         printf "│   %-30s %10s                │\n" "Reliability rating"     "$SONAR_RELIABILITY_RATING"
         printf "│   %-30s %10s                │\n" "Security rating"        "$SONAR_SECURITY_RATING"
         printf "│   %-30s %10s                │\n" "Maintainability rating" "$SONAR_MAINTAINABILITY_RATING"
+        echo "│   ─────────────────────────────────────────────────────── │"
+        echo "│   SOFTWARE QUALITY (nouveau modele SonarQube 10+)        │"
+        echo "│   ─────────────────────────────────────────────────────── │"
+        printf "│   %-30s %10s                │\n" "Security issues"        "$SONAR_SQ_SECURITY_ISSUES"
+        printf "│   %-30s %10s                │\n" "  dont High"            "$SONAR_SQ_HIGH"
+        printf "│   %-30s %10s                │\n" "  dont Medium"          "$SONAR_SQ_MEDIUM"
+        printf "│   %-30s %10s                │\n" "  dont Low"             "$SONAR_SQ_LOW"
+        printf "│   %-30s %10s                │\n" "Reliability issues"     "$SONAR_SQ_RELIABILITY_ISSUES"
+        printf "│   %-30s %10s                │\n" "Maintainability issues" "$SONAR_SQ_MAINTAINABILITY_ISSUES"
+        echo "│   ─────────────────────────────────────────────────────── │"
+        printf "│   %-30s %10s                │\n" "SQ Security rating"     "$SONAR_SQ_SECURITY_RATING"
+        printf "│   %-30s %10s                │\n" "SQ Reliability rating"  "$SONAR_SQ_RELIABILITY_RATING"
+        printf "│   %-30s %10s                │\n" "SQ Maintain. rating"    "$SONAR_SQ_MAINTAINABILITY_RATING"
         printf "│   %-30s                           │\n" "Dashboard: ${SONAR_HOST_URL}/dashboard?id=${PROJECT_KEY}&branch=${GIT_BRANCH}"
       else
         printf "│   %-55s │\n" "Non disponible (SONAR_HOST_URL ou SONAR_TOKEN manquant)"
@@ -1224,6 +1367,20 @@ security-validation:
             \"sonar_coverage\":        \"$SONAR_COVERAGE\",
             \"sonar_security_rating\": \"$SONAR_SECURITY_RATING\"
           }" || echo "Backend notification failed (non-blocking)"
+      fi
+    # ── 7. Capture automatique snapshot Quality Gate ─────────────
+    - |
+      if [ -n "$BACKEND_URL" ] && [ -n "$ENVIRONMENT_ID" ] && [ -n "$PIPELINE_SECRET" ]; then
+        echo "Capture snapshot pour env ${ENVIRONMENT_ID}..."
+        SNAP_CODE=$(curl -s -o /tmp/snap_resp.json -w "%{http_code}" -X POST \
+          "${BACKEND_URL}/projet/api/quality-gate/internal/snapshot?environmentId=${ENVIRONMENT_ID}" \
+          -H "X-Pipeline-Secret: ${PIPELINE_SECRET}")
+        if [ "$SNAP_CODE" -ge 400 ]; then
+          echo "Snapshot échoué — HTTP $SNAP_CODE : $(cat /tmp/snap_resp.json)"
+        else
+          VERDICT=$(cat /tmp/snap_resp.json | grep -o '"verdict":"[^"]*"' | cut -d'"' -f4)
+          echo "Snapshot enregistré — verdict: $VERDICT"
+        fi
       fi
   artifacts:
     paths:

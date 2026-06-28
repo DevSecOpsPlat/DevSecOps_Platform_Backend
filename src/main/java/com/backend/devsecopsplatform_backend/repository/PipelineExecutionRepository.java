@@ -174,4 +174,15 @@ public interface PipelineExecutionRepository extends JpaRepository<PipelineExecu
             WHERE pe.id = :id
             """)
     Optional<PipelineExecution> findByIdWithEnvironmentAndApplication(@Param("id") UUID id);
+
+    /** Pipeline CI snapshot : env + app + utilisateurs (évite lazy-load hors session). */
+    @Query("""
+            SELECT pe FROM PipelineExecution pe
+            JOIN FETCH pe.environment env
+            JOIN FETCH env.application app
+            LEFT JOIN FETCH app.createdBy
+            LEFT JOIN FETCH env.requestedBy
+            WHERE env.id = :environmentId
+            """)
+    Optional<PipelineExecution> findByEnvironmentIdWithDetails(@Param("environmentId") UUID environmentId);
 }

@@ -4,10 +4,12 @@ import com.backend.devsecopsplatform_backend.repository.PipelineExecutionReposit
 import com.backend.devsecopsplatform_backend.service.finding.FindingIngestionService;
 import com.backend.devsecopsplatform_backend.service.qualitygate.QualityGateService;
 import com.backend.devsecopsplatform_backend.service.qualitygate.dto.QualityGateEnvironmentOptionDto;
+import com.backend.devsecopsplatform_backend.service.qualitygate.dto.QualityGateResultDto;
 import com.backend.devsecopsplatform_backend.service.qualitygate.dto.QualityGateSnapshotHistoryItemDto;
 import com.backend.devsecopsplatform_backend.service.qualitygate.dto.SecurityGateIngestRequest;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
@@ -25,6 +27,9 @@ public class QualityGateController {
     private final QualityGateService qualityGateService;
     private final FindingIngestionService findingIngestionService;
     private final PipelineExecutionRepository pipelineExecutionRepository;
+
+    @Value("${pipeline.secret}")
+    private String pipelineSecret;
 
     /** Ingestion du verdict CI (job security-validation). */
     @PostMapping("/ingest")
@@ -105,6 +110,39 @@ public class QualityGateController {
                     "message", "Capture du snapshot impossible",
                     "detail", e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()
             ));
+        }
+    }
+
+    /** Appelé par le pipeline GitLab à la fin — pas de JWT, secret partagé ({@code X-Pipeline-Secret}). */
+    @PostMapping("/internal/snapshot")
+    public ResponseEntity<?> pipelineSnapshot(
+            @RequestParam UUID environmentId,
+            @RequestHeader("X-Pipeline-Secret") String secret
+    ) {
+        if (pipelineSecret == null || pipelineSecret.isBlank() || !pipelineSecret.equals(secret)) {
+            return ResponseEntity.status(403).body(Map.of("message", "Secret invalide"));
+        }
+        try {
+            pipelineExecutionRepository.findByEnvironmentIdWithDetails(environmentId)
+                    .ifPresent(execution -> {
+                        if (execution.getGitlabPipelineId() != null) {
+                            try {
+                                findingIngestionService.ingestFromAggregateArtifacts(
+                                        execution.getGitlabPipelineId());
+                            } catch (Exception e) {
+                                log.warn("Ingestion artifacts échouée (pipeline internal env {}): {}",
+                                        environmentId, e.getMessage());
+                            }
+                        }
+                    });
+
+            QualityGateResultDto result = qualityGateService.captureSnapshotFromPipeline(environmentId);
+            return ResponseEntity.ok(Map.of("status", "ok", "verdict", result.getVerdict()));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("message", e.getMessage()));
+        } catch (Exception e) {
+            log.error("Pipeline snapshot failed env {}", environmentId, e);
+            return ResponseEntity.internalServerError().body(Map.of("message", e.getMessage()));
         }
     }
 

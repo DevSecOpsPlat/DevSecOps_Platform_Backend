@@ -181,6 +181,42 @@ public class QualityGateService {
     }
 
     /**
+     * Capture déclenchée par le job CI security-validation (secret partagé, sans JWT).
+     * Charge les associations User dans la transaction avant impersonation DefectDojo.
+     */
+    @Transactional
+    public QualityGateResultDto captureSnapshotFromPipeline(UUID environmentId) {
+        PipelineExecution execution = pipelineExecutionRepository
+                .findByEnvironmentIdWithDetails(environmentId)
+                .orElseThrow(() -> new IllegalArgumentException("Pipeline introuvable"));
+        Application app = execution.getEnvironment().getApplication();
+        if (app == null) {
+            throw new IllegalArgumentException("Application manquante");
+        }
+
+        String username = resolveSnapshotUsername(app, execution);
+        try {
+            if (username != null) {
+                SecurityContextHolder.getContext().setAuthentication(
+                        new UsernamePasswordAuthenticationToken(username, null, List.of()));
+            }
+            buildAndPersistSnapshot(
+                    app,
+                    execution.getEnvironment().getGitBranch(),
+                    execution,
+                    true,
+                    SNAPSHOT_SOURCE_PIPELINE_SYNC);
+
+            QualityGateSnapshot saved = qualityGateSnapshotRepository
+                    .findByPipelineExecutionId(execution.getId())
+                    .orElseThrow(() -> new IllegalStateException("Snapshot non enregistré après capture"));
+            return fromSnapshotEntity(saved);
+        } finally {
+            SecurityContextHolder.clearContext();
+        }
+    }
+
+    /**
      * Capture un snapshot backend (Sonar + DefectDojo tag env-* + stages GitLab).
      * Ne dépend pas du rapport CI security-validation.
      */
