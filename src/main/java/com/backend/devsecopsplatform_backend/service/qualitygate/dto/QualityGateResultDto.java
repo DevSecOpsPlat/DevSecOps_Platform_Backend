@@ -23,7 +23,7 @@ public class QualityGateResultDto {
     private String pipelineStatus;
     private List<QualityGateStageDto> stages;
     private Map<String, Object> metrics;
-    /** RECOMMENDED | WITH_WARNINGS | NOT_RECOMMENDED | UNKNOWN */
+    /** RECOMMENDED | WITH_WARNINGS | NOT_RECOMMENDED | INDETERMINE | UNKNOWN */
     private String verdict;
     private String summary;
     private List<String> detailedRecommendations;
@@ -62,4 +62,22 @@ public class QualityGateResultDto {
     private String snapshotRecordSource;
     /** true si chargé depuis la table (données figées), pas depuis DefectDojo/Sonar live. */
     private Boolean fromSnapshot;
+
+    /** Hard gates violés (secrets, critical DD, blocker Sonar, QG ERROR). */
+    private List<HardGateViolationDto> hardGateViolations;
+    /** Hard gates indéterminés (source indisponible). */
+    private List<HardGateViolationDto> hardGateIndeterminate;
+    /** Message synthétique des hard gates violés. */
+    private String hardGateSummary;
+    /** true si getDashboard2 a répondu ; false si exception ou null. */
+    private Boolean defectDojoAvailable;
+    /** Sources indisponibles empêchant une recommandation complète. */
+    private List<String> indeterminateSources;
+    /** Bandeau « Recommandation incomplète ». */
+    private String incompleteRecommendationMessage;
+
+    /** Lignes de code non commentées (SonarQube) — base du calcul densité. */
+    private Integer ncloc;
+    /** SONAR_LIVE | SUMMARY | PIPELINE_GATE | SNAPSHOT | UNKNOWN */
+    private String nclocSource;
 }

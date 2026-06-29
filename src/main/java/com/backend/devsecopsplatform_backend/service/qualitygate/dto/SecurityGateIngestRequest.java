@@ -21,6 +21,24 @@ public class SecurityGateIngestRequest {
     private Integer containerCritical;
     @JsonProperty("dast_high")
     private Integer dastHigh;
+    @JsonProperty("sonar_security_rating")
+    private String sonarSecurityRating;
+    @JsonProperty("sonar_quality_gate")
+    private String sonarQualityGate;
+    @JsonProperty("sonar_bugs")
+    private Integer sonarBugs;
+    @JsonProperty("sonar_vulnerabilities")
+    private Integer sonarVulnerabilities;
+    @JsonProperty("sonar_hotspots")
+    private Integer sonarHotspots;
+    @JsonProperty("sonar_coverage")
+    private String sonarCoverage;
+    @JsonProperty("sonar_blockers")
+    private Integer sonarBlockers;
+    @JsonProperty("sonar_criticals")
+    private Integer sonarCriticals;
+    @JsonProperty("sonar_ncloc")
+    private Integer sonarNcloc;
     private JsonNode summary;
     @JsonProperty("quality_gate")
     private JsonNode qualityGate;

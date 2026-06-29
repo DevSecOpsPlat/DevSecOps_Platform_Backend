@@ -1372,6 +1372,26 @@ public class GitLabService {
         envelope.put("requested_branch", resolution.getRequestedBranch());
 
         if (!resolution.isSonarReachable() || resolution.getResolvedBranch() == null) {
+            String fallbackBranch = requestedBranch != null && !requestedBranch.isBlank()
+                    ? requestedBranch.trim() : "main";
+            Map<String, Object> direct = loadSonarDataForProjectBranch(projectKey, fallbackBranch);
+            if (isSonarMetricsEmpty(direct) && !fallbackBranch.equals("main")) {
+                direct = loadSonarDataForProjectBranch(projectKey, "main");
+                fallbackBranch = "main";
+            }
+            if (!isSonarMetricsEmpty(direct) || direct.containsKey("quality_gate")) {
+                envelope.putAll(direct);
+                envelope.put("branch", fallbackBranch);
+                envelope.put("sonar_available", true);
+                envelope.put("branch_resolution", SonarBranchResolution.builder()
+                        .requestedBranch(requestedBranch)
+                        .resolvedBranch(fallbackBranch)
+                        .branchFallback(!fallbackBranch.equals(requestedBranch))
+                        .sonarReachable(true)
+                        .availableBranches(List.of(fallbackBranch))
+                        .build());
+                return envelope;
+            }
             envelope.put("sonar_available", false);
             envelope.put("branch", resolution.getResolvedBranch());
             return envelope;

@@ -28,8 +28,7 @@ variables:
   DOCKER_ACCESS_TOKEN: ""
   ENVIRONMENT_URL:    ""
   BACKEND_URL:        ""
-  API_TOKEN:          ""
-  PIPELINE_SECRET:    ""
+  PIPELINE_SECRET:    ""   # Secret partagé avec le backend (pipeline.secret) — auth CI sans JWT
   K8S_API_URL:        ""
   K8S_TOKEN:          ""
   K8S_NAMESPACE:      "envirotest-${ENVIRONMENT_ID}"
@@ -1346,11 +1345,11 @@ security-validation:
 
     # ── 6. Notification backend ───────────────────────────────────
     - |
-      if [ -n "$BACKEND_URL" ]; then
+      if [ -n "$BACKEND_URL" ] && [ -n "$PIPELINE_SECRET" ]; then
         RECOMMENDATION=$(cat final-report/recommendation.txt)
         curl -s -X POST "${BACKEND_URL}/projet/api/security-gate" \
           -H "Content-Type: application/json" \
-          -H "Authorization: Bearer ${API_TOKEN}" \
+          -H "X-Pipeline-Secret: ${PIPELINE_SECRET}" \
           -d "{
             \"environment_id\":        \"$ENVIRONMENT_ID\",
             \"recommendation\":        \"$RECOMMENDATION\",
@@ -1365,8 +1364,40 @@ security-validation:
             \"sonar_vulnerabilities\": \"$SONAR_VULNERABILITIES\",
             \"sonar_hotspots\":        \"$SONAR_SECURITY_HOTSPOTS\",
             \"sonar_coverage\":        \"$SONAR_COVERAGE\",
-            \"sonar_security_rating\": \"$SONAR_SECURITY_RATING\"
+            \"sonar_security_rating\": \"$SONAR_SECURITY_RATING\",
+            \"sonar_blockers\":        \"${SONAR_BLOCKERS:-0}\",
+            \"sonar_criticals\":       \"${SONAR_CRITICALS:-0}\",
+            \"sonar_ncloc\":           \"${SONAR_NCLOC:-0}\"
           }" || echo "Backend notification failed (non-blocking)"
+      elif [ -n "$BACKEND_URL" ]; then
+        echo "BACKEND_URL défini mais PIPELINE_SECRET manquant — ingestion security-gate ignorée"
+      fi
+    # ── Enrichir summary.json avec métriques Sonar (snapshot / fallback backend) ──
+    - |
+      if [ -f final-report/summary.json ] && [ "$SONAR_AVAILABLE" = "true" ]; then
+        tmp=$(mktemp)
+        jq --arg qg "${SONAR_QUALITY_GATE:-N/A}" \
+           --argjson blockers "${SONAR_BLOCKERS:-0}" \
+           --argjson criticals "${SONAR_CRITICALS:-0}" \
+           --argjson majors "${SONAR_MAJORS:-0}" \
+           --argjson minors "${SONAR_MINORS:-0}" \
+           --argjson bugs "${SONAR_BUGS:-0}" \
+           --argjson vulns "${SONAR_VULNERABILITIES:-0}" \
+           --argjson hotspots "${SONAR_SECURITY_HOTSPOTS:-0}" \
+           --argjson ncloc "${SONAR_NCLOC:-0}" \
+           '. + {sonar: ((.sonar // {}) + {
+             quality_gate: $qg,
+             blocker_violations: $blockers,
+             critical_violations: $criticals,
+             major_violations: $majors,
+             minor_violations: $minors,
+             bugs: $bugs,
+             vulnerabilities: $vulns,
+             hotspots: $hotspots,
+             ncloc: $ncloc
+           })}' final-report/summary.json > "$tmp" \
+          && mv "$tmp" final-report/summary.json
+        echo "summary.json enrichi — sonar (QG=$SONAR_QUALITY_GATE, blockers=$SONAR_BLOCKERS, ncloc=$SONAR_NCLOC)"
       fi
     # ── 7. Capture automatique snapshot Quality Gate ─────────────
     - |

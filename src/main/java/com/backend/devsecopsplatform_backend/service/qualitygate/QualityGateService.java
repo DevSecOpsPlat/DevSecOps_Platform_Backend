@@ -16,6 +16,7 @@ import com.backend.devsecopsplatform_backend.service.GitLabService;
 import com.backend.devsecopsplatform_backend.service.SonarBranchResolution;
 import com.backend.devsecopsplatform_backend.service.defectdojo.DefectDojoService;
 import com.backend.devsecopsplatform_backend.service.defectdojo.dto.DefectDojoDashboard2Response;
+import com.backend.devsecopsplatform_backend.service.qualitygate.dto.HardGateViolationDto;
 import com.backend.devsecopsplatform_backend.service.qualitygate.dto.QualityGateEnvironmentOptionDto;
 import com.backend.devsecopsplatform_backend.service.qualitygate.dto.QualityGateResultDto;
 import com.backend.devsecopsplatform_backend.service.qualitygate.dto.QualityGateSnapshotHistoryItemDto;
@@ -120,6 +121,30 @@ public class QualityGateService {
         gate.put("secrets", request.getSecrets());
         gate.put("containerCritical", request.getContainerCritical());
         gate.put("dastHigh", request.getDastHigh());
+        if (request.getSonarNcloc() != null && request.getSonarNcloc() > 0) {
+            gate.put("sonarNcloc", request.getSonarNcloc());
+        }
+        if (request.getSonarQualityGate() != null && !request.getSonarQualityGate().isBlank()) {
+            gate.put("sonarQualityGate", request.getSonarQualityGate().trim());
+        }
+        if (request.getSonarBlockers() != null) {
+            gate.put("sonarBlockers", request.getSonarBlockers());
+        }
+        if (request.getSonarCriticals() != null) {
+            gate.put("sonarCriticals", request.getSonarCriticals());
+        }
+        if (request.getSonarBugs() != null) {
+            gate.put("sonarBugs", request.getSonarBugs());
+        }
+        if (request.getSonarVulnerabilities() != null) {
+            gate.put("sonarVulnerabilities", request.getSonarVulnerabilities());
+        }
+        if (request.getSonarHotspots() != null) {
+            gate.put("sonarHotspots", request.getSonarHotspots());
+        }
+        if (request.getSonarSecurityRating() != null && !request.getSonarSecurityRating().isBlank()) {
+            gate.put("sonarSecurityRating", request.getSonarSecurityRating().trim());
+        }
         if (request.getSummary() != null) {
             gate.put("summary", objectMapper.convertValue(request.getSummary(), Map.class));
         }
@@ -442,9 +467,8 @@ public class QualityGateService {
                 .orElseThrow(() -> new IllegalArgumentException("Application introuvable ou accès refusé"));
 
         String effectiveBranch = normalizeBranch(branch);
-        // Tous les environnements de l'app (pas de filtre branche) pour ne pas masquer un nouveau test.
         List<EphemeralEnvironment> envs = environmentRepository.findByApplicationWithPipeline(
-                applicationId, null);
+                applicationId, effectiveBranch);
 
         List<QualityGateEnvironmentOptionDto> options = new ArrayList<>();
         for (EphemeralEnvironment env : envs) {
@@ -568,8 +592,34 @@ public class QualityGateService {
         if (dto.getBranch() == null || dto.getBranch().isBlank()) {
             dto.setBranch(row.getBranch());
         }
+        if ((dto.getNcloc() == null || dto.getNcloc() <= 0) && row.getNcloc() != null && row.getNcloc() > 0) {
+            dto.setNcloc(row.getNcloc());
+            if (dto.getNclocSource() == null) {
+                dto.setNclocSource("SNAPSHOT");
+            }
+            enrichMetricsNcloc(dto, row.getNcloc());
+        }
         return dto;
     }
+
+    private void enrichMetricsNcloc(QualityGateResultDto dto, int ncloc) {
+        if (dto.getMetrics() == null) {
+            dto.setMetrics(new LinkedHashMap<>());
+        }
+        dto.getMetrics().put("ncloc", ncloc);
+        Object sonarObj = dto.getMetrics().get("sonarQube");
+        if (sonarObj instanceof Map<?, ?> sonarMap) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> sonar = (Map<String, Object>) sonarMap;
+            sonar.put("ncloc", ncloc);
+        } else if (ncloc > 0) {
+            Map<String, Object> sonar = new LinkedHashMap<>();
+            sonar.put("ncloc", ncloc);
+            dto.getMetrics().put("sonarQube", sonar);
+        }
+    }
+
+    private record NclocResolution(int value, String source) {}
 
     private QualityGateSnapshotHistoryItemDto toHistoryItem(QualityGateSnapshot row) {
         String envName = environmentRepository.findById(row.getEnvironmentId())
@@ -628,6 +678,7 @@ public class QualityGateService {
         row.setGitlabPipelineId(execution.getGitlabPipelineId());
         row.setSource(source != null ? source : SNAPSHOT_SOURCE_MANUAL);
         row.setEvaluatedAt(dto.getEvaluatedAt() != null ? dto.getEvaluatedAt() : Instant.now());
+        row.setNcloc(dto.getNcloc());
         row.setPayload(objectMapper.convertValue(dto, Map.class));
         qualityGateSnapshotRepository.saveAndFlush(row);
         log.info("Snapshot QG persisté table id={} pipelineExec={} env={} gitlabPipeline={}",
@@ -898,6 +949,7 @@ public class QualityGateService {
     ) {
         Map<String, Object> storedGate = execution != null ? execution.getQualityGateJson() : null;
         Map<String, Object> summary = resolveEffectiveSummary(execution, storedGate);
+        sonar = mergePipelineSonarIfNeeded(sonar, storedGate, summary);
         boolean hasSummary = !summary.isEmpty();
         UUID scopedEnvId = environmentId != null
                 ? environmentId
@@ -914,9 +966,13 @@ public class QualityGateService {
                 : List.of();
 
         Map<String, Object> sonarFlat = sonarFlatMetrics(sonar);
-        SonarAvailabilityDto sonarAvailability = buildSonarAvailability(sonar, app);
+        NclocResolution nclocResolution = resolveNcloc(sonarFlat, summary, storedGate);
+        int resolvedNcloc = nclocResolution.value();
+        boolean defectDojoAvailable = dd != null;
+        boolean sonarLiveAvailable = isSonarLiveAvailable(sonar);
+        SonarAvailabilityDto sonarAvailability = buildSonarAvailability(sonar, app, sonarLiveAvailable);
         List<SoftwareQualityDimensionDto> softwareQuality = buildSoftwareQualityDimensions(
-                sonarFlat, sonarAvailability.isAvailable());
+                sonarFlat, sonarLiveAvailable);
         Map<String, Integer> softwareQualitySeverity = buildSoftwareQualitySeverity(sonarFlat);
 
         List<QualityGateToolMetricDto> toolMetrics = buildToolMetrics(
@@ -927,7 +983,10 @@ public class QualityGateService {
         List<QualityGateStageDto> stages = buildStages(jobs, effectiveSummary, storedGate, sonarFlat, usePipelineSummary || !toolMetrics.isEmpty());
         attachStageToTools(toolMetrics, stages);
         Map<String, Object> metrics = buildMetrics(
-                bySeverity, effectiveSummary, stages, sonarFlat, dd, softwareQuality, softwareQualitySeverity);
+                bySeverity, effectiveSummary, stages, sonarFlat, dd, softwareQuality, softwareQualitySeverity,
+                resolvedNcloc);
+        metrics.put("defectDojoAvailable", defectDojoAvailable);
+        metrics.put("sonarLiveAvailable", sonarLiveAvailable);
 
         String ciVerdictRaw = storedGate != null ? stringVal(storedGate.get("verdict")) : null;
         if (ciVerdictRaw == null && storedGate != null) {
@@ -935,20 +994,42 @@ public class QualityGateService {
         }
         String ciVerdict = normalizeCiVerdict(ciVerdictRaw);
 
-        SecurityScoreInput scoreInput = buildSecurityScoreInput(
-                bySeverity, effectiveSummary, stages, sonarFlat, sonar, storedGate);
-        SecurityScoreDto securityScore = securityScoringService.compute(scoreInput);
+        int ddCritical = defectDojoAvailable && dd != null && dd.getBySeverity() != null
+                ? dd.getBySeverity().getOrDefault("Critical", 0) : 0;
+        int sonarBlockers = sonarViolationCount(sonarFlat, "blocker");
+        int secrets = intVal(effectiveSummary.get("secrets"));
 
-        VerdictResolution verdictResolution = resolveVerdictWithSource(
-                ciVerdict, securityScore, stages, effectiveSummary);
+        HardGateInput hardGateInput = HardGateInput.builder()
+                .secrets(secrets)
+                .ddCritical(ddCritical)
+                .sonarBlockers(sonarBlockers)
+                .sonarQgStatus(stringVal(sonarFlat.get("quality_gate_status")))
+                .defectDojoAvailable(defectDojoAvailable)
+                .sonarAvailable(sonarLiveAvailable)
+                .build();
+        SecurityScoringService.HardGateEvaluation hardGates = securityScoringService.evaluateHardGates(hardGateInput);
+
+        SecurityScoreDto securityScore = null;
+        if (hardGates.violations().isEmpty() && hardGates.indeterminateSources().isEmpty()) {
+            SecurityScoreInput scoreInput = buildSecurityScoreInput(
+                    bySeverity, effectiveSummary, stages, sonarFlat, sonar, storedGate,
+                    defectDojoAvailable, sonarLiveAvailable, sonarBlockers, resolvedNcloc);
+            securityScore = securityScoringService.computePostureScore(scoreInput);
+        }
+
+        VerdictResolution verdictResolution = resolveDeterministicVerdict(hardGates, securityScore);
         String verdict = verdictResolution.verdict();
         String verdictSource = verdictResolution.source();
 
+        List<String> indeterminateSources = hardGates.indeterminateSources();
+        String incompleteMessage = buildIncompleteRecommendationMessage(indeterminateSources);
+
         List<String> verdictExplanation = buildVerdictExplanation(
-                stages, effectiveSummary, bySeverity, verdict, sonarFlat, securityScore);
+                stages, effectiveSummary, bySeverity,
+                hardGates.violations(), indeterminateSources, verdict, sonarFlat, securityScore);
         List<String> practicalAdvice = buildPracticalAdvice(verdict, stages, effectiveSummary, toolMetrics, sonarFlat);
         String scoringNote = buildScoringNote();
-        String summaryText = buildSummaryText(verdict, bySeverity, stages, securityScore);
+        String summaryText = buildSummaryText(verdict, bySeverity, stages, securityScore, hardGates, incompleteMessage);
 
         List<String> availableBranches = mergeAvailableBranches(branch, sonar, dd);
 
@@ -996,6 +1077,14 @@ public class QualityGateService {
                 .ciVerdict(ciVerdict)
                 .verdictSource(verdictSource)
                 .securityScore(securityScore)
+                .hardGateViolations(hardGates.violations())
+                .hardGateIndeterminate(hardGates.indeterminate())
+                .hardGateSummary(hardGates.summaryMessage())
+                .defectDojoAvailable(defectDojoAvailable)
+                .indeterminateSources(indeterminateSources)
+                .incompleteRecommendationMessage(incompleteMessage)
+                .ncloc(resolvedNcloc > 0 ? resolvedNcloc : null)
+                .nclocSource(nclocResolution.source())
                 .softwareQuality(softwareQuality)
                 .softwareQualitySeverity(softwareQualitySeverity)
                 .sonarAvailability(sonarAvailability)
@@ -1625,7 +1714,7 @@ public class QualityGateService {
     ) {
         String lower = stageName.toLowerCase(Locale.ROOT);
         String gitlabStatus = job != null ? stringVal(job.get("status")) : null;
-        String toolLabel = toolLabelForStage(lower);
+        String toolLabel = toolLabelForStage(stageName);
         Map<String, Object> stageMetrics = new LinkedHashMap<>();
 
         if (pipelineBlocked && CASCADE_AFTER_BLOCK.contains(lower)) {
@@ -1813,21 +1902,38 @@ public class QualityGateService {
                 || lower.contains("container") || lower.contains("iac") || lower.contains("zap");
     }
 
-    private String toolLabelForStage(String lower) {
-        if (lower.contains("sca") || lower.contains("trivy")) return "Sca (Trivy FS)";
-        if (lower.contains("sast")) return "Sast (Semgrep)";
-        if (lower.contains("secret")) return "Secrets (Gitleaks)";
-        if (lower.contains("container")) return "Container-Scan (Grype)";
-        if (lower.contains("sonar")) return "Code-Analysis (SonarQube)";
-        if (lower.contains("iac")) return "IaC (Checkov)";
-        if (lower.contains("zap")) return "Zap-Scan (DAST)";
-        if (lower.contains("security-validation")) return "Security-Validation";
-        if (lower.contains("setup") || lower.contains("clone")) return "Setup";
-        if (lower.contains("build")) return "Build";
-        if (lower.contains("push")) return "Push-Image";
-        if (lower.contains("deploy")) return "Deploy-K8s";
-        if (lower.contains("report") || lower.contains("aggregate")) return "Reporting";
-        return capitalizeStage(lower);
+    private String toolLabelForStage(String stageName) {
+        if (stageName == null || stageName.isBlank()) {
+            return "Stage";
+        }
+        String lower = stageName.toLowerCase(Locale.ROOT);
+        return switch (lower) {
+            case "sca", "sca-trivy" -> "SCA (Trivy FS)";
+            case "sast" -> "SAST (Semgrep)";
+            case "secrets", "secrets-iac" -> "Secrets (Gitleaks)";
+            case "container-scan" -> "Container-Scan (Grype)";
+            case "sonarqube-scan", "code-analysis" -> "Code-Analysis (SonarQube)";
+            case "sonarqube-setup" -> "SonarQube Setup";
+            case "iac" -> "IaC (Checkov)";
+            case "zap-scan" -> "ZAP Scan (DAST)";
+            case "security-validation" -> "Security-Validation";
+            case "setup", "clone" -> "Setup";
+            case "build", "build-image" -> "Build";
+            case "push-image" -> "Push-Image";
+            case "deploy-k8s" -> "Deploy-K8s";
+            case "aggregate-report", "reporting" -> "Reporting";
+            case "import-defectdojo" -> "import-defectdojo";
+            default -> {
+                if (lower.contains("semgrep")) yield "SAST (Semgrep)";
+                if (lower.contains("gitleaks")) yield "Secrets (Gitleaks)";
+                if (lower.contains("grype")) yield "Container-Scan (Grype)";
+                if (lower.contains("checkov")) yield "IaC (Checkov)";
+                if (lower.contains("trivy") && !lower.contains("container")) yield "SCA (Trivy FS)";
+                if (lower.contains("sonar")) yield "Code-Analysis (SonarQube)";
+                if (lower.contains("zap") || lower.contains("dast")) yield "ZAP Scan (DAST)";
+                yield capitalizeStage(lower);
+            }
+        };
     }
 
     private String capitalizeStage(String s) {
@@ -1945,7 +2051,8 @@ public class QualityGateService {
             Map<String, Object> sonarFlat,
             DefectDojoDashboard2Response dd,
             List<SoftwareQualityDimensionDto> softwareQuality,
-            Map<String, Integer> softwareQualitySeverity
+            Map<String, Integer> softwareQualitySeverity,
+            int resolvedNcloc
     ) {
         Map<String, Object> metrics = new LinkedHashMap<>();
         int totalOpen = dd != null && dd.getTotalOpen() > 0
@@ -1953,6 +2060,9 @@ public class QualityGateService {
                 : bySeverity.values().stream().mapToInt(Integer::intValue).sum();
         metrics.put("totalVulnerabilities", totalOpen);
         metrics.put("bySeverity", bySeverity);
+        if (resolvedNcloc > 0) {
+            metrics.put("ncloc", resolvedNcloc);
+        }
 
         long blockingFails = stages.stream()
                 .filter(s -> "FAIL".equals(s.getStatus()) && s.isBlocking())
@@ -1963,8 +2073,8 @@ public class QualityGateService {
         metrics.put("warningStages", warnStages);
         metrics.put("secrets", intVal(summary.get("secrets")));
 
+        Map<String, Object> sonarMetrics = new LinkedHashMap<>();
         if (!sonarFlat.isEmpty()) {
-            Map<String, Object> sonarMetrics = new LinkedHashMap<>();
             sonarMetrics.put("bugs", intVal(sonarFlat.get("bugs")));
             sonarMetrics.put("vulnerabilities", intVal(sonarFlat.get("vulnerabilities")));
             sonarMetrics.put("codeSmells", intVal(sonarFlat.get("code_smells")));
@@ -1972,8 +2082,13 @@ public class QualityGateService {
             sonarMetrics.put("coverage", doubleVal(sonarFlat.get("coverage")));
             sonarMetrics.put("duplications", doubleVal(sonarFlat.get("duplicated_lines_density")));
             sonarMetrics.put("hotspots", intVal(sonarFlat.get("security_hotspots")));
-            sonarMetrics.put("ncloc", intVal(sonarFlat.get("ncloc")));
+        }
+        int sonarNcloc = resolvedNcloc > 0 ? resolvedNcloc : intVal(sonarFlat.get("ncloc"));
+        if (sonarNcloc > 0) {
+            sonarMetrics.put("ncloc", sonarNcloc);
+        }
 
+        if (!sonarMetrics.isEmpty()) {
             Map<String, Integer> sonarBySev = sonarViolationBySeverity(sonarFlat);
             if (sonarBySev.values().stream().anyMatch(v -> v > 0)) {
                 sonarMetrics.put("bySeverity", sonarBySev);
@@ -2025,16 +2140,19 @@ public class QualityGateService {
         return metrics;
     }
 
-    private SonarAvailabilityDto buildSonarAvailability(Map<String, Object> sonar, Application app) {
+    private SonarAvailabilityDto buildSonarAvailability(
+            Map<String, Object> sonar,
+            Application app,
+            boolean liveAvailable
+    ) {
         String projectKey = sonar.get("sonar_project_key") != null
                 ? stringVal(sonar.get("sonar_project_key"))
                 : SonarProjectKeyUtil.deriveSonarProjectKey(app.getGitRepositoryUrl());
-        boolean available = Boolean.TRUE.equals(sonar.get("sonar_available"));
         String requested = stringVal(sonar.get("requested_branch"));
         String resolved = stringVal(sonar.get("branch"));
         String message = stringVal(sonar.get("branch_fallback_message"));
-        if (!available && isBlankStr(message)) {
-            message = "SonarQube indisponible — données DefectDojo et CI affichées seules.";
+        if (!liveAvailable && isBlankStr(message)) {
+            message = "SonarQube indisponible — impossible de valider les hard gates Blocker et Quality Gate.";
         }
         String host = stringVal(sonar.get("sonar_host_url"));
         if (!isBlankStr(host)) {
@@ -2045,7 +2163,7 @@ public class QualityGateService {
             dashboardUrl = host + "/dashboard?id=" + projectKey + "&branch=" + resolved;
         }
         return SonarAvailabilityDto.builder()
-                .available(available)
+                .available(liveAvailable)
                 .projectKey(isBlankStr(projectKey) ? null : projectKey)
                 .requestedBranch(nullIfBlank(requested))
                 .resolvedBranch(nullIfBlank(resolved))
@@ -2158,7 +2276,11 @@ public class QualityGateService {
             List<QualityGateStageDto> stages,
             Map<String, Object> sonarFlat,
             Map<String, Object> sonar,
-            Map<String, Object> storedGate
+            Map<String, Object> storedGate,
+            boolean defectDojoAvailable,
+            boolean sonarLiveAvailable,
+            int sonarBlockers,
+            int resolvedNcloc
     ) {
         Map<String, Object> container = mapVal(summary, "container");
         int containerCritical = intVal(container.get("critical"));
@@ -2194,8 +2316,66 @@ public class QualityGateService {
                         && !isBlankStr(stringVal(sonarFlat.get("coverage"))))
                 .securityHotspots(intVal(sonarFlat.get("security_hotspots")))
                 .stages(stages)
-                .sonarAvailable(Boolean.TRUE.equals(sonar.get("sonar_available")))
+                .sonarAvailable(sonarLiveAvailable)
+                .defectDojoAvailable(defectDojoAvailable)
+                .sonarBlockers(sonarBlockers)
+                .ncloc(resolvedNcloc > 0 ? resolvedNcloc : intVal(sonarFlat.get("ncloc")))
                 .build();
+    }
+
+    /**
+     * Résout ncloc pour le score densité : Sonar live → summary.json → quality_gate_json pipeline.
+     */
+    @SuppressWarnings("unchecked")
+    private NclocResolution resolveNcloc(
+            Map<String, Object> sonarFlat,
+            Map<String, Object> summary,
+            Map<String, Object> storedGate
+    ) {
+        int fromSonar = intVal(sonarFlat != null ? sonarFlat.get("ncloc") : null);
+        if (fromSonar > 0) {
+            return new NclocResolution(fromSonar, "SONAR_LIVE");
+        }
+
+        int fromSummary = extractNclocFromMap(summary);
+        if (fromSummary > 0) {
+            return new NclocResolution(fromSummary, "SUMMARY");
+        }
+
+        if (storedGate != null) {
+            int fromGate = intVal(storedGate.get("sonarNcloc"));
+            if (fromGate > 0) {
+                return new NclocResolution(fromGate, "PIPELINE_GATE");
+            }
+            Object nestedSummary = storedGate.get("summary");
+            if (nestedSummary instanceof Map<?, ?> sm) {
+                fromSummary = extractNclocFromMap((Map<String, Object>) sm);
+                if (fromSummary > 0) {
+                    return new NclocResolution(fromSummary, "SUMMARY");
+                }
+            }
+        }
+
+        return new NclocResolution(0, "UNKNOWN");
+    }
+
+    @SuppressWarnings("unchecked")
+    private int extractNclocFromMap(Map<String, Object> map) {
+        if (map == null || map.isEmpty()) {
+            return 0;
+        }
+        int direct = intVal(map.get("ncloc"));
+        if (direct > 0) {
+            return direct;
+        }
+        Object sonar = map.get("sonar");
+        if (sonar instanceof Map<?, ?> sonarMap) {
+            int nested = intVal(sonarMap.get("ncloc"));
+            if (nested > 0) {
+                return nested;
+            }
+        }
+        return 0;
     }
 
     private int thresholdFromSummaryOrDefault(
@@ -2231,79 +2411,252 @@ public class QualityGateService {
         };
     }
 
-    private VerdictResolution resolveVerdictWithSource(
-            String ciVerdict,
-            SecurityScoreDto securityScore,
-            List<QualityGateStageDto> stages,
+    private VerdictResolution resolveDeterministicVerdict(
+            SecurityScoringService.HardGateEvaluation hardGates,
+            SecurityScoreDto postureScore
+    ) {
+        if (hardGates != null && !hardGates.violations().isEmpty()) {
+            return new VerdictResolution("NOT_RECOMMENDED", "HARD_GATES");
+        }
+        if (hardGates != null && !hardGates.indeterminateSources().isEmpty()) {
+            return new VerdictResolution("INDETERMINE", "HARD_GATES");
+        }
+        if (postureScore != null && postureScore.getDerivedVerdict() != null) {
+            return new VerdictResolution(postureScore.getDerivedVerdict(), "POSTURE");
+        }
+        return new VerdictResolution("WITH_WARNINGS", "POSTURE");
+    }
+
+    private String buildIncompleteRecommendationMessage(List<String> indeterminateSources) {
+        if (indeterminateSources == null || indeterminateSources.isEmpty()) {
+            return null;
+        }
+        return "Recommandation incomplète — "
+                + String.join(", ", indeterminateSources)
+                + " indisponible(s), métriques non prises en compte.";
+    }
+
+    @SuppressWarnings("unchecked")
+    private boolean isSonarLiveAvailable(Map<String, Object> sonar) {
+        if (sonar == null || sonar.isEmpty()) {
+            return false;
+        }
+        if (!Boolean.TRUE.equals(sonar.get("sonar_available"))) {
+            return false;
+        }
+        Object branchResolution = sonar.get("branch_resolution");
+        if (branchResolution instanceof Map<?, ?> br) {
+            Object reachable = br.get("sonarReachable");
+            if (reachable instanceof Boolean b && !b) {
+                return false;
+            }
+        } else if (branchResolution instanceof com.backend.devsecopsplatform_backend.service.SonarBranchResolution br) {
+            if (!br.isSonarReachable()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Si Sonar live échoue (API branches, réseau backend), retombe sur les métriques
+     * remontées par le job CI (qualityGateJson / summary.json).
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> mergePipelineSonarIfNeeded(
+            Map<String, Object> sonar,
+            Map<String, Object> storedGate,
             Map<String, Object> summary
     ) {
-        if (ciVerdict != null) {
-            return new VerdictResolution(ciVerdict, "CI");
+        if (isSonarLiveAvailable(sonar)) {
+            return sonar;
         }
-        if (securityScore != null && securityScore.getDerivedVerdict() != null) {
-            return new VerdictResolution(securityScore.getDerivedVerdict(), "SCORE");
+        Map<String, Object> pipeline = buildSonarFromPipelineArtifacts(storedGate, summary);
+        if (pipeline.isEmpty()) {
+            return sonar != null ? sonar : Map.of();
         }
-        boolean blocking = stages.stream().anyMatch(s -> s.isBlocking() && "FAIL".equals(s.getStatus()));
-        if (blocking || intVal(summary.get("secrets")) > 0) {
-            return new VerdictResolution("NOT_RECOMMENDED", "MERGED");
+
+        Map<String, Object> merged = new LinkedHashMap<>();
+        if (sonar != null) {
+            merged.putAll(sonar);
         }
-        if (stages.stream().anyMatch(s -> "WARN".equals(s.getStatus()))) {
-            return new VerdictResolution("WITH_WARNINGS", "MERGED");
+
+        Object existingMetrics = merged.get("metrics");
+        Object pipelineMetrics = pipeline.get("metrics");
+        if (existingMetrics instanceof Map<?, ?> em && pipelineMetrics instanceof Map<?, ?> pm) {
+            Map<String, Object> m = new LinkedHashMap<>((Map<String, Object>) em);
+            ((Map<String, Object>) pm).forEach(m::putIfAbsent);
+            merged.put("metrics", m);
+            pipeline.forEach((k, v) -> { if (!"metrics".equals(k)) merged.put(k, v); });
+        } else {
+            merged.putAll(pipeline);
         }
-        return new VerdictResolution("RECOMMENDED", "MERGED");
+
+        merged.put("sonar_available", true);
+        merged.put("sonar_source", "PIPELINE");
+
+        String resolvedBranch = stringVal(merged.get("branch"));
+        if (isBlankStr(resolvedBranch)) {
+            resolvedBranch = stringVal(merged.get("requested_branch"));
+        }
+        merged.put("branch_resolution",
+                com.backend.devsecopsplatform_backend.service.SonarBranchResolution.builder()
+                        .sonarReachable(true)
+                        .resolvedBranch(resolvedBranch)
+                        .requestedBranch(resolvedBranch)
+                        .availableBranches(isBlankStr(resolvedBranch) ? List.of() : List.of(resolvedBranch))
+                        .build());
+
+        return merged;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> buildSonarFromPipelineArtifacts(
+            Map<String, Object> storedGate,
+            Map<String, Object> summary
+    ) {
+        Map<String, Object> metrics = new LinkedHashMap<>();
+        String qgStatus = null;
+
+        if (storedGate != null) {
+            qgStatus = firstNonBlank(
+                    stringVal(storedGate.get("sonarQualityGate")),
+                    stringVal(storedGate.get("sonar_quality_gate")));
+            copyIntMetric(metrics, "blocker_violations", storedGate.get("sonarBlockers"), storedGate.get("sonar_blockers"));
+            copyIntMetric(metrics, "critical_violations", storedGate.get("sonarCriticals"), storedGate.get("sonar_criticals"));
+            copyIntMetric(metrics, "bugs", storedGate.get("sonarBugs"));
+            copyIntMetric(metrics, "vulnerabilities", storedGate.get("sonarVulnerabilities"));
+            copyIntMetric(metrics, "security_hotspots", storedGate.get("sonarHotspots"));
+            copyIntMetric(metrics, "ncloc", storedGate.get("sonarNcloc"), storedGate.get("sonar_ncloc"));
+        }
+
+        if (summary != null && summary.get("sonar") instanceof Map<?, ?> sonarSection) {
+            Map<String, Object> s = (Map<String, Object>) sonarSection;
+            if (qgStatus == null) {
+                qgStatus = firstNonBlank(
+                        stringVal(s.get("quality_gate")),
+                        stringVal(s.get("quality_gate_status")));
+            }
+            copyIntMetric(metrics, "blocker_violations", s.get("blocker_violations"), s.get("blockers"));
+            copyIntMetric(metrics, "critical_violations", s.get("critical_violations"), s.get("criticals"));
+            copyIntMetric(metrics, "major_violations", s.get("major_violations"), s.get("majors"));
+            copyIntMetric(metrics, "minor_violations", s.get("minor_violations"), s.get("minors"));
+            copyIntMetric(metrics, "bugs", s.get("bugs"));
+            copyIntMetric(metrics, "vulnerabilities", s.get("vulnerabilities"));
+            copyIntMetric(metrics, "code_smells", s.get("code_smells"));
+            copyIntMetric(metrics, "security_hotspots", s.get("hotspots"), s.get("security_hotspots"));
+            copyIntMetric(metrics, "ncloc", s.get("ncloc"));
+            if (s.get("coverage") != null) {
+                metrics.putIfAbsent("coverage", s.get("coverage"));
+            }
+        }
+
+        boolean hasQg = qgStatus != null && !qgStatus.isBlank() && !"N/A".equalsIgnoreCase(qgStatus);
+        boolean hasMetrics = metrics.values().stream().anyMatch(v -> intVal(v) > 0 || (v != null && !String.valueOf(v).isBlank()));
+        if (!hasQg && !hasMetrics) {
+            return Map.of();
+        }
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        if (!metrics.isEmpty()) {
+            result.put("metrics", metrics);
+        }
+        if (hasQg) {
+            Map<String, Object> qg = new LinkedHashMap<>();
+            qg.put("status", normalizeSonarQgStatus(qgStatus));
+            result.put("quality_gate", qg);
+        }
+        return result;
+    }
+
+    private String normalizeSonarQgStatus(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return raw;
+        }
+        return switch (raw.trim().toUpperCase(Locale.ROOT)) {
+            case "PASSED", "PASS", "OK" -> "OK";
+            case "FAILED", "FAIL", "ERROR" -> "ERROR";
+            default -> raw.trim();
+        };
+    }
+
+    private void copyIntMetric(Map<String, Object> target, String key, Object... candidates) {
+        for (Object c : candidates) {
+            if (c == null) continue;
+            int v = intVal(c);
+            if (v >= 0 && (v > 0 || target.get(key) == null)) {
+                target.put(key, v);
+                if (v > 0) return;
+            }
+        }
+    }
+
+    private String firstNonBlank(String... values) {
+        if (values == null) return null;
+        for (String v : values) {
+            if (v != null && !v.isBlank() && !"N/A".equalsIgnoreCase(v)) {
+                return v;
+            }
+        }
+        return null;
     }
 
     private List<String> buildVerdictExplanation(
             List<QualityGateStageDto> stages,
             Map<String, Object> summary,
             Map<String, Integer> bySeverity,
+            List<HardGateViolationDto> hardGateViolations,
+            List<String> indeterminateSources,
             String verdict,
             Map<String, Object> sonarFlat,
             SecurityScoreDto securityScore
     ) {
         List<String> lines = new ArrayList<>();
+
+        if ("INDETERMINE".equals(verdict) && indeterminateSources != null && !indeterminateSources.isEmpty()) {
+            lines.add("Impossible de garantir l'absence de vulnérabilité critique : "
+                    + String.join(", ", indeterminateSources)
+                    + " n'a/ont pas répondu. Relancez le service et actualisez.");
+            return lines;
+        }
+
+        if (hardGateViolations != null && !hardGateViolations.isEmpty()) {
+            lines.add("Hard gates violés — déploiement bloqué :");
+            for (HardGateViolationDto v : hardGateViolations) {
+                lines.add("• " + v.getLabel() + " → " + v.getMessage());
+            }
+        }
+
         List<QualityGateStageDto> blocking = stages.stream()
                 .filter(s -> s.isBlocking() && "FAIL".equals(s.getStatus()))
                 .toList();
 
         if (!blocking.isEmpty()) {
-            lines.add("Votre pipeline a " + blocking.size() + " violation(s) bloquante(s) :");
+            lines.add("Seuils dépassés en échec (n'affecte pas le verdict si non hard gate) :");
             for (QualityGateStageDto s : blocking) {
-                lines.add("• " + s.getToolLabel() + " → " + s.getMessage());
+                lines.add("• " + s.getName() + " (" + s.getToolLabel() + ") → " + s.getMessage());
             }
-        } else if ("NOT_RECOMMENDED".equals(verdict)) {
-            lines.add("Le déploiement est bloqué par le verdict CI security-validation.");
         }
 
         int highTotal = bySeverity.getOrDefault("high", 0);
         int medTotal = bySeverity.getOrDefault("medium", 0);
         if (highTotal > 0 || medTotal > 0) {
             lines.add(String.format(
-                    "Vous avez %d vulnérabilité(s) élevée(s) et %d moyenne(s) au total — elles contribuent à l'alerte même si chaque seuil outil n'est pas dépassé individuellement.",
+                    "%d vulnérabilité(s) élevée(s) et %d moyenne(s) contribuent au score de posture.",
                     highTotal, medTotal));
-        }
-
-        long warns = stages.stream().filter(s -> "WARN".equals(s.getStatus())).count();
-        if (warns > 0) {
-            lines.add(warns + " étape(s) en avertissement (seuils intermédiaires ou findings non bloquants).");
         }
 
         if (securityScore != null) {
             lines.add(String.format(
-                    "Score de posture : %d/100 (note %s) — pénalités basées sur DefectDojo uniquement ; SonarQube contribue via ratings et Quality Gate.",
+                    "Score de posture : %d/100 (note %s) — basé sur la densité des findings (DefectDojo) et les ratings SonarQube.",
                     securityScore.getScore(), securityScore.getGrade()));
-        }
-
-        String qgStatus = stringVal(sonarFlat.get("quality_gate_status"));
-        if ("OK".equalsIgnoreCase(qgStatus) && securityScore != null && securityScore.getScore() < 75) {
-            lines.add("Quality Gate Sonar OK mais score global < 75 — des findings DefectDojo ou des ratings Sonar pénalisent la posture.");
         }
 
         if (lines.isEmpty()) {
             if ("RECOMMENDED".equals(verdict)) {
-                lines.add("Tous les seuils bloquants sont respectés — aucune violation critique détectée.");
+                lines.add("Tous les hard gates sont respectés — aucune violation bloquante détectée.");
             } else {
-                lines.add("Analyse basée sur DefectDojo, le dernier summary CI et SonarQube.");
+                lines.add("Analyse basée sur les données live DefectDojo, SonarQube et le pipeline.");
             }
         }
         return lines;
@@ -2343,30 +2696,39 @@ public class QualityGateService {
                 advice.add("1. Aucune action bloquante — vous pouvez déployer cette version en environnement éphémère.");
             } else if ("WITH_WARNINGS".equals(verdict)) {
                 advice.add("1. Déploiement possible avec surveillance ; planifiez les corrections avant la production.");
+            } else if ("INDETERMINE".equals(verdict)) {
+                advice.add("1. Relancez les services indisponibles (DefectDojo, SonarQube) puis cliquez « Actualiser ».");
             } else {
-                advice.add("1. Ne pas déployer tant que les étapes bloquantes ne sont pas corrigées et le pipeline repassé au vert.");
+                advice.add("1. Corrigez les hard gates violés puis relancez le pipeline.");
             }
         }
         return advice;
     }
 
     private String buildScoringNote() {
-        return "Score de posture 0–100 (note A–E) : pénalités de sévérité uniquement depuis DefectDojo "
-                + "(Critical −8, High −3, Medium −1, Low −0,25) — les vulnérabilités SonarQube ne sont pas re-comptées "
-                + "pour éviter le double comptage avec Semgrep/Trivy. SonarQube contribue via ratings Security/Reliability, "
-                + "Quality Gate ERROR (plafond 60), couverture et hotspots. "
-                + "Seuils CI : SCA critique ≤ " + QualityGateThresholds.SCA_CRITICAL
-                + ", container critique ≤ " + QualityGateThresholds.CONTAINER_CRITICAL
-                + " (lus depuis summary.json si ingéré). "
-                + "Le verdict security-validation reste prioritaire sur le score quand il est disponible.";
+        return "Décision en deux niveaux : (1) hard gates déterministes — secrets Gitleaks, "
+                + "vulnérabilités Critical DefectDojo, issues Blocker SonarQube, Quality Gate Sonar ERROR "
+                + "(indéterminé si la source est indisponible) ; "
+                + "(2) score de posture informatif (densité / 1000 LOC via ncloc SonarQube) "
+                + "uniquement si tous les hard gates passent — départage RECOMMENDED vs WITH_WARNINGS. "
+                + "Le verdict CI security-validation n'est pas utilisé pour la décision.";
     }
 
     private String buildSummaryText(
             String verdict,
             Map<String, Integer> bySeverity,
             List<QualityGateStageDto> stages,
-            SecurityScoreDto securityScore
+            SecurityScoreDto securityScore,
+            SecurityScoringService.HardGateEvaluation hardGates,
+            String incompleteMessage
     ) {
+        if ("INDETERMINE".equals(verdict) && incompleteMessage != null) {
+            return incompleteMessage;
+        }
+        if ("NOT_RECOMMENDED".equals(verdict) && hardGates != null && hardGates.summaryMessage() != null) {
+            return hardGates.summaryMessage();
+        }
+
         int total = bySeverity.values().stream().mapToInt(Integer::intValue).sum();
         long blocking = stages.stream().filter(s -> s.isBlocking() && "FAIL".equals(s.getStatus())).count();
         long warn = stages.stream().filter(s -> "WARN".equals(s.getStatus())).count();
@@ -2375,19 +2737,19 @@ public class QualityGateService {
         int med = bySeverity.getOrDefault("medium", 0);
 
         String verdictFr = switch (verdict) {
-            case "RECOMMENDED" -> "RECOMMANDÉ";
-            case "WITH_WARNINGS" -> "AVEC AVERTISSEMENTS";
-            case "NOT_RECOMMENDED" -> "NON RECOMMANDÉ";
-            default -> "INCONNU";
+            case "RECOMMENDED" -> "Déployable";
+            case "WITH_WARNINGS" -> "Déployable avec surveillance";
+            case "NOT_RECOMMENDED" -> "Déploiement bloqué";
+            case "INDETERMINE" -> "Vérification incomplète";
+            default -> "Inconnu";
         };
 
-        String deployLine = "NOT_RECOMMENDED".equals(verdict) ? " — DÉPLOIEMENT BLOQUÉ" : "";
         String scorePart = securityScore != null
-                ? String.format(" · Score %d/100 (%s)", securityScore.getScore(), securityScore.getGrade())
+                ? String.format(" · Score posture %d/100 (%s)", securityScore.getScore(), securityScore.getGrade())
                 : "";
         return String.format(
-                "%s%s%s — %d vulnérabilité(s) ouvertes · %d critiques · %d élevées · %d moyennes — ❌ %d stage(s) bloquant(s) · ⚠️ %d avertissement(s)",
-                verdictFr, deployLine, scorePart, total, crit, high, med, blocking, warn
+                "%s%s — %d vulnérabilité(s) ouvertes · %d critiques · %d élevées · %d moyennes — %d seuil(s) dépassé(s) · %d avertissement(s)",
+                verdictFr, scorePart, total, crit, high, med, blocking, warn
         );
     }
 

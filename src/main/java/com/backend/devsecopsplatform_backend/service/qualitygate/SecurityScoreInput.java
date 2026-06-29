@@ -30,4 +30,7 @@ public class SecurityScoreInput {
 
     private List<QualityGateStageDto> stages;
     private boolean sonarAvailable;
+    private boolean defectDojoAvailable;
+    private int sonarBlockers;
+    private int ncloc;
 }

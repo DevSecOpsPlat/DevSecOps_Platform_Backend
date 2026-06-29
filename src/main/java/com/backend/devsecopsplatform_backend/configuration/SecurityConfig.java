@@ -95,7 +95,9 @@ public class SecurityConfig {
                         // Snapshot pipeline CI (secret partagé, sans JWT)
                         .requestMatchers(HttpMethod.POST,
                                 "/api/quality-gate/internal/snapshot",
-                                "/projet/api/quality-gate/internal/snapshot").permitAll()
+                                "/projet/api/quality-gate/internal/snapshot",
+                                "/api/security-gate",
+                                "/projet/api/security-gate").permitAll()
                         // Quality Gate (recommandation de déploiement par branche)
                         .requestMatchers("/api/quality-gate/**", "/projet/api/quality-gate/**").authenticated()
                         // API Reports (PDF export)

@@ -62,4 +62,8 @@ public class QualityGateSnapshot {
     @JdbcTypeCode(SqlTypes.JSON)
     @Column(name = "payload", nullable = false, columnDefinition = "jsonb")
     private Map<String, Object> payload;
+
+    /** ncloc SonarQube au moment du snapshot (denormalisé pour affichage / requêtes). */
+    @Column(name = "ncloc")
+    private Integer ncloc;
 }
