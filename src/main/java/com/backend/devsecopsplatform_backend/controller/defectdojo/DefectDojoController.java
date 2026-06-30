@@ -70,14 +70,31 @@ public class DefectDojoController {
         }
     }
 
-    @GetMapping("/dashboard")
-    public ResponseEntity<DefectDojoDashboardResponse> dashboard(
+    @GetMapping("/dashboard/charts")
+    public ResponseEntity<DefectDojoDashboardCharts> dashboardCharts(
             @RequestParam UUID applicationId,
             @RequestParam(required = false) String branch,
             @RequestParam(required = false) String tags
     ) {
         try {
-            return ResponseEntity.ok(defectDojoService.getDashboard(applicationId, branch, tags));
+            return ResponseEntity.ok(defectDojoService.getDashboardCharts(applicationId, branch, tags));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().build();
+        } catch (Exception e) {
+            log.error("Erreur graphiques dashboard DefectDojo app={} branch={}", applicationId, branch, e);
+            return ResponseEntity.internalServerError().build();
+        }
+    }
+
+    @GetMapping("/dashboard")
+    public ResponseEntity<DefectDojoDashboardResponse> dashboard(
+            @RequestParam UUID applicationId,
+            @RequestParam(required = false) String branch,
+            @RequestParam(required = false) String tags,
+            @RequestParam(defaultValue = "true") boolean includeCharts
+    ) {
+        try {
+            return ResponseEntity.ok(defectDojoService.getDashboard(applicationId, branch, tags, includeCharts));
         } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest().build();
         } catch (Exception e) {
