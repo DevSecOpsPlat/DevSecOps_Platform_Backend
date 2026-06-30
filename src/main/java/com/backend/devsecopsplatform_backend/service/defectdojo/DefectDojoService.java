@@ -49,6 +49,7 @@ public class DefectDojoService {
     private final EphemeralEnvironmentRepository environmentRepository;
     private final UserRepository userRepository;
     private final SourceSnippetFetcherService sourceSnippetFetcherService;
+    private final DefectDojoHttpClientFactory httpClientFactory;
 
     private record EngagementContext(
             Application application,
@@ -859,12 +860,13 @@ public class DefectDojoService {
         String baseUrl = properties.normalizedBaseUrl();
         if (lastApiError != null && !lastApiError.isBlank()) {
             return "Connexion DefectDojo impossible (" + baseUrl + ") : " + lastApiError
-                    + ". Vérifiez DEFECTDOJO_URL et DEFECTDOJO_TOKEN puis redémarrez le backend.";
+                    + ". Vérifiez que DEFECTDOJO_URL du backend est identique à GitLab CI "
+                    + "(https://votre-tunnel.trycloudflare.com, sans slash final), redémarrez le backend.";
         }
         JsonNode all = get("/api/v2/products/", Map.of("limit", "50", "ordering", "name"));
         if (all == null) {
             return "DefectDojo ne répond pas à " + baseUrl
-                    + ". Vérifiez ngrok, le token API, et redémarrez le backend.";
+                    + ". Vérifiez le tunnel Cloudflare/ngrok, le token API, et redémarrez le backend.";
         }
         List<String> names = new ArrayList<>();
         for (JsonNode item : all.path("results")) {
@@ -1576,13 +1578,15 @@ public class DefectDojoService {
             headers.setAccept(List.of(MediaType.APPLICATION_JSON));
             headers.set("Authorization", properties.authorizationHeaderValue());
             headers.set("User-Agent", "EnviroTest-Backend/1.0");
-            if (properties.normalizedBaseUrl().contains("ngrok")) {
+            if (properties.normalizedBaseUrl().contains("ngrok")
+                    || properties.normalizedBaseUrl().contains("trycloudflare.com")) {
                 headers.set("Ngrok-Skip-Browser-Warning", "true");
             }
 
-            RestTemplate rest = new RestTemplate();
+            RestTemplate rest = httpClientFactory.create(properties.isInsecureSsl());
+            var uri = builder.build(true).toUri();
             ResponseEntity<JsonNode> resp = rest.exchange(
-                    builder.build(true).toUri(),
+                    uri,
                     HttpMethod.GET,
                     new HttpEntity<>(headers),
                     JsonNode.class
@@ -1590,11 +1594,14 @@ public class DefectDojoService {
             return resp.getBody();
         } catch (HttpStatusCodeException e) {
             lastApiError = e.getStatusCode() + " — " + truncate(e.getResponseBodyAsString(), 200);
-            log.warn("DefectDojo API {} → {} : {}", path, e.getStatusCode(), e.getResponseBodyAsString());
+            log.warn("DefectDojo API {} → {} (host={}) : {}", path, e.getStatusCode(),
+                    properties.hostForLog(), e.getResponseBodyAsString());
             return null;
         } catch (Exception e) {
             lastApiError = e.getMessage();
-            log.warn("DefectDojo API {} error: {}", path, e.getMessage());
+            log.warn("DefectDojo API {} error (host={}, url={}): {} — "
+                            + "Vérifiez DEFECTDOJO_URL backend = même URL que GitLab CI (tunnel Cloudflare https://...)",
+                    path, properties.hostForLog(), properties.normalizedBaseUrl(), e.getMessage());
             return null;
         }
     }

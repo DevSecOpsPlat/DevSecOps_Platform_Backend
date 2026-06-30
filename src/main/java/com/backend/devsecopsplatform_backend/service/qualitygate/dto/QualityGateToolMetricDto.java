@@ -26,4 +26,6 @@ public class QualityGateToolMetricDto {
     private String stageStatus;
     private String stageName;
     private String stageLabel;
+    /** false si le job GitLab n'a pas produit de rapport fiable (non exécuté ou échec sans données). */
+    private Boolean evaluable;
 }

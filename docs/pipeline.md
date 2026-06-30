@@ -1086,13 +1086,6 @@ security-validation:
         SONAR_MAJORS=$(get_metric "major_violations")
         SONAR_MINORS=$(get_metric "minor_violations")
 
-        # Software Quality metrics (SonarQube 10+)
-        SONAR_SQ_SECURITY=$(get_metric "software_quality_security_issues")
-        SONAR_SQ_RELIABILITY=$(get_metric "software_quality_reliability_issues")
-        SONAR_SQ_MAINTAINABILITY=$(get_metric "software_quality_maintainability_issues")
-        SONAR_SQ_SECURITY_HIGH=$(get_metric "software_quality_high_severity_issues")
-        SONAR_SQ_SECURITY_MEDIUM=$(get_metric "software_quality_medium_severity_issues")
-        SONAR_SQ_SECURITY_LOW=$(get_metric "software_quality_low_severity_issues")
 
         rating_label() {
           case "$1" in
@@ -1104,10 +1097,6 @@ security-validation:
         SONAR_SECURITY_RATING=$(rating_label "$(get_metric 'security_rating')")
         SONAR_MAINTAINABILITY_RATING=$(rating_label "$(get_metric 'sqale_rating')")
 
-        # Software Quality ratings (SonarQube 10+)
-        SONAR_SQ_SECURITY_RATING=$(rating_label "$(get_metric 'software_quality_security_rating')")
-        SONAR_SQ_RELIABILITY_RATING=$(rating_label "$(get_metric 'software_quality_reliability_rating')")
-        SONAR_SQ_MAINTAINABILITY_RATING=$(rating_label "$(get_metric 'software_quality_maintainability_rating')")
 
         [ "$SONAR_COVERAGE" != "N/A" ]    && SONAR_COVERAGE="${SONAR_COVERAGE}%"
         [ "$SONAR_DUPLICATIONS" != "N/A" ] && SONAR_DUPLICATIONS="${SONAR_DUPLICATIONS}%"
@@ -1203,9 +1192,7 @@ security-validation:
         echo "│   SOFTWARE QUALITY (nouveau modele SonarQube 10+)        │"
         echo "│   ─────────────────────────────────────────────────────── │"
         printf "│   %-30s %10s                │\n" "Security issues"        "$SONAR_SQ_SECURITY_ISSUES"
-        printf "│   %-30s %10s                │\n" "  dont High"            "$SONAR_SQ_HIGH"
-        printf "│   %-30s %10s                │\n" "  dont Medium"          "$SONAR_SQ_MEDIUM"
-        printf "│   %-30s %10s                │\n" "  dont Low"             "$SONAR_SQ_LOW"
+      
         printf "│   %-30s %10s                │\n" "Reliability issues"     "$SONAR_SQ_RELIABILITY_ISSUES"
         printf "│   %-30s %10s                │\n" "Maintainability issues" "$SONAR_SQ_MAINTAINABILITY_ISSUES"
         echo "│   ─────────────────────────────────────────────────────── │"
@@ -1343,61 +1330,101 @@ security-validation:
 
       echo "$RECOMMENDATION" > final-report/recommendation.txt
 
+    # ── Enrichir summary.json avec métriques Sonar (avant notification backend) ──
+    - |
+      if [ -f final-report/summary.json ] && [ "$SONAR_AVAILABLE" = "true" ]; then
+        # Ratings SQ : fallback sur les ratings classiques si l'API SQ rating renvoie N/A
+        [ "$SONAR_SQ_SECURITY_RATING" = "N/A" ] && SONAR_SQ_SECURITY_RATING="${SONAR_SECURITY_RATING}"
+        [ "$SONAR_SQ_RELIABILITY_RATING" = "N/A" ] && SONAR_SQ_RELIABILITY_RATING="${SONAR_RELIABILITY_RATING}"
+        [ "$SONAR_SQ_MAINTAINABILITY_RATING" = "N/A" ] && SONAR_SQ_MAINTAINABILITY_RATING="${SONAR_MAINTAINABILITY_RATING}"
+        sq_to_json_num() {
+          case "$1" in ''|N/A|n/a|null) echo 0 ;; *) echo "$1" ;; esac
+        }
+        sq_rating_num() {
+          case "$1" in A) echo 1;; B) echo 2;; C) echo 3;; D) echo 4;; E) echo 5;; *) echo 0;; esac
+        }
+        tmp=$(mktemp)
+        jq --arg qg "${SONAR_QUALITY_GATE:-N/A}" \
+          --argjson blockers "$(sq_to_json_num "${SONAR_BLOCKERS}")" \
+          --argjson criticals "$(sq_to_json_num "${SONAR_CRITICALS}")" \
+          --argjson majors "$(sq_to_json_num "${SONAR_MAJORS}")" \
+          --argjson minors "$(sq_to_json_num "${SONAR_MINORS}")" \
+          --argjson bugs "$(sq_to_json_num "${SONAR_BUGS}")" \
+          --argjson vulns "$(sq_to_json_num "${SONAR_VULNERABILITIES}")" \
+          --argjson hotspots "$(sq_to_json_num "${SONAR_SECURITY_HOTSPOTS}")" \
+          --argjson ncloc "$(sq_to_json_num "${SONAR_NCLOC}")" \
+          --argjson sqSec "$(sq_to_json_num "${SONAR_SQ_SECURITY_ISSUES}")" \
+          --argjson sqRel "$(sq_to_json_num "${SONAR_SQ_RELIABILITY_ISSUES}")" \
+          --argjson sqMaint "$(sq_to_json_num "${SONAR_SQ_MAINTAINABILITY_ISSUES}")" \
+          --argjson sqSecRate "$(sq_rating_num "${SONAR_SQ_SECURITY_RATING}")" \
+          --argjson sqRelRate "$(sq_rating_num "${SONAR_SQ_RELIABILITY_RATING}")" \
+          --argjson sqMaintRate "$(sq_rating_num "${SONAR_SQ_MAINTAINABILITY_RATING}")" \
+          --arg secRate "${SONAR_SECURITY_RATING:-N/A}" \
+          --arg relRate "${SONAR_RELIABILITY_RATING:-N/A}" \
+          --arg maintRate "${SONAR_MAINTAINABILITY_RATING:-N/A}" \
+          '. + {sonar: ((.sonar // {}) + {
+            quality_gate: $qg,
+            blocker_violations: $blockers,
+            critical_violations: $criticals,
+            major_violations: $majors,
+            minor_violations: $minors,
+            bugs: $bugs,
+            vulnerabilities: $vulns,
+            hotspots: $hotspots,
+            ncloc: $ncloc,
+            software_quality_security_issues: $sqSec,
+            software_quality_reliability_issues: $sqRel,
+            software_quality_maintainability_issues: $sqMaint,
+            software_quality_security_rating: $sqSecRate,
+            software_quality_reliability_rating: $sqRelRate,
+            software_quality_maintainability_rating: $sqMaintRate,
+            security_rating: $secRate,
+            reliability_rating: $relRate,
+            sqale_rating: $maintRate
+          })}' final-report/summary.json > "$tmp" \
+          && mv "$tmp" final-report/summary.json
+        echo "summary.json enrichi — sonar + software quality (sec=${SONAR_SQ_SECURITY_ISSUES} rel=${SONAR_SQ_RELIABILITY_ISSUES} maint=${SONAR_SQ_MAINTAINABILITY_ISSUES})"
+      fi
     # ── 6. Notification backend ───────────────────────────────────
     - |
       if [ -n "$BACKEND_URL" ] && [ -n "$PIPELINE_SECRET" ]; then
         RECOMMENDATION=$(cat final-report/recommendation.txt)
+        SUMMARY_JSON=$(cat final-report/summary.json | jq -c .)
         curl -s -X POST "${BACKEND_URL}/projet/api/security-gate" \
           -H "Content-Type: application/json" \
           -H "X-Pipeline-Secret: ${PIPELINE_SECRET}" \
           -d "{
             \"environment_id\":        \"$ENVIRONMENT_ID\",
+            \"pipeline_id\":           \"$CI_PIPELINE_ID\",
             \"recommendation\":        \"$RECOMMENDATION\",
-            \"git_branch\":            \"$GIT_BRANCH\",
-            \"critical\":              $SCA_CRITICAL,
-            \"high\":                  $SCA_HIGH,
-            \"secrets\":               $SECRETS,
-            \"container_critical\":    $CONTAINER_CRITICAL,
-            \"dast_high\":             $DAST_HIGH,
-            \"sonar_quality_gate\":    \"$SONAR_QUALITY_GATE\",
-            \"sonar_bugs\":            \"$SONAR_BUGS\",
-            \"sonar_vulnerabilities\": \"$SONAR_VULNERABILITIES\",
-            \"sonar_hotspots\":        \"$SONAR_SECURITY_HOTSPOTS\",
-            \"sonar_coverage\":        \"$SONAR_COVERAGE\",
-            \"sonar_security_rating\": \"$SONAR_SECURITY_RATING\",
-            \"sonar_blockers\":        \"${SONAR_BLOCKERS:-0}\",
-            \"sonar_criticals\":       \"${SONAR_CRITICALS:-0}\",
-            \"sonar_ncloc\":           \"${SONAR_NCLOC:-0}\"
+            \"critical\":              ${SCA_CRITICAL:-0},
+            \"high\":                  ${SCA_HIGH:-0},
+            \"sca_medium\":            ${SCA_MEDIUM:-0},
+            \"sca_low\":               ${SCA_LOW:-0},
+            \"secrets\":               ${SECRETS:-0},
+            \"container_critical\":    ${CONTAINER_CRITICAL:-0},
+            \"container_high\":        ${CONTAINER_HIGH:-0},
+            \"semgrep_high\":          ${SEMGREP_HIGH:-0},
+            \"semgrep_medium\":        ${SEMGREP_MEDIUM:-0},
+            \"semgrep_info\":          ${SEMGREP_INFO:-0},
+            \"hadolint_errors\":       ${HADOLINT:-0},
+            \"checkov_failed\":        ${CHECKOV_FAILED:-0},
+            \"dast_high\":             ${DAST_HIGH:-0},
+            \"dast_medium\":           ${DAST_MEDIUM:-0},
+            \"dast_low\":              ${DAST_LOW:-0},
+            \"sonar_quality_gate\":    \"${SONAR_QUALITY_GATE:-N/A}\",
+            \"sonar_bugs\":            ${SONAR_BUGS:-0},
+            \"sonar_vulnerabilities\": ${SONAR_VULNERABILITIES:-0},
+            \"sonar_hotspots\":        ${SONAR_SECURITY_HOTSPOTS:-0},
+            \"sonar_coverage\":        \"${SONAR_COVERAGE:-0}\",
+            \"sonar_security_rating\": \"${SONAR_SECURITY_RATING:-N/A}\",
+            \"sonar_blockers\":        ${SONAR_BLOCKERS:-0},
+            \"sonar_criticals\":       ${SONAR_CRITICALS:-0},
+            \"sonar_ncloc\":           ${SONAR_NCLOC:-0},
+            \"summary\":               $SUMMARY_JSON
           }" || echo "Backend notification failed (non-blocking)"
       elif [ -n "$BACKEND_URL" ]; then
         echo "BACKEND_URL défini mais PIPELINE_SECRET manquant — ingestion security-gate ignorée"
-      fi
-    # ── Enrichir summary.json avec métriques Sonar (snapshot / fallback backend) ──
-    - |
-      if [ -f final-report/summary.json ] && [ "$SONAR_AVAILABLE" = "true" ]; then
-        tmp=$(mktemp)
-        jq --arg qg "${SONAR_QUALITY_GATE:-N/A}" \
-           --argjson blockers "${SONAR_BLOCKERS:-0}" \
-           --argjson criticals "${SONAR_CRITICALS:-0}" \
-           --argjson majors "${SONAR_MAJORS:-0}" \
-           --argjson minors "${SONAR_MINORS:-0}" \
-           --argjson bugs "${SONAR_BUGS:-0}" \
-           --argjson vulns "${SONAR_VULNERABILITIES:-0}" \
-           --argjson hotspots "${SONAR_SECURITY_HOTSPOTS:-0}" \
-           --argjson ncloc "${SONAR_NCLOC:-0}" \
-           '. + {sonar: ((.sonar // {}) + {
-             quality_gate: $qg,
-             blocker_violations: $blockers,
-             critical_violations: $criticals,
-             major_violations: $majors,
-             minor_violations: $minors,
-             bugs: $bugs,
-             vulnerabilities: $vulns,
-             hotspots: $hotspots,
-             ncloc: $ncloc
-           })}' final-report/summary.json > "$tmp" \
-          && mv "$tmp" final-report/summary.json
-        echo "summary.json enrichi — sonar (QG=$SONAR_QUALITY_GATE, blockers=$SONAR_BLOCKERS, ncloc=$SONAR_NCLOC)"
       fi
     # ── 7. Capture automatique snapshot Quality Gate ─────────────
     - |

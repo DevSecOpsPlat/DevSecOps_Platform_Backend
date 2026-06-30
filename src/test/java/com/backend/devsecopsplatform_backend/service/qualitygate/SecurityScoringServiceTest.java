@@ -18,6 +18,7 @@ class SecurityScoringServiceTest {
     void hardGate_secretsBlockImmediately() {
         HardGateInput input = HardGateInput.builder()
                 .secrets(2)
+                .secretsEvaluable(true)
                 .ddCritical(0)
                 .sonarBlockers(0)
                 .defectDojoAvailable(true)
@@ -29,9 +30,22 @@ class SecurityScoringServiceTest {
     }
 
     @Test
+    void hardGate_secretsNotEvaluableIsIndeterminate() {
+        HardGateInput input = HardGateInput.builder()
+                .secrets(0)
+                .secretsEvaluable(false)
+                .defectDojoAvailable(true)
+                .sonarAvailable(true)
+                .build();
+        var eval = service.evaluateHardGates(input);
+        assertTrue(eval.indeterminate().stream().anyMatch(v -> "secrets".equals(v.getId())));
+    }
+
+    @Test
     void hardGate_defectDojoUnavailableIsIndeterminate() {
         HardGateInput input = HardGateInput.builder()
                 .secrets(0)
+                .secretsEvaluable(true)
                 .defectDojoAvailable(false)
                 .sonarAvailable(true)
                 .build();

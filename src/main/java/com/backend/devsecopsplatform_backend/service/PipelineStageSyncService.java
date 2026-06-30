@@ -141,7 +141,7 @@ public class PipelineStageSyncService {
             log.info("✅ Stages synchronisés en BDD pour le pipeline #{} ({} jobs)", pipelineId, stagesJson.get("totalJobs"));
 
             if (newStatus != null && newStatus.isFinished()) {
-                qualityGateService.captureSnapshotIfAbsent(execution);
+                qualityGateService.captureSnapshotAfterStagesSync(execution);
             }
             return true;
         } catch (Exception e) {

@@ -1,8 +1,10 @@
 package com.backend.devsecopsplatform_backend.controller.qualitygate;
 
 import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
+import com.backend.devsecopsplatform_backend.service.PipelineStageSyncService;
 import com.backend.devsecopsplatform_backend.service.finding.FindingIngestionService;
 import com.backend.devsecopsplatform_backend.service.qualitygate.QualityGateService;
+import com.backend.devsecopsplatform_backend.service.qualitygate.SnapshotCaptureRejectedException;
 import com.backend.devsecopsplatform_backend.service.qualitygate.dto.QualityGateEnvironmentOptionDto;
 import com.backend.devsecopsplatform_backend.service.qualitygate.dto.QualityGateResultDto;
 import com.backend.devsecopsplatform_backend.service.qualitygate.dto.QualityGateSnapshotHistoryItemDto;
@@ -27,6 +29,7 @@ public class QualityGateController {
     private final QualityGateService qualityGateService;
     private final FindingIngestionService findingIngestionService;
     private final PipelineExecutionRepository pipelineExecutionRepository;
+    private final PipelineStageSyncService pipelineStageSyncService;
 
     @Value("${pipeline.secret}")
     private String pipelineSecret;
@@ -47,6 +50,9 @@ public class QualityGateController {
             @RequestParam(required = false, defaultValue = "false") boolean refresh
     ) {
         try {
+            if (environmentId != null) {
+                syncStagesForEnvironment(applicationId, environmentId);
+            }
             return ResponseEntity.ok(qualityGateService.getForApplication(
                     applicationId, branch, environmentId, refresh, snapshotId));
         } catch (IllegalArgumentException e) {
@@ -64,9 +70,10 @@ public class QualityGateController {
     @PostMapping("/ai-insight")
     public ResponseEntity<Map<String, String>> aiInsight(
             @RequestParam UUID applicationId,
-            @RequestParam(required = false) String branch
+            @RequestParam(required = false) String branch,
+            @RequestParam(required = false) UUID environmentId
     ) {
-        String insight = qualityGateService.generateAiInsight(applicationId, branch);
+        String insight = qualityGateService.generateAiInsight(applicationId, branch, environmentId);
         if (insight == null || insight.isBlank()) {
             return ResponseEntity.ok(Map.of(
                     "insight", "",
@@ -91,6 +98,7 @@ public class QualityGateController {
             @RequestParam UUID environmentId
     ) {
         try {
+            syncStagesForEnvironment(applicationId, environmentId);
             var executionOpt = pipelineExecutionRepository
                     .findByEnvironmentIdAndApplicationId(environmentId, applicationId);
             if (executionOpt.isPresent() && executionOpt.get().getGitlabPipelineId() != null) {
@@ -102,6 +110,8 @@ public class QualityGateController {
                 }
             }
             return ResponseEntity.ok(qualityGateService.captureSnapshotViaApi(applicationId, environmentId));
+        } catch (SnapshotCaptureRejectedException e) {
+            return ResponseEntity.status(409).body(Map.of("message", e.getMessage()));
         } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest().body(Map.of("message", e.getMessage()));
         } catch (Exception e) {
@@ -127,7 +137,14 @@ public class QualityGateController {
                     .ifPresent(execution -> {
                         if (execution.getGitlabPipelineId() != null) {
                             try {
-                                findingIngestionService.ingestFromAggregateArtifacts(
+                                findingIngestionService.ingestSummaryFromPipelineArtifacts(
+                                        execution.getGitlabPipelineId());
+                            } catch (Exception e) {
+                                log.warn("Ingestion summary.json échouée (pipeline internal env {}): {}",
+                                        environmentId, e.getMessage());
+                            }
+                            try {
+                                findingIngestionService.ingestFindingsFromAggregateJob(
                                         execution.getGitlabPipelineId());
                             } catch (Exception e) {
                                 log.warn("Ingestion artifacts échouée (pipeline internal env {}): {}",
@@ -184,5 +201,18 @@ public class QualityGateController {
             @RequestParam(required = false) String branch
     ) {
         return ResponseEntity.ok(qualityGateService.listEnvironments(applicationId, branch));
+    }
+
+    private void syncStagesForEnvironment(UUID applicationId, UUID environmentId) {
+        pipelineExecutionRepository.findByEnvironmentIdAndApplicationId(environmentId, applicationId)
+                .filter(exec -> exec.getGitlabPipelineId() != null)
+                .ifPresent(exec -> {
+                    try {
+                        pipelineStageSyncService.syncStagesForPipeline(exec.getGitlabPipelineId());
+                    } catch (Exception e) {
+                        log.warn("Sync stages GitLab échouée (pipeline #{}): {}",
+                                exec.getGitlabPipelineId(), e.getMessage());
+                    }
+                });
     }
 }

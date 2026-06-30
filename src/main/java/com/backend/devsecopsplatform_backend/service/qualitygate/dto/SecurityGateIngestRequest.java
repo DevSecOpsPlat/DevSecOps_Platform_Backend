@@ -19,8 +19,28 @@ public class SecurityGateIngestRequest {
     private Integer secrets;
     @JsonProperty("container_critical")
     private Integer containerCritical;
+    @JsonProperty("container_high")
+    private Integer containerHigh;
+    @JsonProperty("sca_medium")
+    private Integer scaMedium;
+    @JsonProperty("sca_low")
+    private Integer scaLow;
+    @JsonProperty("semgrep_high")
+    private Integer semgrepHigh;
+    @JsonProperty("semgrep_medium")
+    private Integer semgrepMedium;
+    @JsonProperty("semgrep_info")
+    private Integer semgrepInfo;
+    @JsonProperty("hadolint_errors")
+    private Integer hadolintErrors;
+    @JsonProperty("checkov_failed")
+    private Integer checkovFailed;
     @JsonProperty("dast_high")
     private Integer dastHigh;
+    @JsonProperty("dast_medium")
+    private Integer dastMedium;
+    @JsonProperty("dast_low")
+    private Integer dastLow;
     @JsonProperty("sonar_security_rating")
     private String sonarSecurityRating;
     @JsonProperty("sonar_quality_gate")

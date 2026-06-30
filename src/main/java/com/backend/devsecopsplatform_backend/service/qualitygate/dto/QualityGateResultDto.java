@@ -71,10 +71,24 @@ public class QualityGateResultDto {
     private String hardGateSummary;
     /** true si getDashboard2 a répondu ; false si exception ou null. */
     private Boolean defectDojoAvailable;
+    /** true si DefectDojo indisponible et métriques issues de security-validation. */
+    private Boolean metricsFromSecurityValidation;
+    /** true si le pipeline GitLab associé est terminé (success/failed/canceled). */
+    private Boolean pipelineFinished;
     /** Sources indisponibles empêchant une recommandation complète. */
     private List<String> indeterminateSources;
     /** Bandeau « Recommandation incomplète ». */
     private String incompleteRecommendationMessage;
+
+    /** false si un ou plusieurs jobs scan GitLab sont en échec ou non exécutés (hors Sonar/DD). */
+    private Boolean recommendationReliable;
+    /** Jobs concernés pour le bandeau fiabilité. */
+    private List<String> failedScanJobs;
+    /** Message bandeau fiabilité pipeline. */
+    private String reliabilityMessage;
+
+    /** true si POST /snapshots/capture est autorisé pour cette exécution. */
+    private Boolean canCaptureSnapshot;
 
     /** Lignes de code non commentées (SonarQube) — base du calcul densité. */
     private Integer ncloc;

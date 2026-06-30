@@ -48,18 +48,34 @@ public class SecurityScoringService {
         List<HardGateViolationDto> indeterminate = new ArrayList<>();
         List<String> indeterminateSources = new ArrayList<>();
 
-        if (input.getSecrets() > 0) {
+        if (!input.isSecretsEvaluable()) {
+            indeterminate.add(violation("secrets", "Secrets exposés (Gitleaks)",
+                    "Scan secrets non exécuté — état inconnu", "INDETERMINATE"));
+        } else if (input.getSecrets() > 0) {
             violations.add(violation("secrets", "Secrets exposés (Gitleaks)",
                     input.getSecrets() + " secret(s) exposé(s)", "VIOLATED"));
         }
 
         if (!input.isDefectDojoAvailable()) {
             indeterminateSources.add("Centralisation des vulnérabilités");
-            indeterminate.add(violation("dd_critical", "Vulnérabilités critiques (DefectDojo)",
+            indeterminate.add(violation("dd_critical", "Vulnérabilités critiques",
                     "Centralisation des vulnérabilités indisponible — état inconnu", "INDETERMINATE"));
-        } else if (input.getDdCritical() > 0) {
-            violations.add(violation("dd_critical", "Vulnérabilités critiques (DefectDojo)",
-                    input.getDdCritical() + " vulnérabilité(s) critique(s)", "VIOLATED"));
+        } else {
+            int combinedCritical = input.getDdCritical();
+            if (input.isSonarAvailable()) {
+                combinedCritical += Math.max(0, input.getSonarCritical());
+            }
+            if (combinedCritical > 0) {
+                String detail = combinedCritical + " vulnérabilité(s) critique(s)";
+                if (input.isSonarAvailable() && input.getSonarCritical() > 0 && input.getDdCritical() > 0) {
+                    detail += " (centralisation " + input.getDdCritical() + " + SonarQube "
+                            + input.getSonarCritical() + ")";
+                } else if (input.isSonarAvailable() && input.getSonarCritical() > 0) {
+                    detail += " (SonarQube " + input.getSonarCritical() + ")";
+                }
+                violations.add(violation("dd_critical", "Vulnérabilités critiques",
+                        detail, "VIOLATED"));
+            }
         }
 
         if (!input.isSonarAvailable()) {
