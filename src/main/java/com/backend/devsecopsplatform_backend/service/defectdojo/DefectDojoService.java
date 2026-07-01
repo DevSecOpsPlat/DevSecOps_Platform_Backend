@@ -886,7 +886,9 @@ public class DefectDojoService {
 
     private DefectDojoFindingDetailResponse mapFindingDetail(JsonNode f, EngagementContext ctx, JsonNode testDetail) {
         DefectDojoFindingItem item = mapFindingItem(f, testDetail);
-        int lineEnd = f.path("end_line").isInt() ? f.path("end_line").asInt() : item.getLine();
+        Integer lineEnd = f.path("end_line").isInt()
+                ? Integer.valueOf(f.path("end_line").asInt())
+                : item.getLine();
         return DefectDojoFindingDetailResponse.builder()
                 .id(item.getId())
                 .title(item.getTitle())
