@@ -5,6 +5,7 @@ import com.backend.devsecopsplatform_backend.entity.PipelineStatus;
 import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
 import com.backend.devsecopsplatform_backend.service.PipelineStageSyncService;
 import com.backend.devsecopsplatform_backend.service.finding.FindingIngestionService;
+import com.backend.devsecopsplatform_backend.service.qualitygate.QualityGateService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
@@ -29,6 +30,7 @@ public class GitLabWebhookController {
     private final PipelineExecutionRepository pipelineExecutionRepository;
     private final PipelineStageSyncService pipelineStageSyncService;
     private final FindingIngestionService findingIngestionService;
+    private final QualityGateService qualityGateService;
     private final ObjectMapper objectMapper;
 
     @Value("${gitlab.webhook.secret:}")
@@ -143,15 +145,42 @@ public class GitLabWebhookController {
     }
 
     private void handleJobEvent(JsonNode root) {
-        JsonNode attrs = root.path("build_attributes");
+        JsonNode attrs = root.path("object_attributes");
+        if (attrs.isMissingNode() || attrs.isEmpty()) {
+            attrs = root.path("build_attributes");
+        }
 
         long jobId = attrs.path("id").asLong(0);
         String statusStr = attrs.path("status").asText(null);
         long pipelineId = attrs.path("pipeline_id").asLong(0);
+        String jobName = attrs.path("name").asText("").toLowerCase(java.util.Locale.ROOT);
 
-        log.info("🔧 Job #{} (pipeline #{}) - statut: {}", jobId, pipelineId, statusStr);
+        log.info("🔧 Job #{} « {} » (pipeline #{}) — statut: {}", jobId, jobName, pipelineId, statusStr);
 
-        // Optionnel: Mettre à jour des informations de job si vous les stockez
+        if (pipelineId <= 0 || statusStr == null || !"success".equalsIgnoreCase(statusStr)) {
+            return;
+        }
+
+        if (jobName.contains("import-defectdojo")) {
+            java.util.concurrent.CompletableFuture.runAsync(() -> {
+                try {
+                    Thread.sleep(10_000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                try {
+                    findingIngestionService.ingestFromAggregateArtifacts(pipelineId);
+                } catch (Exception e) {
+                    log.warn("⚠️ Ingestion findings après import-defectdojo échouée pipeline #{}: {}",
+                            pipelineId, e.getMessage());
+                    pipelineExecutionRepository.findByGitlabPipelineId(pipelineId).ifPresent(exec -> {
+                        log.info("📸 Capture snapshot QG (fallback) après import-defectdojo pipeline #{}", pipelineId);
+                        qualityGateService.captureSnapshotAfterDefectDojoImport(exec);
+                    });
+                }
+            });
+        }
     }
 
     private void updatePipelineDates(PipelineExecution execution, JsonNode attrs) {

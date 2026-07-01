@@ -5,6 +5,8 @@ import com.backend.devsecopsplatform_backend.controller.finding.FindingAiRemedia
 import com.backend.devsecopsplatform_backend.controller.finding.FindingChatRequest;
 import com.backend.devsecopsplatform_backend.service.AiAnalysisService;
 import com.backend.devsecopsplatform_backend.service.defectdojo.DefectDojoService;
+import com.backend.devsecopsplatform_backend.service.defectdojo.dto.DefectDojoDashboard2Response;
+import com.backend.devsecopsplatform_backend.service.defectdojo.dto.DefectDojoDashboardCharts;
 import com.backend.devsecopsplatform_backend.service.defectdojo.dto.DefectDojoDashboardResponse;
 import com.backend.devsecopsplatform_backend.service.defectdojo.dto.DefectDojoFindingDetailResponse;
 import com.backend.devsecopsplatform_backend.service.defectdojo.dto.DefectDojoFindingsPageResponse;
@@ -28,13 +30,71 @@ public class DefectDojoController {
     private final DefectDojoService defectDojoService;
     private final AiAnalysisService aiAnalysisService;
 
-    @GetMapping("/dashboard")
-    public ResponseEntity<DefectDojoDashboardResponse> dashboard(
+    @GetMapping("/dashboard2")
+    public ResponseEntity<DefectDojoDashboard2Response> dashboard2(
             @RequestParam UUID applicationId,
             @RequestParam(required = false) String branch
     ) {
         try {
-            return ResponseEntity.ok(defectDojoService.getDashboard(applicationId, branch));
+            return ResponseEntity.ok(defectDojoService.getDashboard2(applicationId, branch));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().build();
+        } catch (Exception e) {
+            log.error("Erreur dashboard2 DefectDojo app={} branch={}", applicationId, branch, e);
+            return ResponseEntity.internalServerError().body(
+                    DefectDojoDashboard2Response.builder()
+                            .configured(false)
+                            .scope("global")
+                            .message("Erreur lors de la récupération du dashboard : " + e.getMessage())
+                            .bySeverity(Map.of("Critical", 0, "High", 0, "Medium", 0, "Low", 0, "Info", 0))
+                            .byTool(Map.of())
+                            .topRecurrent(List.of())
+                            .trendPoints(List.of())
+                            .build()
+            );
+        }
+    }
+
+    @GetMapping("/dashboard2/charts")
+    public ResponseEntity<DefectDojoDashboardCharts> dashboard2Charts(
+            @RequestParam UUID applicationId,
+            @RequestParam(required = false) String branch
+    ) {
+        try {
+            return ResponseEntity.ok(defectDojoService.getDashboard2Charts(applicationId, branch));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().build();
+        } catch (Exception e) {
+            log.error("Erreur graphiques dashboard2 DefectDojo app={} branch={}", applicationId, branch, e);
+            return ResponseEntity.internalServerError().build();
+        }
+    }
+
+    @GetMapping("/dashboard/charts")
+    public ResponseEntity<DefectDojoDashboardCharts> dashboardCharts(
+            @RequestParam UUID applicationId,
+            @RequestParam(required = false) String branch,
+            @RequestParam(required = false) String tags
+    ) {
+        try {
+            return ResponseEntity.ok(defectDojoService.getDashboardCharts(applicationId, branch, tags));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().build();
+        } catch (Exception e) {
+            log.error("Erreur graphiques dashboard DefectDojo app={} branch={}", applicationId, branch, e);
+            return ResponseEntity.internalServerError().build();
+        }
+    }
+
+    @GetMapping("/dashboard")
+    public ResponseEntity<DefectDojoDashboardResponse> dashboard(
+            @RequestParam UUID applicationId,
+            @RequestParam(required = false) String branch,
+            @RequestParam(required = false) String tags,
+            @RequestParam(defaultValue = "true") boolean includeCharts
+    ) {
+        try {
+            return ResponseEntity.ok(defectDojoService.getDashboard(applicationId, branch, tags, includeCharts));
         } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest().build();
         } catch (Exception e) {
@@ -54,11 +114,12 @@ public class DefectDojoController {
             @RequestParam(required = false) String branch,
             @RequestParam(defaultValue = "open") String category,
             @RequestParam(required = false) String severity,
+            @RequestParam(required = false) String tags,
             @RequestParam(defaultValue = "0") int page,
             @RequestParam(defaultValue = "25") int size
     ) {
         try {
-            return ResponseEntity.ok(defectDojoService.listFindings(applicationId, branch, category, severity, page, size));
+            return ResponseEntity.ok(defectDojoService.listFindings(applicationId, branch, category, severity, page, size, tags));
         } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest().build();
         }
@@ -132,12 +193,21 @@ public class DefectDojoController {
         }
     }
 
+    @GetMapping("/environment-counts")
+    public ResponseEntity<Map<String, Integer>> environmentCounts(@RequestParam UUID applicationId) {
+        try {
+            return ResponseEntity.ok(defectDojoService.getEnvironmentOpenCounts(applicationId));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().build();
+        }
+    }
+
     @GetMapping("/recommendation")
     public ResponseEntity<Map<String, Object>> recommendation(
             @RequestParam UUID applicationId,
             @RequestParam(required = false) String branch
     ) {
-        DefectDojoDashboardResponse dash = defectDojoService.getDashboard(applicationId, branch);
+        DefectDojoDashboardResponse dash = defectDojoService.getDashboard(applicationId, branch, null);
         if (dash.getDeployRecommendation() == null) {
             return ResponseEntity.ok(Map.of(
                     "status", "INCONNU",

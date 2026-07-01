@@ -95,6 +95,28 @@ public interface PipelineExecutionRepository extends JpaRepository<PipelineExecu
             from PipelineExecution pe
             join pe.environment env
             where env.application.id = :appId
+              and (:branch is null or env.gitBranch = :branch)
+            """)
+    long countByApplicationIdAndBranch(@Param("appId") UUID appId, @Param("branch") String branch);
+
+    @Query("""
+            select pe.status, count(pe)
+            from PipelineExecution pe
+            join pe.environment env
+            where env.application.id = :appId
+              and (:branch is null or env.gitBranch = :branch)
+            group by pe.status
+            """)
+    List<Object[]> countByApplicationIdAndBranchGroupByStatus(
+            @Param("appId") UUID appId,
+            @Param("branch") String branch
+    );
+
+    @Query("""
+            select count(pe)
+            from PipelineExecution pe
+            join pe.environment env
+            where env.application.id = :appId
             """)
     long countByApplicationId(@Param("appId") UUID appId);
 
@@ -106,4 +128,61 @@ public interface PipelineExecutionRepository extends JpaRepository<PipelineExecu
             group by pe.status
             """)
     List<Object[]> countByApplicationIdGroupByStatus(@Param("appId") UUID appId);
+
+    @Query("""
+            SELECT pe FROM PipelineExecution pe
+            JOIN FETCH pe.environment env
+            WHERE env.application.id = :appId
+              AND (:branch IS NULL OR env.gitBranch = :branch)
+            ORDER BY pe.createdAt DESC
+            """)
+    List<PipelineExecution> findByApplicationIdAndBranchOrderByCreatedAtDesc(
+            @Param("appId") UUID appId,
+            @Param("branch") String branch,
+            Pageable pageable
+    );
+
+    @Query("""
+            SELECT pe FROM PipelineExecution pe
+            JOIN FETCH pe.environment env
+            WHERE env.id = :environmentId
+              AND env.application.id = :appId
+            """)
+    Optional<PipelineExecution> findByEnvironmentIdAndApplicationId(
+            @Param("environmentId") UUID environmentId,
+            @Param("appId") UUID appId
+    );
+
+    @Query("""
+            SELECT pe FROM PipelineExecution pe
+            JOIN FETCH pe.environment env
+            JOIN FETCH env.application app
+            LEFT JOIN FETCH app.createdBy
+            LEFT JOIN FETCH env.requestedBy
+            WHERE env.id = :environmentId
+              AND app.id = :appId
+            """)
+    Optional<PipelineExecution> findByEnvironmentIdAndApplicationIdWithDetails(
+            @Param("environmentId") UUID environmentId,
+            @Param("appId") UUID appId
+    );
+
+    @Query("""
+            SELECT pe FROM PipelineExecution pe
+            JOIN FETCH pe.environment env
+            JOIN FETCH env.application app
+            WHERE pe.id = :id
+            """)
+    Optional<PipelineExecution> findByIdWithEnvironmentAndApplication(@Param("id") UUID id);
+
+    /** Pipeline CI snapshot : env + app + utilisateurs (évite lazy-load hors session). */
+    @Query("""
+            SELECT pe FROM PipelineExecution pe
+            JOIN FETCH pe.environment env
+            JOIN FETCH env.application app
+            LEFT JOIN FETCH app.createdBy
+            LEFT JOIN FETCH env.requestedBy
+            WHERE env.id = :environmentId
+            """)
+    Optional<PipelineExecution> findByEnvironmentIdWithDetails(@Param("environmentId") UUID environmentId);
 }

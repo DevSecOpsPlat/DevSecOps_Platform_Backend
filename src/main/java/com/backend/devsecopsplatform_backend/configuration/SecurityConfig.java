@@ -92,6 +92,14 @@ public class SecurityConfig {
                         .requestMatchers("/api/findings/**", "/projet/api/findings/**").authenticated()
                         // API DefectDojo (dashboard sécurité par produit / branche)
                         .requestMatchers("/api/defectdojo/**", "/projet/api/defectdojo/**").authenticated()
+                        // Snapshot pipeline CI (secret partagé, sans JWT)
+                        .requestMatchers(HttpMethod.POST,
+                                "/api/quality-gate/internal/snapshot",
+                                "/projet/api/quality-gate/internal/snapshot",
+                                "/api/security-gate",
+                                "/projet/api/security-gate").permitAll()
+                        // Quality Gate (recommandation de déploiement par branche)
+                        .requestMatchers("/api/quality-gate/**", "/projet/api/quality-gate/**").authenticated()
                         // API Reports (PDF export)
                         .requestMatchers("/api/reports/**", "/projet/api/reports/**").authenticated()
                         // Webhook GitLab (appelé par GitLab, pas par le front)

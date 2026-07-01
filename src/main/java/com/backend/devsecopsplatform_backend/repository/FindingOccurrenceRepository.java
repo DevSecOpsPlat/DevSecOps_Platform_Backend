@@ -101,6 +101,15 @@ public interface FindingOccurrenceRepository extends JpaRepository<FindingOccurr
     List<Object[]> countDistinctFindingsByToolForPipeline(@Param("pipelineId") Long pipelineId);
 
     @Query("""
+            select f.toolName as tool, f.severity as severity, count(distinct f.id) as cnt
+            from FindingOccurrence o
+            join o.finding f
+            where o.pipelineExecution.gitlabPipelineId = :pipelineId
+            group by f.toolName, f.severity
+            """)
+    List<Object[]> countDistinctFindingsByToolAndSeverityForPipeline(@Param("pipelineId") Long pipelineId);
+
+    @Query("""
             select distinct f.fingerprint
             from FindingOccurrence o
             join o.finding f
