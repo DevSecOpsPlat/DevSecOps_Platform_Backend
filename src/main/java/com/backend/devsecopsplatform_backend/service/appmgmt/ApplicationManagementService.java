@@ -2,8 +2,18 @@ package com.backend.devsecopsplatform_backend.service.appmgmt;
 
 import com.backend.devsecopsplatform_backend.controller.appmgmt.*;
 import com.backend.devsecopsplatform_backend.entity.User;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.*;
-import com.backend.devsecopsplatform_backend.repository.*;
+import com.backend.devsecopsplatform_backend.entity.AppService;
+import com.backend.devsecopsplatform_backend.entity.appmgmt.AppServiceRole;
+import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDatabase;
+import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDeployment;
+import com.backend.devsecopsplatform_backend.entity.appmgmt.ManagedApplication;
+import com.backend.devsecopsplatform_backend.entity.appmgmt.ServiceEnvVar;
+import com.backend.devsecopsplatform_backend.repository.AppDatabaseRepository;
+import com.backend.devsecopsplatform_backend.repository.AppDeploymentRepository;
+import com.backend.devsecopsplatform_backend.repository.AppServiceRepository;
+import com.backend.devsecopsplatform_backend.repository.ManagedApplicationRepository;
+import com.backend.devsecopsplatform_backend.repository.ServiceEnvVarRepository;
+import com.backend.devsecopsplatform_backend.repository.UserRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.security.core.Authentication;
@@ -11,6 +21,7 @@ import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -89,7 +100,8 @@ public class ApplicationManagementService {
         validateServiceRequest(app, request, null);
 
         AppService svc = new AppService();
-        svc.setApplication(app);
+        svc.setManagedApplication(app);
+        svc.setCreatedBy(app.getCreatedBy());
         applyServiceScalars(svc, request);
         if (request.getGitToken() != null && !request.getGitToken().isBlank() && !MASK.equals(request.getGitToken())) {
             svc.setGitToken(request.getGitToken());
@@ -102,9 +114,9 @@ public class ApplicationManagementService {
     @Transactional
     public AppServiceResponse updateService(UUID appId, UUID serviceId, AppServiceRequest request) {
         loadOwnedApp(appId);
-        AppService svc = serviceRepository.findByIdAndApplication_Id(serviceId, appId)
+        AppService svc = serviceRepository.findByIdAndManagedApplication_Id(serviceId, appId)
                 .orElseThrow(() -> new AppValidationException("Service introuvable dans cette application."));
-        validateServiceRequest(svc.getApplication(), request, serviceId);
+        validateServiceRequest(svc.getManagedApplication(), request, serviceId);
         applyServiceScalars(svc, request);
         if (request.getGitToken() != null && !request.getGitToken().isBlank() && !MASK.equals(request.getGitToken())) {
             svc.setGitToken(request.getGitToken());
@@ -116,7 +128,7 @@ public class ApplicationManagementService {
     @Transactional
     public void deleteService(UUID appId, UUID serviceId) {
         loadOwnedApp(appId);
-        AppService svc = serviceRepository.findByIdAndApplication_Id(serviceId, appId)
+        AppService svc = serviceRepository.findByIdAndManagedApplication_Id(serviceId, appId)
                 .orElseThrow(() -> new AppValidationException("Service introuvable dans cette application."));
         serviceRepository.delete(svc);
     }
@@ -231,7 +243,7 @@ public class ApplicationManagementService {
 
     public List<EnvVarResponse> listEnvVars(UUID appId, UUID serviceId) {
         loadOwnedApp(appId);
-        serviceRepository.findByIdAndApplication_Id(serviceId, appId)
+        serviceRepository.findByIdAndManagedApplication_Id(serviceId, appId)
                 .orElseThrow(() -> new AppValidationException("Service introuvable dans cette application."));
         return envVarRepository.findByAppService_Id(serviceId).stream()
                 .map(this::mapEnvVar).collect(Collectors.toList());
@@ -240,7 +252,7 @@ public class ApplicationManagementService {
     @Transactional
     public EnvVarResponse addEnvVar(UUID appId, UUID serviceId, EnvVarRequest request) {
         loadOwnedApp(appId);
-        AppService svc = serviceRepository.findByIdAndApplication_Id(serviceId, appId)
+        AppService svc = serviceRepository.findByIdAndManagedApplication_Id(serviceId, appId)
                 .orElseThrow(() -> new AppValidationException("Service introuvable dans cette application."));
         ServiceEnvVar envVar = new ServiceEnvVar();
         envVar.setAppService(svc);
@@ -253,7 +265,7 @@ public class ApplicationManagementService {
     @Transactional
     public EnvVarResponse updateEnvVar(UUID appId, UUID serviceId, UUID envVarId, EnvVarRequest request) {
         loadOwnedApp(appId);
-        serviceRepository.findByIdAndApplication_Id(serviceId, appId)
+        serviceRepository.findByIdAndManagedApplication_Id(serviceId, appId)
                 .orElseThrow(() -> new AppValidationException("Service introuvable dans cette application."));
         ServiceEnvVar envVar = envVarRepository.findByIdAndAppService_Id(envVarId, serviceId)
                 .orElseThrow(() -> new AppValidationException("Variable introuvable."));
@@ -268,7 +280,7 @@ public class ApplicationManagementService {
     @Transactional
     public void deleteEnvVar(UUID appId, UUID serviceId, UUID envVarId) {
         loadOwnedApp(appId);
-        serviceRepository.findByIdAndApplication_Id(serviceId, appId)
+        serviceRepository.findByIdAndManagedApplication_Id(serviceId, appId)
                 .orElseThrow(() -> new AppValidationException("Service introuvable dans cette application."));
         ServiceEnvVar envVar = envVarRepository.findByIdAndAppService_Id(envVarId, serviceId)
                 .orElseThrow(() -> new AppValidationException("Variable introuvable."));
@@ -344,7 +356,7 @@ public class ApplicationManagementService {
     public String revealSecret(UUID appId, RevealSecretRequest request) {
         ManagedApplication app = loadOwnedApp(appId);
         String value = switch (request.getType()) {
-            case GIT_TOKEN -> serviceRepository.findByIdAndApplication_Id(request.getTargetId(), appId)
+            case GIT_TOKEN -> serviceRepository.findByIdAndManagedApplication_Id(request.getTargetId(), appId)
                     .map(AppService::getGitToken)
                     .orElseThrow(() -> new AppValidationException("Service introuvable."));
             case DB_PASSWORD -> databaseRepository.findByIdAndApplication_Id(request.getTargetId(), appId)
@@ -353,8 +365,8 @@ public class ApplicationManagementService {
             case ENV_VAR -> {
                 ServiceEnvVar envVar = envVarRepository.findById(request.getTargetId())
                         .orElseThrow(() -> new AppValidationException("Variable introuvable."));
-                if (envVar.getAppService() == null || envVar.getAppService().getApplication() == null
-                        || !envVar.getAppService().getApplication().getId().equals(app.getId())) {
+                if (envVar.getAppService() == null || envVar.getAppService().getManagedApplication() == null
+                        || !envVar.getAppService().getManagedApplication().getId().equals(app.getId())) {
                     throw new AppValidationException("Variable hors de cette application.");
                 }
                 yield envVar.getVarValue();
@@ -426,8 +438,9 @@ public class ApplicationManagementService {
                 .memoryRequest(svc.getMemoryRequest())
                 .memoryLimit(svc.getMemoryLimit())
                 .envVars(envVars)
-                .createdAt(svc.getCreatedAt())
-                .updatedAt(svc.getUpdatedAt())
+                .createdAt(svc.getCreatedAt() != null
+                        ? svc.getCreatedAt().atZone(ZoneId.systemDefault()).toInstant() : null)
+                .updatedAt(null)
                 .build();
     }
 

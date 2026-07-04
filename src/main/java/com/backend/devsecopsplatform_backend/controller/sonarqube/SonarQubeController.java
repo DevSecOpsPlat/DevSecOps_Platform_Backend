@@ -1,6 +1,9 @@
 package com.backend.devsecopsplatform_backend.controller.sonarqube;
 
+import com.backend.devsecopsplatform_backend.entity.AppService;
+import com.backend.devsecopsplatform_backend.repository.AppServiceRepository;
 import com.backend.devsecopsplatform_backend.service.GitLabService;
+import com.backend.devsecopsplatform_backend.service.qualitygate.SonarProjectKeyUtil;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
@@ -12,6 +15,7 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.Map;
+import java.util.UUID;
 
 @RestController
 @RequestMapping("/api/sonarqube")
@@ -21,6 +25,7 @@ import java.util.Map;
 public class SonarQubeController {
 
     private final GitLabService gitLabService;
+    private final AppServiceRepository appServiceRepository;
 
     @GetMapping("/results")
     public ResponseEntity<?> getSonarQubeResults() {
@@ -36,10 +41,32 @@ public class SonarQubeController {
         }
     }
 
-    @GetMapping("/results-by-branch")
-    public ResponseEntity<?> getSonarQubeResultsByBranch(@RequestParam("branch") String branch) {
+    @GetMapping("/branches")
+    public ResponseEntity<?> listBranches(@RequestParam(value = "serviceId", required = false) String serviceId) {
         try {
-            Map<String, Object> results = gitLabService.getSonarQubeResultsForBranch(branch);
+            String pk = resolveProjectKey(null, serviceId);
+            if (pk == null || pk.isBlank()) {
+                return ResponseEntity.ok(java.util.List.of("main"));
+            }
+            java.util.List<String> branches = gitLabService.listSonarProjectBranches(pk);
+            if (branches.isEmpty()) {
+                branches = java.util.List.of("main");
+            }
+            return ResponseEntity.ok(branches);
+        } catch (Exception e) {
+            log.warn("Branches SonarQube indisponibles: {}", e.getMessage());
+            return ResponseEntity.ok(java.util.List.of("main"));
+        }
+    }
+
+    @GetMapping("/results-by-branch")
+    public ResponseEntity<?> getSonarQubeResultsByBranch(
+            @RequestParam("branch") String branch,
+            @RequestParam(value = "projectKey", required = false) String projectKey,
+            @RequestParam(value = "serviceId", required = false) String serviceId) {
+        try {
+            String resolvedKey = resolveProjectKey(projectKey, serviceId);
+            Map<String, Object> results = gitLabService.getSonarQubeResultsForBranch(branch, resolvedKey);
             return ResponseEntity.ok(results);
         } catch (Exception e) {
             log.error("❌ Impossible de récupérer les résultats SonarQube pour la branche {}", branch, e);
@@ -48,6 +75,19 @@ public class SonarQubeController {
                     "message", e.getMessage()
             ));
         }
+    }
+
+    private String resolveProjectKey(String explicitKey, String serviceId) {
+        if (explicitKey != null && !explicitKey.isBlank()) {
+            return explicitKey;
+        }
+        if (serviceId != null && !serviceId.isBlank()) {
+            AppService svc = appServiceRepository.findById(UUID.fromString(serviceId)).orElse(null);
+            if (svc != null && svc.getGitRepositoryUrl() != null) {
+                return SonarProjectKeyUtil.deriveSonarProjectKey(svc.getGitRepositoryUrl());
+            }
+        }
+        return null;
     }
 
     @GetMapping("/quality-gate")

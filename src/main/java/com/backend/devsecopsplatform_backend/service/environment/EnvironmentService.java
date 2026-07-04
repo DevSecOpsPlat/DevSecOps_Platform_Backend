@@ -99,7 +99,7 @@ public class EnvironmentService {
         // 2. Trouver ou créer l'application
         String dockerfilePath = request.getDockerfilePath() != null && !request.getDockerfilePath().isBlank()
                 ? request.getDockerfilePath() : "./Dockerfile";
-        Application app = applicationService
+        AppService app = applicationService
                 .findOrCreateApplicationForDeploy(
                         currentUser,
                         request.getGitRepositoryUrl(),
@@ -112,7 +112,7 @@ public class EnvironmentService {
         String envName = "env-" + UUID.randomUUID().toString().substring(0, 8);
         EphemeralEnvironment env = new EphemeralEnvironment();
         env.setEnvironmentName(envName);
-        env.setApplication(app);
+        env.setService(app);
         env.setGitBranch(request.getBranch());
         env.setRequestedBy(currentUser);
         env.setStatus(EnvironmentStatus.PENDING);
@@ -227,7 +227,7 @@ public class EnvironmentService {
             result.add(EnvironmentSummaryResponse.builder()
                     .id(e.getId())
                     .environmentName(e.getEnvironmentName())
-                    .gitRepositoryUrl(e.getApplication().getGitRepositoryUrl())
+                    .gitRepositoryUrl(e.getService().getGitRepositoryUrl())
                     .gitBranch(e.getGitBranch())
                     .ttlHours(e.getTtlHours())
                     .status(e.getStatus().name())
@@ -245,14 +245,14 @@ public class EnvironmentService {
     public List<EnvironmentSummaryResponse> getMyEnvironmentsForApplication(UUID appId) {
         User user = getCurrentUser();
         List<EphemeralEnvironment> list = environmentRepository
-                .findByRequestedByAndApplicationIdWithApplicationAndPipelineOrderByCreatedAtDesc(user, appId);
+                .findByRequestedByAndServiceIdWithServiceAndPipelineOrderByCreatedAtDesc(user, appId);
         List<EnvironmentSummaryResponse> result = new ArrayList<>();
         for (EphemeralEnvironment e : list) {
             PipelineExecution pipeline = e.getPipelineExecution();
             result.add(EnvironmentSummaryResponse.builder()
                     .id(e.getId())
                     .environmentName(e.getEnvironmentName())
-                    .gitRepositoryUrl(e.getApplication().getGitRepositoryUrl())
+                    .gitRepositoryUrl(e.getService().getGitRepositoryUrl())
                     .gitBranch(e.getGitBranch())
                     .ttlHours(e.getTtlHours())
                     .status(e.getStatus().name())
@@ -402,7 +402,7 @@ public class EnvironmentService {
         return EnvironmentSummaryResponse.builder()
                 .id(e.getId())
                 .environmentName(e.getEnvironmentName())
-                .gitRepositoryUrl(e.getApplication().getGitRepositoryUrl())
+                .gitRepositoryUrl(e.getService().getGitRepositoryUrl())
                 .gitBranch(e.getGitBranch())
                 .ttlHours(e.getTtlHours())
                 .status(e.getStatus().name())

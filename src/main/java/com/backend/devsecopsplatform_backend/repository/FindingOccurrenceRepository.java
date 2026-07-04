@@ -22,7 +22,7 @@ public interface FindingOccurrenceRepository extends JpaRepository<FindingOccurr
             join o.pipelineExecution pe
             join pe.environment env
             where o.finding.id = :findingId
-              and env.application.id = :appId
+              and env.service.id = :appId
             """)
     long countByFindingIdAndApplicationId(@Param("findingId") UUID findingId, @Param("appId") UUID appId);
 
@@ -32,7 +32,7 @@ public interface FindingOccurrenceRepository extends JpaRepository<FindingOccurr
             join o.pipelineExecution pe
             join pe.environment env
             where o.finding.id = :findingId
-              and env.application.id = :appId
+              and env.service.id = :appId
             order by o.observedAt desc
             """)
     List<FindingOccurrence> findByFindingIdAndApplicationIdOrderByObservedAtDesc(@Param("findingId") UUID findingId, @Param("appId") UUID appId);
@@ -136,7 +136,7 @@ public interface FindingOccurrenceRepository extends JpaRepository<FindingOccurr
             join o.finding f
             join o.pipelineExecution pe
             join pe.environment env
-            where env.application.id = :appId
+            where env.service.id = :appId
               and (:status is null or f.status = :status)
             group by f.severity
             """)
@@ -150,7 +150,7 @@ public interface FindingOccurrenceRepository extends JpaRepository<FindingOccurr
             join o.finding f
             join o.pipelineExecution pe
             join pe.environment env
-            where env.application.id = :appId
+            where env.service.id = :appId
               and (:status is null or f.status = :status)
             group by f.scanType
             """)
@@ -164,7 +164,7 @@ public interface FindingOccurrenceRepository extends JpaRepository<FindingOccurr
             join o.finding f
             join o.pipelineExecution pe
             join pe.environment env
-            where env.application.id = :appId
+            where env.service.id = :appId
               and (:status is null or f.status = :status)
             group by f.toolName
             """)
@@ -180,7 +180,7 @@ public interface FindingOccurrenceRepository extends JpaRepository<FindingOccurr
             join pe.environment env
             join env.requestedBy u
             where u.username = :username
-              and env.application.id = :appId
+              and env.service.id = :appId
             order by o.observedAt desc
             """)
     List<FindingOccurrence> findRecentForUsernameAndApplication(

@@ -5,7 +5,7 @@ import com.backend.devsecopsplatform_backend.entity.FindingOccurrence;
 import com.backend.devsecopsplatform_backend.entity.FindingStatus;
 import com.backend.devsecopsplatform_backend.entity.ScanType;
 import com.backend.devsecopsplatform_backend.entity.Severity;
-import com.backend.devsecopsplatform_backend.entity.Application;
+import com.backend.devsecopsplatform_backend.entity.AppService;
 import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
 import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
 import com.backend.devsecopsplatform_backend.repository.FindingOccurrenceRepository;
@@ -154,7 +154,7 @@ public class FindingController {
             return ResponseEntity.notFound().build();
         }
         FindingOccurrence occ = findingOccurrenceRepository.findFirstByFinding_IdOrderByObservedAtDesc(findingId).orElse(null);
-        Application app = resolveApplicationForEnv(effectiveEnvId);
+        AppService app = resolveApplicationForEnv(effectiveEnvId);
 
         String snippet = "";
         String codeContextSource = "NONE";
@@ -207,7 +207,7 @@ public class FindingController {
             return ResponseEntity.notFound().build();
         }
         FindingOccurrence occ = findingOccurrenceRepository.findFirstByFinding_IdOrderByObservedAtDesc(findingId).orElse(null);
-        Application app = resolveApplicationForEnv(effectiveEnvId);
+        AppService app = resolveApplicationForEnv(effectiveEnvId);
 
         String snippetBlock = "";
         var chatSnippet = sourceSnippetFetcherService.tryFetchSnippet(effectiveEnvId, f.getFilePath(), f.getLineStart(), f.getLineEnd());
@@ -227,13 +227,13 @@ public class FindingController {
         return ResponseEntity.ok(Map.of("reply", reply));
     }
 
-    private Application resolveApplicationForEnv(UUID envId) {
-        return ephemeralEnvironmentRepository.findByIdWithApplication(envId)
-                .map(EphemeralEnvironment::getApplication)
+    private AppService resolveApplicationForEnv(UUID envId) {
+        return ephemeralEnvironmentRepository.findByIdWithService(envId)
+                .map(EphemeralEnvironment::getService)
                 .orElse(null);
     }
 
-    private String buildFindingContextForAi(Finding f, FindingOccurrence occ, Application app, String snippetForStackInference) {
+    private String buildFindingContextForAi(Finding f, FindingOccurrence occ, AppService app, String snippetForStackInference) {
         StringBuilder sb = new StringBuilder();
         sb.append(ProjectStackInference.buildBlock(f, occ, app, snippetForStackInference));
         sb.append("\n");

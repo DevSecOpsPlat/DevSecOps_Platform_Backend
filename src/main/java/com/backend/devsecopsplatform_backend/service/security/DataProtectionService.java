@@ -43,7 +43,7 @@ public class DataProtectionService {
         atRest.put("keySource", "Variable ENCRYPTION_SECRET_KEY (32+ caractères)");
         atRest.put("productionKeyConfigured", isProductionKeyConfigured());
         atRest.put("encryptedFields", List.of(
-                Map.of("table", "applications", "column", "encrypted_github_token", "label", "Tokens GitHub"),
+                Map.of("table", "app_service", "column", "encrypted_github_token", "label", "Tokens GitHub"),
                 Map.of("table", "users", "column", "totp_secret_enc", "label", "Secret 2FA (TOTP)"),
                 Map.of("table", "users", "column", "password_hash", "label", "Mot de passe (bcrypt, hash irréversible)")
         ));

@@ -1,6 +1,6 @@
 package com.backend.devsecopsplatform_backend.service;
 
-import com.backend.devsecopsplatform_backend.entity.Application;
+import com.backend.devsecopsplatform_backend.entity.AppService;
 import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
 import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
 import com.backend.devsecopsplatform_backend.service.application.ApplicationService;
@@ -67,12 +67,12 @@ public class SourceSnippetFetcherService {
             return Optional.empty();
         }
 
-        Optional<EphemeralEnvironment> envOpt = ephemeralEnvironmentRepository.findByIdWithApplication(environmentId);
+        Optional<EphemeralEnvironment> envOpt = ephemeralEnvironmentRepository.findByIdWithService(environmentId);
         if (envOpt.isEmpty()) {
             return Optional.empty();
         }
         EphemeralEnvironment env = envOpt.get();
-        Application app = env.getApplication();
+        AppService app = env.getService();
         if (app == null) {
             return Optional.empty();
         }

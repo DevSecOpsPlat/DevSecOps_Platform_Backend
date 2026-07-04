@@ -1173,10 +1173,17 @@ public class GitLabService {
      * Résilient : échec d'une sous-API n'annule pas les autres ; Quality Gate via project_status + branche.
      */
     public Map<String, Object> getSonarQubeResultsForBranch(String branch) {
+        return getSonarQubeResultsForBranch(branch, null);
+    }
+
+    public Map<String, Object> getSonarQubeResultsForBranch(String branch, String overrideProjectKey) {
+        String effectiveProjectKey = (overrideProjectKey != null && !overrideProjectKey.isBlank())
+                ? overrideProjectKey : sonarProjectKey;
+
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("branch", branch);
         result.put("sonar_host_url", sonarHostUrl);
-        result.put("sonar_project_key", sonarProjectKey);
+        result.put("sonar_project_key", effectiveProjectKey);
 
         RestTemplate restTemplate = new RestTemplate();
         HttpEntity<String> entity = sonarAuthEntity();
@@ -1187,7 +1194,7 @@ public class GitLabService {
             String measuresUrl = String.format(
                     "%s/api/measures/component?component=%s&branch=%s&metricKeys=bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density,ncloc,security_hotspots,security_rating,reliability_rating,sqale_rating",
                     sonarHostUrl,
-                    sonarUrlEncode(sonarProjectKey),
+                    sonarUrlEncode(effectiveProjectKey),
                     encodedBranch
             );
             ResponseEntity<JsonNode> measuresResponse = restTemplate.exchange(
@@ -1213,7 +1220,7 @@ public class GitLabService {
                             + "&additionalFields=_all"
                             + "&facets=severities,types,statuses,languages,tags,assignees,resolutions",
                     sonarHostUrl,
-                    sonarUrlEncode(sonarProjectKey),
+                    sonarUrlEncode(effectiveProjectKey),
                     encodedBranch
             );
             int pageIndex = 1;
@@ -1252,7 +1259,7 @@ public class GitLabService {
 
         // 3) Hotspots
         try {
-            String hotspotsUrl = String.format("%s/api/hotspots/search?projectKey=%s&ps=100", sonarHostUrl, sonarProjectKey);
+            String hotspotsUrl = String.format("%s/api/hotspots/search?projectKey=%s&ps=100", sonarHostUrl, effectiveProjectKey);
             ResponseEntity<JsonNode> hotspotsResponse = restTemplate.exchange(hotspotsUrl, HttpMethod.GET, entity, JsonNode.class);
             if (hotspotsResponse.getBody() != null) {
                 JsonNode hotspotsBody = hotspotsResponse.getBody();
@@ -1267,7 +1274,7 @@ public class GitLabService {
         }
 
         // 4) Quality Gate API (par branche)
-        Map<String, Object> qg = fetchSonarQualityGateStatus(sonarProjectKey, branch);
+        Map<String, Object> qg = fetchSonarQualityGateStatus(effectiveProjectKey, branch);
         if (!qg.isEmpty()) {
             result.put("quality_gate", qg);
         }

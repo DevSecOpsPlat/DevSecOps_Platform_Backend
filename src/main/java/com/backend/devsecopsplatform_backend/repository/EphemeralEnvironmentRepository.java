@@ -32,33 +32,33 @@ public interface EphemeralEnvironmentRepository extends JpaRepository<EphemeralE
 
     List<EphemeralEnvironment> findByStatusNotInAndExpiresAtBefore(Collection<EnvironmentStatus> excludedStatuses,
                                                                    LocalDateTime before);
-    List<EphemeralEnvironment> findByApplication_Id(UUID applicationId);
+    List<EphemeralEnvironment> findByService_Id(UUID serviceId);
 
-    List<EphemeralEnvironment> findByApplication_IdAndGitBranchOrderByCreatedAtDesc(
-            UUID applicationId, String gitBranch);
+    List<EphemeralEnvironment> findByService_IdAndGitBranchOrderByCreatedAtDesc(
+            UUID serviceId, String gitBranch);
 
-    Optional<EphemeralEnvironment> findByIdAndApplication_Id(UUID id, UUID applicationId);
+    Optional<EphemeralEnvironment> findByIdAndService_Id(UUID id, UUID serviceId);
 
     @Query("""
             select distinct e from EphemeralEnvironment e
             left join fetch e.pipelineExecution
-            where e.application.id = :applicationId
+            where e.service.id = :applicationId
               and (:branch is null or e.gitBranch = :branch)
             order by e.createdAt desc
             """)
-    List<EphemeralEnvironment> findByApplicationWithPipeline(
+    List<EphemeralEnvironment> findByServiceWithPipeline(
             @Param("applicationId") UUID applicationId,
             @Param("branch") String branch);
 
     @Query("""
             select distinct e from EphemeralEnvironment e
-            join fetch e.application a
+            join fetch e.service a
             left join fetch e.pipelineExecution p
             where e.requestedBy = :user
               and a.id = :appId
             order by e.createdAt desc
             """)
-    List<EphemeralEnvironment> findByRequestedByAndApplicationIdWithApplicationAndPipelineOrderByCreatedAtDesc(
+    List<EphemeralEnvironment> findByRequestedByAndServiceIdWithServiceAndPipelineOrderByCreatedAtDesc(
             @Param("user") User user,
             @Param("appId") UUID appId);
 
@@ -73,20 +73,20 @@ public interface EphemeralEnvironmentRepository extends JpaRepository<EphemeralE
         return results.isEmpty() ? null : results.get(0);
     }
 
-    /** Pour fetch fichier source (join fetch application → gitRepositoryUrl + token). */
-    @Query("select distinct e from EphemeralEnvironment e join fetch e.application where e.id = :id")
-    Optional<EphemeralEnvironment> findByIdWithApplication(@Param("id") UUID id);
+    /** Pour fetch fichier source (join fetch service → gitRepositoryUrl + token). */
+    @Query("select distinct e from EphemeralEnvironment e join fetch e.service where e.id = :id")
+    Optional<EphemeralEnvironment> findByIdWithService(@Param("id") UUID id);
 
     /**
-     * Environnements d'un utilisateur avec application et pipeline (évite N+1 pour l'admin).
+     * Environnements d'un utilisateur avec service et pipeline (évite N+1 pour l'admin).
      */
     @Query("""
             select distinct e from EphemeralEnvironment e
-            join fetch e.application a
+            join fetch e.service a
             left join fetch e.pipelineExecution p
             where e.requestedBy = :user
             order by e.createdAt desc
             """)
-    List<EphemeralEnvironment> findByRequestedByWithApplicationAndPipelineOrderByCreatedAtDesc(
+    List<EphemeralEnvironment> findByRequestedByWithServiceAndPipelineOrderByCreatedAtDesc(
             @Param("user") User user);
 }

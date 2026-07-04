@@ -145,7 +145,7 @@ public class ApplicationController {
             @RequestParam(name = "size", defaultValue = "50") int size
     ) {
         try {
-            List<EphemeralEnvironment> envs = environmentRepository.findByApplication_Id(id);
+            List<EphemeralEnvironment> envs = environmentRepository.findByService_Id(id);
 
             List<DeploymentHistoryItem> history = envs.stream()
                     .filter(env -> branch == null || branch.isBlank() || branch.equals(env.getGitBranch()))

@@ -224,7 +224,7 @@ public class FindingIngestionService {
         // on le marque FIXED au niveau de l’application (même branche).
         // Important: on ne peut pas comparer par envId car chaque test crée un env différent.
         try {
-            if (createdOccurrences > 0 && execution.getEnvironment() != null && execution.getEnvironment().getApplication() != null) {
+            if (createdOccurrences > 0 && execution.getEnvironment() != null && execution.getEnvironment().getService() != null) {
                 List<String> currentFingerprints = findingOccurrenceRepository.findDistinctFingerprintsByPipeline(pipelineId);
                 autoFixedFindings = autoFixFindingsForApplicationBranch(execution, currentFingerprints);
             }
@@ -377,7 +377,7 @@ public class FindingIngestionService {
     private int autoFixFindingsForApplicationBranch(PipelineExecution execution, List<String> currentFingerprints) {
         if (currentFingerprints == null || currentFingerprints.isEmpty()) return 0;
         var env = execution.getEnvironment();
-        var app = env.getApplication();
+        var app = env.getService();
         if (env.getGitBranch() == null || env.getGitBranch().isBlank()) return 0;
 
         List<Finding> toFix = findingRepository.findOpenFindingsForAppBranchNotInFingerprints(

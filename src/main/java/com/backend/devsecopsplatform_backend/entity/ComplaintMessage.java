@@ -33,7 +33,7 @@ public class ComplaintMessage {
 
     @ManyToOne(fetch = FetchType.EAGER, optional = false)
     @JoinColumn(name = "author_id", nullable = false)
-    @JsonIgnoreProperties({"password", "ephemeralEnvironments", "applications", "hibernateLazyInitializer", "handler"})
+    @JsonIgnoreProperties({"password", "ephemeralEnvironments", "services", "hibernateLazyInitializer", "handler"})
     private User author;
 
     @Column(name = "body", nullable = false, columnDefinition = "TEXT")

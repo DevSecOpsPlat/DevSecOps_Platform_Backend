@@ -37,10 +37,10 @@ public interface PipelineExecutionRepository extends JpaRepository<PipelineExecu
     List<Object[]> countByUserGroupByStatus(@Param("user") User user);
 
     @Query("""
-            select pe.environment.application.id, pe.status, count(pe)
+            select pe.environment.service.id, pe.status, count(pe)
             from PipelineExecution pe
             where pe.environment.requestedBy = :user
-            group by pe.environment.application.id, pe.status
+            group by pe.environment.service.id, pe.status
             """)
     List<Object[]> countByUserGroupByApplicationAndStatus(@Param("user") User user);
 
@@ -66,7 +66,7 @@ public interface PipelineExecutionRepository extends JpaRepository<PipelineExecu
             select pe.gitlabPipelineId
             from PipelineExecution pe
             join pe.environment env
-            where env.application.id = :appId
+            where env.service.id = :appId
               and pe.gitlabPipelineId is not null
             order by pe.createdAt desc
             """)
@@ -79,7 +79,7 @@ public interface PipelineExecutionRepository extends JpaRepository<PipelineExecu
             select pe.gitlabPipelineId
             from PipelineExecution pe
             join pe.environment env
-            where env.application.id = :appId
+            where env.service.id = :appId
               and (:branch is null or env.gitBranch = :branch)
               and pe.gitlabPipelineId is not null
             order by pe.createdAt desc
@@ -94,7 +94,7 @@ public interface PipelineExecutionRepository extends JpaRepository<PipelineExecu
             select count(pe)
             from PipelineExecution pe
             join pe.environment env
-            where env.application.id = :appId
+            where env.service.id = :appId
               and (:branch is null or env.gitBranch = :branch)
             """)
     long countByApplicationIdAndBranch(@Param("appId") UUID appId, @Param("branch") String branch);
@@ -103,7 +103,7 @@ public interface PipelineExecutionRepository extends JpaRepository<PipelineExecu
             select pe.status, count(pe)
             from PipelineExecution pe
             join pe.environment env
-            where env.application.id = :appId
+            where env.service.id = :appId
               and (:branch is null or env.gitBranch = :branch)
             group by pe.status
             """)
@@ -116,7 +116,7 @@ public interface PipelineExecutionRepository extends JpaRepository<PipelineExecu
             select count(pe)
             from PipelineExecution pe
             join pe.environment env
-            where env.application.id = :appId
+            where env.service.id = :appId
             """)
     long countByApplicationId(@Param("appId") UUID appId);
 
@@ -124,7 +124,7 @@ public interface PipelineExecutionRepository extends JpaRepository<PipelineExecu
             select pe.status, count(pe)
             from PipelineExecution pe
             join pe.environment env
-            where env.application.id = :appId
+            where env.service.id = :appId
             group by pe.status
             """)
     List<Object[]> countByApplicationIdGroupByStatus(@Param("appId") UUID appId);
@@ -132,7 +132,7 @@ public interface PipelineExecutionRepository extends JpaRepository<PipelineExecu
     @Query("""
             SELECT pe FROM PipelineExecution pe
             JOIN FETCH pe.environment env
-            WHERE env.application.id = :appId
+            WHERE env.service.id = :appId
               AND (:branch IS NULL OR env.gitBranch = :branch)
             ORDER BY pe.createdAt DESC
             """)
@@ -146,7 +146,7 @@ public interface PipelineExecutionRepository extends JpaRepository<PipelineExecu
             SELECT pe FROM PipelineExecution pe
             JOIN FETCH pe.environment env
             WHERE env.id = :environmentId
-              AND env.application.id = :appId
+              AND env.service.id = :appId
             """)
     Optional<PipelineExecution> findByEnvironmentIdAndApplicationId(
             @Param("environmentId") UUID environmentId,
@@ -156,7 +156,7 @@ public interface PipelineExecutionRepository extends JpaRepository<PipelineExecu
     @Query("""
             SELECT pe FROM PipelineExecution pe
             JOIN FETCH pe.environment env
-            JOIN FETCH env.application app
+            JOIN FETCH env.service app
             LEFT JOIN FETCH app.createdBy
             LEFT JOIN FETCH env.requestedBy
             WHERE env.id = :environmentId
@@ -170,16 +170,16 @@ public interface PipelineExecutionRepository extends JpaRepository<PipelineExecu
     @Query("""
             SELECT pe FROM PipelineExecution pe
             JOIN FETCH pe.environment env
-            JOIN FETCH env.application app
+            JOIN FETCH env.service app
             WHERE pe.id = :id
             """)
-    Optional<PipelineExecution> findByIdWithEnvironmentAndApplication(@Param("id") UUID id);
+    Optional<PipelineExecution> findByIdWithEnvironmentAndService(@Param("id") UUID id);
 
     /** Pipeline CI snapshot : env + app + utilisateurs (évite lazy-load hors session). */
     @Query("""
             SELECT pe FROM PipelineExecution pe
             JOIN FETCH pe.environment env
-            JOIN FETCH env.application app
+            JOIN FETCH env.service app
             LEFT JOIN FETCH app.createdBy
             LEFT JOIN FETCH env.requestedBy
             WHERE env.id = :environmentId

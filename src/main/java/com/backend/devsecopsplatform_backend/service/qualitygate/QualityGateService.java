@@ -1,12 +1,12 @@
 package com.backend.devsecopsplatform_backend.service.qualitygate;
 
-import com.backend.devsecopsplatform_backend.entity.Application;
+import com.backend.devsecopsplatform_backend.entity.AppService;
 import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
 import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
 import com.backend.devsecopsplatform_backend.entity.PipelineStatus;
 import com.backend.devsecopsplatform_backend.entity.QualityGateSnapshot;
 import com.backend.devsecopsplatform_backend.entity.User;
-import com.backend.devsecopsplatform_backend.repository.ApplicationRepository;
+import com.backend.devsecopsplatform_backend.repository.AppServiceRepository;
 import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
 import com.backend.devsecopsplatform_backend.repository.FindingOccurrenceRepository;
 import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
@@ -81,7 +81,7 @@ public class QualityGateService {
     private final PipelineExecutionRepository pipelineExecutionRepository;
     private final FindingOccurrenceRepository findingOccurrenceRepository;
     private final EphemeralEnvironmentRepository environmentRepository;
-    private final ApplicationRepository applicationRepository;
+    private final AppServiceRepository applicationRepository;
     private final UserRepository userRepository;
     private final GitLabService gitLabService;
     private final DefectDojoService defectDojoService;
@@ -182,15 +182,15 @@ public class QualityGateService {
         User user = currentUser();
         applicationRepository.findByIdAndCreatedBy(applicationId, user)
                 .orElseThrow(() -> new IllegalArgumentException("Application introuvable ou accès refusé"));
-        EphemeralEnvironment env = environmentRepository.findByIdWithApplication(environmentId)
+        EphemeralEnvironment env = environmentRepository.findByIdWithService(environmentId)
                 .orElseThrow(() -> new IllegalArgumentException("Environnement introuvable"));
-        if (env.getApplication() == null || !applicationId.equals(env.getApplication().getId())) {
+        if (env.getService() == null || !applicationId.equals(env.getService().getId())) {
             throw new IllegalArgumentException("Environnement introuvable pour cette application");
         }
         PipelineExecution execution = pipelineExecutionRepository
                 .findByEnvironmentIdAndApplicationId(environmentId, applicationId)
                 .orElseThrow(() -> new IllegalArgumentException("Aucune exécution pipeline pour cet environnement"));
-        buildAndPersistSnapshot(env.getApplication(), env.getGitBranch(), execution, false, SNAPSHOT_SOURCE_MANUAL);
+        buildAndPersistSnapshot(env.getService(), env.getGitBranch(), execution, false, SNAPSHOT_SOURCE_MANUAL);
     }
 
     /**
@@ -202,9 +202,9 @@ public class QualityGateService {
         User user = currentUser();
         applicationRepository.findByIdAndCreatedBy(applicationId, user)
                 .orElseThrow(() -> new IllegalArgumentException("Application introuvable ou accès refusé"));
-        EphemeralEnvironment env = environmentRepository.findByIdWithApplication(environmentId)
+        EphemeralEnvironment env = environmentRepository.findByIdWithService(environmentId)
                 .orElseThrow(() -> new IllegalArgumentException("Environnement introuvable"));
-        if (env.getApplication() == null || !applicationId.equals(env.getApplication().getId())) {
+        if (env.getService() == null || !applicationId.equals(env.getService().getId())) {
             throw new IllegalArgumentException("Environnement introuvable pour cette application");
         }
         PipelineExecution execution = pipelineExecutionRepository
@@ -216,7 +216,7 @@ public class QualityGateService {
                     "Capture impossible — attendez la fin du job security-validation ou la fin du pipeline.");
         }
 
-        buildAndPersistSnapshot(env.getApplication(), env.getGitBranch(), execution, false, SNAPSHOT_SOURCE_MANUAL);
+        buildAndPersistSnapshot(env.getService(), env.getGitBranch(), execution, false, SNAPSHOT_SOURCE_MANUAL);
 
         QualityGateSnapshot saved = qualityGateSnapshotRepository
                 .findByPipelineExecutionId(execution.getId())
@@ -233,7 +233,7 @@ public class QualityGateService {
         PipelineExecution execution = pipelineExecutionRepository
                 .findByEnvironmentIdWithDetails(environmentId)
                 .orElseThrow(() -> new IllegalArgumentException("Pipeline introuvable"));
-        Application app = execution.getEnvironment().getApplication();
+        AppService app = execution.getEnvironment().getService();
         if (app == null) {
             throw new IllegalArgumentException("Application manquante");
         }
@@ -327,7 +327,7 @@ public class QualityGateService {
         applicationRepository.findByIdAndCreatedBy(applicationId, user)
                 .orElseThrow(() -> new IllegalArgumentException("Application introuvable ou accès refusé"));
         int created = 0;
-        for (EphemeralEnvironment env : environmentRepository.findByApplicationWithPipeline(applicationId, null)) {
+        for (EphemeralEnvironment env : environmentRepository.findByServiceWithPipeline(applicationId, null)) {
             PipelineExecution pe = env.getPipelineExecution();
             if (pe == null || pe.getStatus() == null || !pe.getStatus().isFinished()) {
                 continue;
@@ -353,15 +353,15 @@ public class QualityGateService {
             return;
         }
         PipelineExecution loaded = pipelineExecutionRepository
-                .findByIdWithEnvironmentAndApplication(execution.getId())
+                .findByIdWithEnvironmentAndService(execution.getId())
                 .orElse(execution);
-        if (loaded.getEnvironment() == null || loaded.getEnvironment().getApplication() == null) {
+        if (loaded.getEnvironment() == null || loaded.getEnvironment().getService() == null) {
             log.debug("Snapshot QG ignoré : environnement ou application manquant pour exec {}", loaded.getId());
             return;
         }
         try {
             buildAndPersistSnapshot(
-                    loaded.getEnvironment().getApplication(),
+                    loaded.getEnvironment().getService(),
                     loaded.getEnvironment().getGitBranch(),
                     loaded,
                     false,
@@ -402,7 +402,7 @@ public class QualityGateService {
             UUID snapshotId
     ) {
         User user = currentUser();
-        Application app = applicationRepository.findByIdAndCreatedBy(applicationId, user)
+        AppService app = applicationRepository.findByIdAndCreatedBy(applicationId, user)
                 .orElseThrow(() -> new IllegalArgumentException("Application introuvable ou accès refusé"));
 
         if (snapshotId != null) {
@@ -413,7 +413,7 @@ public class QualityGateService {
         PipelineExecution execution;
 
         if (environmentId != null) {
-            environmentRepository.findByIdAndApplication_Id(environmentId, applicationId)
+            environmentRepository.findByIdAndService_Id(environmentId, applicationId)
                     .orElseThrow(() -> new IllegalArgumentException("Environnement introuvable pour cette application"));
             execution = pipelineExecutionRepository
                     .findByEnvironmentIdAndApplicationId(environmentId, applicationId)
@@ -514,7 +514,7 @@ public class QualityGateService {
 
         List<QualityGateSnapshot> rows;
         if (environmentId != null) {
-            environmentRepository.findByIdAndApplication_Id(environmentId, applicationId)
+            environmentRepository.findByIdAndService_Id(environmentId, applicationId)
                     .orElseThrow(() -> new IllegalArgumentException("Environnement introuvable pour cette application"));
             rows = qualityGateSnapshotRepository.findAllByEnvironmentIdOrderByCreatedAtDesc(environmentId);
         } else {
@@ -536,7 +536,7 @@ public class QualityGateService {
     @Transactional(readOnly = true)
     public QualityGateResultDto getSnapshotById(UUID applicationId, UUID snapshotId) {
         User user = currentUser();
-        Application app = applicationRepository.findByIdAndCreatedBy(applicationId, user)
+        AppService app = applicationRepository.findByIdAndCreatedBy(applicationId, user)
                 .orElseThrow(() -> new IllegalArgumentException("Application introuvable ou accès refusé"));
 
         QualityGateSnapshot row = qualityGateSnapshotRepository.findById(snapshotId)
@@ -567,7 +567,7 @@ public class QualityGateService {
                 .orElseThrow(() -> new IllegalArgumentException("Application introuvable ou accès refusé"));
 
         String effectiveBranch = normalizeBranch(branch);
-        List<EphemeralEnvironment> envs = environmentRepository.findByApplicationWithPipeline(
+        List<EphemeralEnvironment> envs = environmentRepository.findByServiceWithPipeline(
                 applicationId, effectiveBranch);
 
         List<QualityGateEnvironmentOptionDto> options = new ArrayList<>();
@@ -608,7 +608,7 @@ public class QualityGateService {
     }
 
     private void buildAndPersistSnapshot(
-            Application app,
+            AppService app,
             String branch,
             PipelineExecution execution,
             boolean appendHistory,
@@ -1289,14 +1289,14 @@ public class QualityGateService {
         }
     }
 
-    private Map<String, Object> fetchSonarForQualityGate(Application app, String branch) {
+    private Map<String, Object> fetchSonarForQualityGate(AppService app, String branch) {
         return fetchSonarForQualityGate(app, branch, null);
     }
 
     /**
      * Sonar : métriques CI uniquement si le job sonarqube-scan a réussi ; sinon pas de fallback live.
      */
-    private Map<String, Object> fetchSonarForQualityGate(Application app, String branch, PipelineExecution execution) {
+    private Map<String, Object> fetchSonarForQualityGate(AppService app, String branch, PipelineExecution execution) {
         if (execution != null) {
             SonarScanJobState sonarJob = sonarScanJobState(execution);
             if (sonarJob == SonarScanJobState.FAILED) {
@@ -1346,7 +1346,7 @@ public class QualityGateService {
      * propriétaire de l'application le temps de l'appel.
      */
     private DefectDojoDashboard2Response fetchDefectDojoForSnapshot(
-            Application app,
+            AppService app,
             PipelineExecution execution,
             String branch,
             UUID environmentId
@@ -1361,7 +1361,7 @@ public class QualityGateService {
         });
     }
 
-    private <T> T runWithSnapshotAuth(Application app, PipelineExecution execution, Supplier<T> action) {
+    private <T> T runWithSnapshotAuth(AppService app, PipelineExecution execution, Supplier<T> action) {
         Authentication existing = SecurityContextHolder.getContext().getAuthentication();
         boolean alreadyAuthenticated = existing != null
                 && existing.getName() != null && !existing.getName().isBlank();
@@ -1386,7 +1386,7 @@ public class QualityGateService {
      * Utilisateur à impersonner pour DefectDojo (filtre findByIdAndCreatedBy) :
      * créateur de l'application, sinon demandeur de l'environnement en repli.
      */
-    private String resolveSnapshotUsername(Application app, PipelineExecution execution) {
+    private String resolveSnapshotUsername(AppService app, PipelineExecution execution) {
         try {
             if (app != null && app.getCreatedBy() != null
                     && app.getCreatedBy().getUsername() != null) {
@@ -1490,7 +1490,7 @@ public class QualityGateService {
     @Transactional(readOnly = true)
     public List<String> listBranches(UUID applicationId) {
         User user = currentUser();
-        Application app = applicationRepository.findByIdAndCreatedBy(applicationId, user)
+        AppService app = applicationRepository.findByIdAndCreatedBy(applicationId, user)
                 .orElseThrow(() -> new IllegalArgumentException("Application introuvable ou accès refusé"));
 
         LinkedHashSet<String> merged = new LinkedHashSet<>();
@@ -1509,7 +1509,7 @@ public class QualityGateService {
             }
         } catch (Exception ignored) {
         }
-        environmentRepository.findByApplication_Id(applicationId).stream()
+        environmentRepository.findByService_Id(applicationId).stream()
                 .map(EphemeralEnvironment::getGitBranch)
                 .filter(Objects::nonNull)
                 .forEach(merged::add);
@@ -1547,7 +1547,7 @@ public class QualityGateService {
     }
 
     private QualityGateResultDto buildResult(
-            Application app,
+            AppService app,
             String branch,
             PipelineExecution execution,
             DefectDojoDashboard2Response dd,
@@ -1831,7 +1831,7 @@ public class QualityGateService {
      */
     private void finalizeDefectDojoPresentation(
             QualityGateResultDto dto,
-            Application app,
+            AppService app,
             String branch,
             UUID environmentId,
             PipelineExecution execution
@@ -1848,7 +1848,7 @@ public class QualityGateService {
 
     private void tryEnrichFromLiveDefectDojo(
             QualityGateResultDto dto,
-            Application app,
+            AppService app,
             String branch,
             UUID environmentId,
             PipelineExecution execution
@@ -2169,7 +2169,7 @@ public class QualityGateService {
     private record VerdictResolution(String verdict, String source) {}
 
     private QualityGateResultDto buildMissingSnapshotResult(
-            Application app,
+            AppService app,
             String branch,
             UUID environmentId,
             PipelineExecution execution
@@ -2251,7 +2251,7 @@ public class QualityGateService {
     }
 
     private QualityGateResultDto buildMissingSnapshotResultForBranch(
-            Application app,
+            AppService app,
             String branch,
             PipelineExecution execution
     ) {
@@ -3006,14 +3006,28 @@ public class QualityGateService {
         }
 
         if (stages.isEmpty() && storedGate != null) {
-            stages.add(QualityGateStageDto.builder()
-                    .name("security-validation")
-                    .toolLabel("Security Validation")
-                    .status(mapStageStatus(storedGate.get("verdict")))
-                    .statusLabel(statusLabel(mapStageStatus(storedGate.get("verdict"))))
-                    .message("Verdict CI : " + storedGate.get("recommendation"))
-                    .blocking("FAIL".equals(mapStageStatus(storedGate.get("verdict"))))
-                    .build());
+            String fallbackVerdict = stringVal(storedGate.get("verdict"));
+            String fallbackRec = stringVal(storedGate.get("recommendation"));
+            boolean meaningless = (fallbackVerdict == null || fallbackVerdict.isBlank() || "—".equals(fallbackVerdict))
+                    && (fallbackRec == null || fallbackRec.isBlank() || "—".equals(fallbackRec));
+            if (meaningless) {
+                stages.add(QualityGateStageDto.builder()
+                        .name("security-validation")
+                        .toolLabel("Security Validation")
+                        .status("FAIL").statusLabel("ÉCHEC")
+                        .message("Le job security-validation n'a pas produit de résultat exploitable — les outils de scan ne se sont pas exécutés.")
+                        .blocking(true)
+                        .build());
+            } else {
+                stages.add(QualityGateStageDto.builder()
+                        .name("security-validation")
+                        .toolLabel("Security Validation")
+                        .status(mapStageStatus(storedGate.get("verdict")))
+                        .statusLabel(statusLabel(mapStageStatus(storedGate.get("verdict"))))
+                        .message("Verdict CI : " + storedGate.get("recommendation"))
+                        .blocking("FAIL".equals(mapStageStatus(storedGate.get("verdict"))))
+                        .build());
+            }
         }
         return stages;
     }
@@ -3166,6 +3180,14 @@ public class QualityGateService {
             }
             String ciRec = storedGate != null ? stringVal(storedGate.get("recommendation")) : null;
             String ciVerdict = storedGate != null ? stringVal(storedGate.get("verdict")) : null;
+            boolean meaningless = (ciRec == null || ciRec.isBlank() || "—".equals(ciRec))
+                    && (ciVerdict == null || ciVerdict.isBlank() || "—".equals(ciVerdict));
+            if (meaningless) {
+                return baseStage(stageName, toolLabel, job)
+                        .status("FAIL").statusLabel("ÉCHEC")
+                        .message("Le job security-validation n'a pas produit de résultat exploitable — les outils de scan ne se sont pas exécutés.")
+                        .blocking(true).metrics(stageMetrics).build();
+            }
             String verdictLabel = ciRec != null ? ciRec
                     : (ciVerdict != null ? ciVerdict : "—");
             String msg = "Job terminé avec succès — recommandation : " + verdictLabel;
@@ -3660,11 +3682,28 @@ public class QualityGateService {
                 return SecurityValidationJobState.PENDING;
             }
             if (gitlabSuccess(st)) {
+                if (!hasSecurityValidationProducedMeaningfulResult(execution)) {
+                    return SecurityValidationJobState.FAILED;
+                }
                 return SecurityValidationJobState.SUCCESS;
             }
             return SecurityValidationJobState.PENDING;
         }
         return SecurityValidationJobState.MISSING;
+    }
+
+    private boolean hasSecurityValidationProducedMeaningfulResult(PipelineExecution execution) {
+        Map<String, Object> storedGate = execution.getQualityGateJson();
+        if (storedGate == null || storedGate.isEmpty()) {
+            return false;
+        }
+        String verdict = stringVal(storedGate.get("verdict"));
+        String recommendation = stringVal(storedGate.get("recommendation"));
+        if ((verdict == null || verdict.isBlank() || "—".equals(verdict))
+                && (recommendation == null || recommendation.isBlank() || "—".equals(recommendation))) {
+            return false;
+        }
+        return true;
     }
 
     /**
@@ -4050,7 +4089,7 @@ public class QualityGateService {
 
     private SonarAvailabilityDto buildSonarAvailability(
             Map<String, Object> sonar,
-            Application app,
+            AppService app,
             boolean liveAvailable
     ) {
         String projectKey = sonar.get("sonar_project_key") != null

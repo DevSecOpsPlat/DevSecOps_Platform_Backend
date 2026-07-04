@@ -3,7 +3,7 @@ package com.backend.devsecopsplatform_backend.service.appmgmt;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDatabase;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDeployment;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDeploymentStatus;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.AppService;
+import com.backend.devsecopsplatform_backend.entity.AppService;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.ManagedApplication;
 import com.backend.devsecopsplatform_backend.repository.AppDatabaseRepository;
 import com.backend.devsecopsplatform_backend.repository.AppDeploymentRepository;
@@ -129,6 +129,97 @@ public class AppDeploymentService {
         variables.put("ACTION", "deploy");
         variables.put("APP_ID", app.getId().toString());
         variables.put("APP_SLUG", app.getSlug());
+        variables.put("DEPLOYMENT_ID", deployment.getId().toString());
+        variables.put("NAMESPACE", namespace);
+        variables.put("BACKEND_URL", callbackBaseUrl);
+        variables.put("PIPELINE_SECRET", pipelineSecret != null ? pipelineSecret : "");
+        variables.put("IMAGE_TAG", imageTag);
+        variables.put("PULL_SECRET_NAME", pullSecretName);
+        variables.put("K8S_DATABASES_B64", databasesB64);
+        variables.put("K8S_SERVICES_B64", servicesB64);
+        variables.put("SERVICES_JSON", servicesJson);
+
+        Long pipelineId = gitLabService.triggerPipeline(variables);
+        deployment.setGitlabPipelineId(pipelineId);
+        deployment.setStatus(pipelineId != null ? AppDeploymentStatus.DEPLOYING : AppDeploymentStatus.FAILED);
+        deployment.setDeployedAt(Instant.now());
+
+        return deploymentRepository.save(deployment);
+    }
+
+    /**
+     * Déploiement ciblé d'un seul service (avec sa base de données dépendante, si déclarée).
+     * Le déploiement est rattaché au vrai projet pour la FK ; les manifests / vagues / état
+     * initial sont générés à partir d'une vue filtrée (shadow) en mémoire, sans muter la
+     * collection JPA {@link ManagedApplication#getServices()}.
+     */
+    @Transactional
+    public AppDeployment deploySingleService(ManagedApplication realApp, UUID targetServiceId) {
+        AppService target = realApp.getServices().stream()
+                .filter(s -> targetServiceId.equals(s.getId()))
+                .findFirst()
+                .orElseThrow(() -> new AppValidationException("Service introuvable dans ce projet."));
+
+        List<AppDatabase> depDbs = new ArrayList<>();
+        if (target.getDependsOnDatabaseId() != null) {
+            realApp.getDatabases().stream()
+                    .filter(d -> target.getDependsOnDatabaseId().equals(d.getId()))
+                    .findFirst()
+                    .ifPresent(depDbs::add);
+        }
+
+        // Vue en mémoire (n'est jamais save() → aucun cascade JPA).
+        ManagedApplication shadow = new ManagedApplication();
+        shadow.setId(realApp.getId());
+        shadow.setName(realApp.getName());
+        shadow.setSlug(realApp.getSlug());
+        shadow.setDescription(realApp.getDescription());
+        shadow.setCreatedBy(realApp.getCreatedBy());
+        shadow.setServices(List.of(target));
+        shadow.setDatabases(depDbs);
+
+        List<String> warnings = validationService.validate(shadow);
+        warnings.forEach(w -> log.info("⚠️ [deploy-svc {}] {}", target.getId(), w));
+
+        AppDeployment deployment = new AppDeployment();
+        deployment.setApplication(realApp);
+        deployment.setStatus(AppDeploymentStatus.PENDING);
+        deployment.setNamespace("pending");
+        deployment = deploymentRepository.save(deployment);
+
+        String namespace = AppNaming.namespace(realApp.getSlug() + "-" + AppNaming.k8sName(target.getName()),
+                deployment.getId());
+        deployment.setNamespace(namespace);
+
+        for (AppDatabase db : depDbs) {
+            db.setGeneratedConnectionUrl(connectionUrlService.buildConnectionUrl(db, namespace));
+            databaseRepository.save(db);
+        }
+
+        String imageTag = AppNaming.shortId(deployment.getId());
+        AppK8sManifestService.ManifestOptions opts = AppK8sManifestService.ManifestOptions.builder()
+                .registryServer(registryServer)
+                .registryUsername(registryUsername)
+                .registryPassword(registryPassword)
+                .pullSecretName(pullSecretName)
+                .ingressEnabled(ingressEnabled)
+                .ingressDomain(ingressDomain)
+                .imageTag(imageTag)
+                .build();
+
+        String databasesB64 = b64(manifestService.generateDatabaseBundle(shadow, namespace, opts));
+        String servicesB64 = b64(manifestService.generateServiceBundle(shadow, namespace, opts));
+
+        Map<Integer, List<AppService>> waves = computeWaves(shadow);
+        String servicesJson = buildServicesJson(shadow, waves, imageTag);
+
+        deployment.setServicesState(buildInitialState(shadow, namespace, waves));
+
+        Map<String, String> variables = new LinkedHashMap<>();
+        variables.put("ACTION", "deploy");
+        variables.put("APP_ID", realApp.getId().toString());
+        variables.put("APP_SLUG", realApp.getSlug());
+        variables.put("SERVICE_ID", target.getId().toString());
         variables.put("DEPLOYMENT_ID", deployment.getId().toString());
         variables.put("NAMESPACE", namespace);
         variables.put("BACKEND_URL", callbackBaseUrl);

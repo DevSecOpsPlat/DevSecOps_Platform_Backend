@@ -1,5 +1,6 @@
 package com.backend.devsecopsplatform_backend.entity.appmgmt;
 
+import com.backend.devsecopsplatform_backend.entity.AppService;
 import com.backend.devsecopsplatform_backend.entity.User;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import jakarta.persistence.*;
@@ -17,16 +18,13 @@ import java.util.UUID;
 /**
  * Conteneur logique = un namespace Kubernetes. Regroupe les services et les bases
  * de données d'un projet (cf. architecture.md §2.1).
- *
- * <p>Entité distincte de {@code Application} (repo unique + scan) pour respecter la
- * règle de non-régression : aucune modification de l'existant.</p>
  */
 @Entity
-@Table(name = "dep_application", indexes = {
-        @Index(name = "idx_depapp_created_by", columnList = "created_by"),
-        @Index(name = "idx_depapp_slug", columnList = "slug")
+@Table(name = "applications", indexes = {
+        @Index(name = "idx_app_created_by", columnList = "created_by"),
+        @Index(name = "idx_app_slug", columnList = "slug")
 }, uniqueConstraints = {
-        @UniqueConstraint(name = "uq_depapp_slug", columnNames = {"slug"})
+        @UniqueConstraint(name = "uq_app_slug", columnNames = {"slug"})
 })
 @Data
 @NoArgsConstructor
@@ -50,7 +48,7 @@ public class ManagedApplication {
 
     @ManyToOne(fetch = FetchType.LAZY, optional = false)
     @JoinColumn(name = "created_by", nullable = false)
-    @JsonIgnoreProperties({"applications", "ephemeralEnvironments", "password"})
+    @JsonIgnoreProperties({"services", "ephemeralEnvironments", "password"})
     private User createdBy;
 
     @CreationTimestamp
@@ -61,7 +59,8 @@ public class ManagedApplication {
     @Column(name = "updated_at")
     private Instant updatedAt;
 
-    @OneToMany(mappedBy = "application", cascade = CascadeType.ALL, orphanRemoval = true)
+    /** Supprimer le projet supprime aussi ses services (équivalent ON DELETE CASCADE côté JPA). */
+    @OneToMany(mappedBy = "managedApplication", cascade = CascadeType.ALL, orphanRemoval = true)
     private List<AppService> services = new ArrayList<>();
 
     @OneToMany(mappedBy = "application", cascade = CascadeType.ALL, orphanRemoval = true)

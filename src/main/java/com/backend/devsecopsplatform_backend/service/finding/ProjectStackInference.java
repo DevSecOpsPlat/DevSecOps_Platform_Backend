@@ -1,6 +1,6 @@
 package com.backend.devsecopsplatform_backend.service.finding;
 
-import com.backend.devsecopsplatform_backend.entity.Application;
+import com.backend.devsecopsplatform_backend.entity.AppService;
 import com.backend.devsecopsplatform_backend.entity.Finding;
 import com.backend.devsecopsplatform_backend.entity.FindingOccurrence;
 
@@ -17,7 +17,7 @@ public final class ProjectStackInference {
     private ProjectStackInference() {
     }
 
-    public static String buildBlock(Finding f, FindingOccurrence occ, Application app, String codeSnippet) {
+    public static String buildBlock(Finding f, FindingOccurrence occ, AppService app, String codeSnippet) {
         Set<String> hints = new LinkedHashSet<>();
         if (app != null) {
             String name = nullToEmpty(app.getName()).strip();

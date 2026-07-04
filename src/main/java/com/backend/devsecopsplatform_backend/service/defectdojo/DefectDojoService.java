@@ -1,10 +1,10 @@
 package com.backend.devsecopsplatform_backend.service.defectdojo;
 
 import com.backend.devsecopsplatform_backend.configuration.DefectDojoProperties;
-import com.backend.devsecopsplatform_backend.entity.Application;
+import com.backend.devsecopsplatform_backend.entity.AppService;
 import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
 import com.backend.devsecopsplatform_backend.entity.User;
-import com.backend.devsecopsplatform_backend.repository.ApplicationRepository;
+import com.backend.devsecopsplatform_backend.repository.AppServiceRepository;
 import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
 import com.backend.devsecopsplatform_backend.repository.UserRepository;
 import com.backend.devsecopsplatform_backend.service.SourceSnippetFetcherService;
@@ -46,14 +46,14 @@ public class DefectDojoService {
     );
 
     private final DefectDojoProperties properties;
-    private final ApplicationRepository applicationRepository;
+    private final AppServiceRepository applicationRepository;
     private final EphemeralEnvironmentRepository environmentRepository;
     private final UserRepository userRepository;
     private final SourceSnippetFetcherService sourceSnippetFetcherService;
     private final DefectDojoHttpClientFactory httpClientFactory;
 
     private record EngagementContext(
-            Application application,
+            AppService application,
             String productName,
             String branch,
             String engagementName,
@@ -81,7 +81,7 @@ public class DefectDojoService {
         }
 
         User user = currentUser();
-        Application app = applicationRepository.findByIdAndCreatedBy(applicationId, user)
+        AppService app = applicationRepository.findByIdAndCreatedBy(applicationId, user)
                 .orElseThrow(() -> new IllegalArgumentException("Application introuvable ou accès refusé"));
 
         String productName = extractRepoName(app.getGitRepositoryUrl());
@@ -175,7 +175,7 @@ public class DefectDojoService {
         }
 
         User user = currentUser();
-        Application app = applicationRepository.findByIdAndCreatedBy(applicationId, user)
+        AppService app = applicationRepository.findByIdAndCreatedBy(applicationId, user)
                 .orElseThrow(() -> new IllegalArgumentException("Application introuvable ou accès refusé"));
 
         String productName = extractRepoName(app.getGitRepositoryUrl());
@@ -295,7 +295,7 @@ public class DefectDojoService {
     public DefectDojoDashboard2Response getDashboard2(UUID applicationId, String branch, UUID environmentId) {
         User user = currentUser();
         String envTag = environmentId != null ? environmentTag(environmentId) : null;
-        Application app = applicationRepository.findByIdAndCreatedBy(applicationId, user)
+        AppService app = applicationRepository.findByIdAndCreatedBy(applicationId, user)
                 .orElseThrow(() -> new IllegalArgumentException("Application introuvable ou accès refusé"));
 
         String productName = extractRepoName(app.getGitRepositoryUrl());
@@ -435,7 +435,7 @@ public class DefectDojoService {
      */
     public DefectDojoDashboardCharts getDashboard2Charts(UUID applicationId, String branch) {
         User user = currentUser();
-        Application app = applicationRepository.findByIdAndCreatedBy(applicationId, user)
+        AppService app = applicationRepository.findByIdAndCreatedBy(applicationId, user)
                 .orElseThrow(() -> new IllegalArgumentException("Application introuvable ou accès refusé"));
 
         String productName = extractRepoName(app.getGitRepositoryUrl());
@@ -519,7 +519,7 @@ public class DefectDojoService {
 
     public DefectDojoFindingDetailResponse getFindingDetail(UUID applicationId, int findingId, String branch) {
         User user = currentUser();
-        Application app = applicationRepository.findByIdAndCreatedBy(applicationId, user)
+        AppService app = applicationRepository.findByIdAndCreatedBy(applicationId, user)
                 .orElseThrow(() -> new IllegalArgumentException("Application introuvable ou accès refusé"));
         String productName = extractRepoName(app.getGitRepositoryUrl());
         JsonNode product = findProduct(productName);
@@ -599,7 +599,7 @@ public class DefectDojoService {
             return Map.of();
         }
 
-        Application app = applicationRepository.findById(applicationId).orElse(null);
+        AppService app = applicationRepository.findById(applicationId).orElse(null);
         if (app == null) {
             return Map.of();
         }
@@ -612,7 +612,7 @@ public class DefectDojoService {
 
         int productId = product.path("id").asInt();
         List<EphemeralEnvironment> envs = environmentRepository
-                .findByRequestedByAndApplicationIdWithApplicationAndPipelineOrderByCreatedAtDesc(user, applicationId)
+                .findByRequestedByAndServiceIdWithServiceAndPipelineOrderByCreatedAtDesc(user, applicationId)
                 .stream()
                 .filter(EphemeralEnvironment::isActive)
                 .limit(4)
@@ -651,13 +651,13 @@ public class DefectDojoService {
                 .orElseThrow(() -> new IllegalArgumentException("Application introuvable ou accès refusé"));
 
         LinkedHashSet<String> branches = new LinkedHashSet<>();
-        for (EphemeralEnvironment env : environmentRepository.findByRequestedByAndApplicationIdWithApplicationAndPipelineOrderByCreatedAtDesc(user, applicationId)) {
+        for (EphemeralEnvironment env : environmentRepository.findByRequestedByAndServiceIdWithServiceAndPipelineOrderByCreatedAtDesc(user, applicationId)) {
             if (env.getGitBranch() != null && !env.getGitBranch().isBlank()) {
                 branches.add(env.getGitBranch().trim());
             }
         }
 
-        Application app = applicationRepository.findById(applicationId).orElse(null);
+        AppService app = applicationRepository.findById(applicationId).orElse(null);
         if (app != null && properties.isConfigured()) {
             String productName = extractRepoName(app.getGitRepositoryUrl());
             JsonNode product = findProduct(productName);
@@ -681,7 +681,7 @@ public class DefectDojoService {
     ) {
         LinkedHashSet<String> branches = new LinkedHashSet<>();
         User user = currentUser();
-        for (EphemeralEnvironment env : environmentRepository.findByRequestedByAndApplicationIdWithApplicationAndPipelineOrderByCreatedAtDesc(user, applicationId)) {
+        for (EphemeralEnvironment env : environmentRepository.findByRequestedByAndServiceIdWithServiceAndPipelineOrderByCreatedAtDesc(user, applicationId)) {
             if (env.getGitBranch() != null && !env.getGitBranch().isBlank()) {
                 branches.add(env.getGitBranch().trim());
             }
@@ -708,7 +708,7 @@ public class DefectDojoService {
             throw new IllegalStateException("DefectDojo non configuré");
         }
         User user = currentUser();
-        Application app = applicationRepository.findByIdAndCreatedBy(applicationId, user)
+        AppService app = applicationRepository.findByIdAndCreatedBy(applicationId, user)
                 .orElseThrow(() -> new IllegalArgumentException("Application introuvable ou accès refusé"));
         String productName = extractRepoName(app.getGitRepositoryUrl());
         String effectiveBranch = resolveBranch(applicationId, user, branch);
@@ -947,7 +947,7 @@ public class DefectDojoService {
 
     private Optional<EphemeralEnvironment> findEnvironmentForBranch(User user, UUID appId, String branch) {
         return environmentRepository
-                .findByRequestedByAndApplicationIdWithApplicationAndPipelineOrderByCreatedAtDesc(user, appId)
+                .findByRequestedByAndServiceIdWithServiceAndPipelineOrderByCreatedAtDesc(user, appId)
                 .stream()
                 .filter(e -> branch.equals(e.getGitBranch()))
                 .findFirst();
@@ -1126,7 +1126,7 @@ public class DefectDojoService {
     }
 
     private List<DefectDojoEngagementSummary> listLocalBranches(UUID applicationId, User user) {
-        return environmentRepository.findByRequestedByAndApplicationIdWithApplicationAndPipelineOrderByCreatedAtDesc(user, applicationId)
+        return environmentRepository.findByRequestedByAndServiceIdWithServiceAndPipelineOrderByCreatedAtDesc(user, applicationId)
                 .stream()
                 .map(EphemeralEnvironment::getGitBranch)
                 .filter(b -> b != null && !b.isBlank())
@@ -1872,7 +1872,7 @@ public class DefectDojoService {
             return requestedBranch.trim();
         }
         List<EphemeralEnvironment> envs = environmentRepository
-                .findByRequestedByAndApplicationIdWithApplicationAndPipelineOrderByCreatedAtDesc(user, applicationId);
+                .findByRequestedByAndServiceIdWithServiceAndPipelineOrderByCreatedAtDesc(user, applicationId);
         if (!envs.isEmpty() && envs.get(0).getGitBranch() != null && !envs.get(0).getGitBranch().isBlank()) {
             return envs.get(0).getGitBranch().trim();
         }
@@ -1920,7 +1920,7 @@ public class DefectDojoService {
     }
 
     private DefectDojoDashboard2Response.DefectDojoDashboard2ResponseBuilder emptyDashboard2(
-            Application app,
+            AppService app,
             String productName,
             boolean global,
             List<String> branches
@@ -1971,7 +1971,7 @@ public class DefectDojoService {
             String tags
     ) {
         User user = currentUser();
-        Application app = applicationRepository.findByIdAndCreatedBy(applicationId, user)
+        AppService app = applicationRepository.findByIdAndCreatedBy(applicationId, user)
                 .orElseThrow(() -> new IllegalArgumentException("Application introuvable ou accès refusé"));
         String productName = extractRepoName(app.getGitRepositoryUrl());
         JsonNode product = findProduct(productName);
@@ -2021,7 +2021,7 @@ public class DefectDojoService {
     }
 
     private EngagementContext engagementContextFromFinding(
-            Application app,
+            AppService app,
             String productName,
             int productId,
             JsonNode finding

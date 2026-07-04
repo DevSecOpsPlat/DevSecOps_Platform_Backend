@@ -21,7 +21,7 @@ import java.util.UUID;
         @Index(name = "idx_env_expires", columnList = "expires_at"),
         @Index(name = "idx_env_namespace", columnList = "namespace"),
         @Index(name = "idx_env_requested_by", columnList = "requested_by"),
-        @Index(name = "idx_env_application", columnList = "application_id")
+        @Index(name = "idx_env_service", columnList = "app_service_id")
 })
 @Data
 @NoArgsConstructor
@@ -37,12 +37,12 @@ public class EphemeralEnvironment {
     private String environmentName;
 
     /**
-     * Application source de cet environnement
+     * Service source de cet environnement.
      */
     @ManyToOne(fetch = FetchType.LAZY, optional = false)
-    @JoinColumn(name = "application_id", nullable = false)
-    @JsonBackReference("app-env") // Enfant de Application
-    private Application application;
+    @JoinColumn(name = "app_service_id", nullable = false)
+    @JsonBackReference("app-env")
+    private AppService service;
 
     @Column(name = "git_branch", nullable = false, length = 255)
     private String gitBranch;
@@ -50,7 +50,7 @@ public class EphemeralEnvironment {
 
     @ManyToOne(fetch = FetchType.LAZY, optional = false)
     @JoinColumn(name = "requested_by", nullable = false)
-    @JsonIgnoreProperties({"ephemeralEnvironments", "applications", "password"})
+    @JsonIgnoreProperties({"ephemeralEnvironments", "services", "password"})
     private User requestedBy;
 
     @Enumerated(EnumType.STRING)
