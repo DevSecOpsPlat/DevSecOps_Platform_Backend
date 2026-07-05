@@ -225,10 +225,12 @@ public class DefectDojoService {
                         ? fetchOpenFindingsSampleForTaggedTests(productId, engagementId, trimmedTags, 200)
                         : fetchOpenFindingsSample(productId, engagementId, 200, tags),
                 DD_IO_POOL);
+        CompletableFuture<List<JsonNode>> timelineFindingsFuture = CompletableFuture.supplyAsync(() ->
+                fetchAllEngagementFindings(engagementId), DD_IO_POOL);
         CompletableFuture<List<DefectDojoScanSnapshot>> snapshotsFuture = CompletableFuture.supplyAsync(() ->
                 buildScanSnapshotsFast(engagementId), DD_IO_POOL);
 
-        joinAllFutures(List.of(bySeverityFuture, byStatusFuture, findingsFuture, snapshotsFuture));
+        joinAllFutures(List.of(bySeverityFuture, byStatusFuture, findingsFuture, timelineFindingsFuture, snapshotsFuture));
 
         Map<String, Integer> bySeverity = bySeverityFuture.join();
         Map<String, Integer> byStatus = byStatusFuture.join();
@@ -241,6 +243,7 @@ public class DefectDojoService {
                 totalActive,
                 totalMitigated,
                 findingsFuture.join(),
+                timelineFindingsFuture.join(),
                 snapshotsFuture.join()
         );
     }
@@ -262,9 +265,11 @@ public class DefectDojoService {
                         ? fetchOpenFindingsSampleForTaggedTests(productId, engagementId, trimmedTags, 200)
                         : fetchOpenFindingsSample(productId, engagementId, 200, tags),
                 DD_IO_POOL);
+        CompletableFuture<List<JsonNode>> timelineFindingsFuture = CompletableFuture.supplyAsync(() ->
+                fetchAllEngagementFindings(engagementId), DD_IO_POOL);
         CompletableFuture<List<DefectDojoScanSnapshot>> snapshotsFuture = CompletableFuture.supplyAsync(() ->
                 buildScanSnapshotsFast(engagementId), DD_IO_POOL);
-        joinAllFutures(List.of(findingsFuture, snapshotsFuture));
+        joinAllFutures(List.of(findingsFuture, timelineFindingsFuture, snapshotsFuture));
 
         return buildChartsFromParts(
                 bySeverity,
@@ -272,6 +277,7 @@ public class DefectDojoService {
                 totalActive,
                 totalMitigated,
                 findingsFuture.join(),
+                timelineFindingsFuture.join(),
                 snapshotsFuture.join()
         );
     }
@@ -547,23 +553,69 @@ public class DefectDojoService {
 
         JsonNode testDetail = fetchTestDetails(f);
         DefectDojoFindingDetailResponse detail = mapFindingDetail(f, ctx, testDetail);
+        enrichFindingCodeContext(detail, app, ctx.branch());
+        return detail;
+    }
 
-        Optional<EphemeralEnvironment> env = findEnvironmentForBranch(currentUser(), applicationId, ctx.branch());
-        if (env.isPresent() && detail.getFilePath() != null && !detail.getFilePath().isBlank()) {
+    private void enrichFindingCodeContext(DefectDojoFindingDetailResponse detail, AppService app, String branch) {
+        Optional<EphemeralEnvironment> env = findEnvironmentForBranch(currentUser(), app.getId(), branch);
+
+        if (detail.getFilePath() != null && !detail.getFilePath().isBlank()
+                && !SourceSnippetFetcherService.isContainerFilesystemPath(detail.getFilePath())) {
             int lineStart = detail.getLine() != null ? detail.getLine() : 0;
             int lineEnd = detail.getLineEnd() != null ? detail.getLineEnd() : lineStart;
             String repoPath = normalizeRepoPath(detail.getFilePath());
-            var fetched = sourceSnippetFetcherService.tryFetchSnippet(env.get().getId(), repoPath, lineStart, lineEnd);
-            if (fetched.isEmpty() && !repoPath.equals(detail.getFilePath())) {
+
+            Optional<SourceSnippetFetcherService.CodeSnippetFetch> fetched =
+                    sourceSnippetFetcherService.tryFetchSnippetForRepository(app, branch, repoPath, lineStart, lineEnd);
+            if (fetched.isEmpty() && env.isPresent()) {
                 fetched = sourceSnippetFetcherService.tryFetchSnippet(
-                        env.get().getId(), detail.getFilePath(), lineStart, lineEnd);
+                        env.get().getId(), repoPath, lineStart, lineEnd);
+            }
+            if (fetched.isEmpty() && !repoPath.equals(detail.getFilePath())) {
+                fetched = sourceSnippetFetcherService.tryFetchSnippetForRepository(
+                        app, branch, detail.getFilePath(), lineStart, lineEnd);
             }
             if (fetched.isPresent()) {
                 detail.setCodeSnippet(fetched.get().content());
                 detail.setCodeContextSource(fetched.get().source());
+                return;
             }
         }
-        return detail;
+
+        if (!isContainerImageFinding(detail)) {
+            return;
+        }
+
+        String imagePath = nullToEmpty(detail.getFilePath());
+        detail.setCodeContextHint(
+                "Le chemin « " + imagePath + " » est dans l'image conteneur scannée (paquet OS / couche image), "
+                        + "pas un fichier de votre dépôt Git.");
+
+        Optional<SourceSnippetFetcherService.CodeSnippetFetch> docker =
+                sourceSnippetFetcherService.tryFetchDockerfileFallback(app, branch);
+        if (docker.isPresent()) {
+            detail.setCodeSnippet(docker.get().content());
+            detail.setCodeContextSource(docker.get().source());
+            detail.setCodeContextHint(
+                    detail.getCodeContextHint()
+                            + " Extrait du Dockerfile du dépôt chargé automatiquement pour la remédiation "
+                            + "(image de base, version du paquet, etc.).");
+        } else {
+            detail.setCodeContextHint(
+                    detail.getCodeContextHint()
+                            + " Aucun Dockerfile trouvé dans le dépôt sur la branche « "
+                            + nullToEmpty(branch) + " » — collez-le dans « Affiner l'analyse ».");
+        }
+    }
+
+    private static boolean isContainerImageFinding(DefectDojoFindingDetailResponse d) {
+        String tool = nullToEmpty(d.getToolName()).toLowerCase(Locale.ROOT);
+        String scan = nullToEmpty(d.getScanType()).toLowerCase(Locale.ROOT);
+        if (tool.contains("grype") || tool.contains("trivy") || scan.contains("container")) {
+            return true;
+        }
+        return SourceSnippetFetcherService.isContainerFilesystemPath(d.getFilePath());
     }
 
     public String buildAiContext(DefectDojoFindingDetailResponse d) {
@@ -580,11 +632,22 @@ public class DefectDojoService {
         sb.append("Fichier: ").append(nullToEmpty(d.getFilePath())).append("\n");
         if (d.getLine() != null) sb.append("Ligne: ").append(d.getLine()).append("\n");
         if (d.getComponentName() != null) sb.append("Composant: ").append(d.getComponentName()).append("\n");
-        if (d.getDescription() != null) sb.append("Description scanner:\n").append(d.getDescription()).append("\n");
-        if (d.getMitigation() != null) sb.append("Mitigation DefectDojo:\n").append(d.getMitigation()).append("\n");
-        if (d.getImpact() != null) sb.append("Impact:\n").append(d.getImpact()).append("\n");
-        if (d.getReferences() != null) sb.append("Références:\n").append(d.getReferences()).append("\n");
+        if ("DOCKERFILE".equalsIgnoreCase(nullToEmpty(d.getCodeContextSource()))) {
+            sb.append("Note: finding conteneur — le snippet joint est le Dockerfile du dépôt, pas le chemin image.\n");
+        }
+        if (d.getCodeContextHint() != null && !d.getCodeContextHint().isBlank()) {
+            sb.append("Contexte extrait: ").append(truncateField(d.getCodeContextHint(), 500)).append("\n");
+        }
+        if (d.getDescription() != null) sb.append("Description scanner:\n").append(truncateField(d.getDescription(), 4000)).append("\n");
+        if (d.getMitigation() != null) sb.append("Mitigation DefectDojo:\n").append(truncateField(d.getMitigation(), 2000)).append("\n");
+        if (d.getImpact() != null) sb.append("Impact:\n").append(truncateField(d.getImpact(), 2000)).append("\n");
+        if (d.getReferences() != null) sb.append("Références:\n").append(truncateField(d.getReferences(), 1000)).append("\n");
         return sb.toString();
+    }
+
+    private static String truncateField(String s, int maxChars) {
+        if (s == null || s.length() <= maxChars) return s;
+        return s.substring(0, maxChars) + "\n[...tronqué]";
     }
 
     /**
@@ -1344,8 +1407,9 @@ public class DefectDojoService {
             String tags
     ) {
         List<JsonNode> findings = fetchOpenFindingsSample(null, engagementId, 200, tags);
+        List<JsonNode> timelineFindings = fetchAllEngagementFindings(engagementId);
         List<DefectDojoScanSnapshot> scanSnapshots = buildScanSnapshotsFast(engagementId);
-        return buildChartsFromParts(bySeverityOpen, byStatus, openCount, closedCount, findings, scanSnapshots);
+        return buildChartsFromParts(bySeverityOpen, byStatus, openCount, closedCount, findings, timelineFindings, scanSnapshots);
     }
 
     private DefectDojoDashboardCharts buildChartsFromParts(
@@ -1354,6 +1418,7 @@ public class DefectDojoService {
             int openCount,
             int closedCount,
             List<JsonNode> findings,
+            List<JsonNode> timelineFindings,
             List<DefectDojoScanSnapshot> scanSnapshotsRaw
     ) {
         Map<String, Integer> byTool = new LinkedHashMap<>();
@@ -1372,7 +1437,10 @@ public class DefectDojoService {
                 scanSnapshotsRaw,
                 bySeverityOpen
         );
-        DefectDojoDetailedMetrics detailedMetrics = buildDetailedMetrics(findings, scanSnapshots);
+        DefectDojoDetailedMetrics detailedMetrics = buildDetailedMetrics(
+                findings,
+                timelineFindings != null ? timelineFindings : findings,
+                scanSnapshots);
 
         String lastScanDate = scanSnapshots.isEmpty() ? null
                 : scanSnapshots.get(scanSnapshots.size() - 1).getDate();
@@ -1393,6 +1461,7 @@ public class DefectDojoService {
 
     private DefectDojoDetailedMetrics buildDetailedMetrics(
             List<JsonNode> findings,
+            List<JsonNode> timelineFindings,
             List<DefectDojoScanSnapshot> scanSnapshots
     ) {
         List<JsonNode> valid = findings.stream()
@@ -1405,16 +1474,9 @@ public class DefectDojoService {
                 Comparator.nullsLast(String::compareTo)
         ));
 
-        List<DefectDojoTimeSeriesPoint> openDayToDay = new ArrayList<>();
+        List<DefectDojoTimeSeriesPoint> openDayToDay = buildOpenDayToDayFromFindings(timelineFindings);
         List<DefectDojoTimeSeriesPoint> openHourToHour = new ArrayList<>();
         for (DefectDojoScanSnapshot snap : sortedScans) {
-            if (snap.getDate() == null) {
-                continue;
-            }
-            openDayToDay.add(DefectDojoTimeSeriesPoint.builder()
-                    .period(snap.getDate())
-                    .bySeverity(snap.getBySeverity())
-                    .build());
             String hour = extractHour(snap.getTimestamp());
             if (hour != null) {
                 openHourToHour.add(DefectDojoTimeSeriesPoint.builder()
@@ -2140,7 +2202,7 @@ public class DefectDojoService {
                 byAnalysisType.merge(classifyAnalysisType(scanType), 1, Integer::sum);
             }
         }
-        DefectDojoDetailedMetrics detailedMetrics = buildDetailedMetrics(findings, scanSnapshots);
+        DefectDojoDetailedMetrics detailedMetrics = buildDetailedMetrics(findings, findings, scanSnapshots);
         String lastScanDate = scanSnapshots.isEmpty() ? null
                 : scanSnapshots.get(scanSnapshots.size() - 1).getDate();
 

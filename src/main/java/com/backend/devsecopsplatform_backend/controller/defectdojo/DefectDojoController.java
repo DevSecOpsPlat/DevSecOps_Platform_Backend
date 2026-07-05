@@ -157,7 +157,7 @@ public class DefectDojoController {
             codeContextSource = detail.getCodeContextSource() != null ? detail.getCodeContextSource() : "REPO";
         }
         String ctx = defectDojoService.buildAiContext(detail);
-        FindingAiRemediationResponse out = aiAnalysisService.analyzeFindingRemediation(ctx, snippet);
+        FindingAiRemediationResponse out = aiAnalysisService.analyzeFindingRemediation(applicationId, branch, ctx, snippet);
         return ResponseEntity.ok(out.toBuilder().codeContextSource(codeContextSource).build());
     }
 
@@ -172,6 +172,7 @@ public class DefectDojoController {
         String ctx = defectDojoService.buildAiContext(detail);
         String snippet = detail.getCodeSnippet() != null ? detail.getCodeSnippet() : "";
         String reply = aiAnalysisService.chatAboutFinding(
+                applicationId, branch,
                 ctx,
                 request.getRemediationSummary(),
                 snippet,

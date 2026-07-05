@@ -170,7 +170,13 @@ public class FindingController {
         }
 
         String ctx = buildFindingContextForAi(f, occ, app, snippet);
-        FindingAiRemediationResponse out = aiAnalysisService.analyzeFindingRemediation(ctx, snippet);
+        UUID resolvedAppId = app != null ? app.getId() : appId;
+        String branch = null;
+        if (effectiveEnvId != null) {
+            var envOpt = ephemeralEnvironmentRepository.findById(effectiveEnvId);
+            if (envOpt.isPresent()) branch = envOpt.get().getGitBranch();
+        }
+        FindingAiRemediationResponse out = aiAnalysisService.analyzeFindingRemediation(resolvedAppId, branch, ctx, snippet);
         return ResponseEntity.ok(out.toBuilder().codeContextSource(codeContextSource).build());
     }
 
@@ -223,7 +229,14 @@ public class FindingController {
                         m.getContent() != null ? m.getContent() : ""))
                 .collect(Collectors.toList());
 
-        String reply = aiAnalysisService.chatAboutFinding(ctx, request.getRemediationSummary(), snippetBlock, turns);
+        UUID chatAppId = app != null ? app.getId() : appId;
+        String chatBranch = null;
+        if (effectiveEnvId != null) {
+            var chatEnvOpt = ephemeralEnvironmentRepository.findById(effectiveEnvId);
+            if (chatEnvOpt.isPresent()) chatBranch = chatEnvOpt.get().getGitBranch();
+        }
+
+        String reply = aiAnalysisService.chatAboutFinding(chatAppId, chatBranch, ctx, request.getRemediationSummary(), snippetBlock, turns);
         return ResponseEntity.ok(Map.of("reply", reply));
     }
 

@@ -1,29 +1,54 @@
-## Playbook: Secret/clé/token en dur détecté
+## Playbook: Secret / clé / token en dur (Gitleaks, Trivy, Semgrep)
 
-### Objectif
-Retirer la valeur sensible du dépôt, sans casser l’app.
+### Quand ça arrive
+- ScanType SECRETS (outil `gitleaks` en général) : une valeur sensible (API key, token, mot de passe, clé privée, ClientId…) est présente dans un fichier versionné.
 
-### Étapes
-1) Révoquer/rotater le secret exposé (console du provider) si c’est un vrai secret.
-2) Remplacer dans le code par une **lecture de variable d’environnement** (placeholder).
-3) Stocker la valeur dans un endroit adapté :
-   - `.env.local` non commité (dev)
-   - Secrets Manager / Parameter Store / variables d’environnement runtime (prod)
-4) Vérifier le démarrage/local build.
-5) Relancer l’analyse depuis la plateforme.
-
-### Exemples (placeholders)
-```js
-// Exemple Node/Front build: utiliser des env injectées (selon framework)
-const apiKey = process.env.MY_API_KEY;
-```
-
+### Ordre STRICT des opérations (l'ordre compte)
+1) **RÉVOQUER / ROTATER d'abord** : si le secret est réel, il est déjà compromis (l'historique Git est public pour quiconque a accès au dépôt). Générer une nouvelle valeur dans la console du provider (AWS, GitHub, GitLab, Stripe…), invalider l'ancienne.
+2) **Externaliser** : remplacer le littéral par une lecture de configuration (voir par stack ci-dessous).
+3) **Stocker la nouvelle valeur hors du dépôt** : `.env` local non commité (dev) ; variables d'environnement runtime, Secrets Manager / Parameter Store, secrets CI (prod).
+4) **Purger l'historique Git si le secret était réel** (sinon il reste lisible dans les anciens commits) :
 ```bash
-# Exemple local (NE PAS commiter)
-export MY_API_KEY="valeur"
+# git-filter-repo (recommandé)
+git filter-repo --replace-text <(echo "LA_VALEUR_SECRETE==>REDACTED")
+git push --force-with-lease
+```
+   Prévenir l'équipe (réécriture d'historique). Si la rotation est faite et l'ancienne valeur invalidée, la purge devient moins critique mais reste une bonne pratique.
+5) Vérifier le démarrage/build local, puis relancer l'analyse depuis la plateforme.
+
+### Externalisation par stack (choisir selon PIPELINE_CONTEXT)
+
+**Frontend SPA (React/Vite/Angular)** — ⚠ tout ce qui est dans le bundle est PUBLIC :
+```js
+const apiKey = import.meta.env.VITE_MY_KEY;   // Vite
+const apiKey = process.env.REACT_APP_MY_KEY;  // CRA
+```
+Un vrai secret ne peut PAS vivre côté client : le déplacer derrière un backend/proxy. Les identifiants « publics par conception » (Cognito ClientId…) restent préférés via env injectée au build, pas en dur dans un fichier versionné.
+
+**Node.js backend** : `process.env.MY_KEY` + `.env` dans `.gitignore` (dotenv en dev).
+
+**Java / Spring Boot** :
+```yaml
+my:
+  api-key: ${MY_API_KEY:}     # application.yml lit l'env var
+```
+puis `@Value("${my.api-key}")` — jamais le littéral dans application.yml commité.
+
+**Python** : `os.environ["MY_KEY"]` (+ python-dotenv en dev). **.NET** : `builder.Configuration["MyKey"]` + user-secrets en dev, env vars en prod.
+
+**Fichier privé complet commité** (clé SSH, keystore, .env) : le retirer, l'ajouter au `.gitignore`, purger l'historique, régénérer la clé.
+
+### Interdits absolus
+- Remplacer la valeur par une « nouvelle clé » en dur : même problème dans un mois.
+- Supprimer la ligne sans rotation : le secret reste dans l'historique ET actif.
+- Committer le `.env` « temporairement ».
+
+### Vérification locale
+```bash
+gitleaks detect --source . -v          # dépôt courant
+gitleaks detect --source . --log-opts="--all"   # inclut l'historique
 ```
 
 ### Notes
-- Ne jamais remplacer une clé par une “nouvelle-clé” en dur.
-- Pour SPA (React/Vite/Angular) : les variables côté client sont publiques, donc secrets réels → backend ou proxy, sinon token public limité.
-
+- Faux positifs fréquents : exemples de doc, valeurs de test, hash. Si c'en est un, l'exclure via `.gitleaks.toml` (allowlist) avec justification.
+- Le rapport JSON du scan (`reports/...`) n'est pas le fichier à corriger : le finding pointe le fichier source d'origine.

@@ -3,6 +3,7 @@ package com.backend.devsecopsplatform_backend.service;
 import com.backend.devsecopsplatform_backend.controller.ai.AnalyzeArtifactResponse;
 import com.backend.devsecopsplatform_backend.controller.ai.VulnerabilityItem;
 import com.backend.devsecopsplatform_backend.controller.finding.FindingAiRemediationResponse;
+import com.backend.devsecopsplatform_backend.controller.finding.ReferenceItem;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
@@ -16,14 +17,14 @@ import org.springframework.web.client.RestTemplate;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.UUID;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Service d'analyse des artifacts par IA. Plusieurs fournisseurs supportés (sans carte bancaire) :
- * - groq : gratuit, clé sur console.groq.com (recommandé)
- * - huggingface : gratuit, token sur huggingface.co/settings/tokens
- * - ollama : local, pas de clé (ollama run llama2)
+ * Service d'analyse des artifacts par IA. Fournisseurs supportés :
+ * - groq : gratuit, clé sur console.groq.com (recommandé — gpt-oss-120b)
+ * - ollama : local, pas de clé (qwen2.5-coder:7b / qwen3-coder:30b)
  * - gemini : Google (quota souvent limité en free tier)
  */
 @Service
@@ -33,24 +34,63 @@ public class AiAnalysisService {
 
     private static final String GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models/";
     private static final String GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-    private static final String HUGGINGFACE_INFERENCE_URL = "https://api-inference.huggingface.co/models/";
     private static final String OLLAMA_DEFAULT_URL = "http://localhost:11434";
-    /** Limite de caractères pour réduire la consommation de tokens. */
     private static final int MAX_ARTIFACT_LENGTH = 120_000;
-    /** Contexte finding + evidence (hors snippet de code utilisateur). */
-    private static final int MAX_FINDING_CONTEXT_CHARS = 16_000;
-    /** Snippet de code optionnel (collé par l'utilisateur ou futur fetch GitLab). */
-    private static final int MAX_CODE_SNIPPET_CHARS = 32_000;
+    private static final int MAX_FINDING_CONTEXT_CHARS = 12_000;
+    private static final int MAX_CODE_SNIPPET_CHARS = 10_000;
+    private static final int MAX_TOTAL_PROMPT_CHARS = 28_000;
     private static final int DEFAULT_RETRY_DELAY_SECONDS = 45;
     private static final int MAX_CHAT_TURNS = 24;
     private static final int MAX_CHAT_MESSAGE_CHARS = 10_000;
 
+    /** JSON Schema pour la sortie structurée de la remédiation. */
+    private static final String REMEDIATION_SCHEMA = """
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["problemSummary","rootCause","impact","businessRisk","location",
+                           "reproduction","remediationSteps","suggestedPatch","secureCodeBefore",
+                           "secureCodeAfter","fullFileRewrite","bestPractices","references",
+                           "verificationHints","verificationCommands","confidence"],
+              "properties": {
+                "problemSummary":   {"type":"string"},
+                "rootCause":        {"type":"string"},
+                "impact":           {"type":"string"},
+                "businessRisk":     {"type":"string"},
+                "location":         {"type":"string"},
+                "reproduction":     {"type":"string"},
+                "remediationSteps": {"type":"array","items":{"type":"string"}},
+                "suggestedPatch":   {"type":"string"},
+                "secureCodeBefore": {"type":"string"},
+                "secureCodeAfter":  {"type":"string"},
+                "fullFileRewrite":  {"type":"string"},
+                "bestPractices":    {"type":"array","items":{"type":"string"}},
+                "references": {
+                  "type":"array",
+                  "items":{
+                    "type":"object",
+                    "additionalProperties": false,
+                    "required":["type","id","url"],
+                    "properties":{
+                      "type":{"type":"string","enum":["CWE","CVE","OWASP","DOC"]},
+                      "id":{"type":"string"},
+                      "url":{"type":"string"}
+                    }
+                  }
+                },
+                "verificationHints":    {"type":"array","items":{"type":"string"}},
+                "verificationCommands": {"type":"array","items":{"type":"string"}},
+                "confidence": {"type":"string","enum":["HIGH","MEDIUM","LOW"]}
+              }
+            }
+            """;
+
     private final ObjectMapper objectMapper;
     private final PlaybookRagService playbookRagService;
+    private final PipelineKnowledgeService pipelineKnowledgeService;
 
     public record ChatTurn(String role, String content) {}
 
-    /** gemini | groq | huggingface | ollama */
     @Value("${ai.provider:groq}")
     private String aiProvider;
 
@@ -63,27 +103,23 @@ public class AiAnalysisService {
     @Value("${ai.gemini.model:gemini-2.0-flash}")
     private String geminiModel;
 
-    // Groq (gratuit, sans carte - console.groq.com)
+    // Groq
     @Value("${ai.groq.api-key:}")
     private String groqApiKey;
-    @Value("${ai.groq.model:llama-3.3-70b-versatile}")
+    @Value("${ai.groq.model:openai/gpt-oss-120b}")
     private String groqModel;
-
-    // Hugging Face (gratuit - huggingface.co/settings/tokens)
-    @Value("${ai.huggingface.token:}")
-    private String huggingfaceToken;
-    @Value("${ai.huggingface.model:HuggingFaceH4/zephyr-7b-beta}")
-    private String huggingfaceModel;
+    @Value("${ai.groq.model-fast:openai/gpt-oss-20b}")
+    private String groqModelFast;
+    @Value("${ai.groq.reasoning-effort:low}")
+    private String groqReasoningEffort;
 
     // Ollama (local, pas de clé)
     @Value("${ai.ollama.url:http://localhost:11434}")
     private String ollamaUrl;
-    @Value("${ai.ollama.model:llama2}")
+    @Value("${ai.ollama.model:qwen2.5-coder:7b}")
     private String ollamaModel;
-    /** Température Ollama pour modèles autres que DeepSeek (DeepSeek utilise 0.1 dans le code). */
     @Value("${ai.ollama.temperature:0.2}")
     private double ollamaTemperature;
-    /** Tokens max générés par Ollama (remédiation JSON longue) ; défaut élevé pour éviter un JSON coupé au milieu. */
     @Value("${ai.ollama.num-predict:8192}")
     private int ollamaNumPredict;
 
@@ -116,7 +152,7 @@ public class AiAnalysisService {
         String prompt = buildPrompt(content, sourceHint);
 
         try {
-            String jsonResponse = callAiProviderWithFallbackResult(provider, prompt).text();
+            String jsonResponse = callAiProviderWithFallbackResult(provider, prompt, null, null, groqModelFast).text();
             return parseGeminiResponse(jsonResponse);
         } catch (Exception e) {
             log.error("Erreur analyse IA ({}): {}", provider, e.getMessage());
@@ -132,7 +168,8 @@ public class AiAnalysisService {
      * Remédiation ciblée pour un finding (pas le rapport complet du pipeline) : limite tokens/quota.
      * Pour éviter les plafonds Groq/Gemini : {@code ai.provider=ollama} (Ollama local, pas de quota cloud).
      */
-    public FindingAiRemediationResponse analyzeFindingRemediation(String findingContextBlock, String optionalCodeSnippet) {
+    public FindingAiRemediationResponse analyzeFindingRemediation(UUID applicationId, String branch,
+                                                                   String findingContextBlock, String optionalCodeSnippet) {
         if (!aiEnabled) {
             return FindingAiRemediationResponse.builder()
                     .problemSummary("Analyse IA désactivée (ai.enabled=true).")
@@ -162,9 +199,13 @@ public class AiAnalysisService {
             snippet = snippet.substring(0, MAX_CODE_SNIPPET_CHARS) + "\n\n[... snippet tronqué ...]";
         }
 
-        String prompt = buildFindingRemediationPrompt(ctx, snippet, isLikelySecretOrCredentialFinding(ctx));
+        String prompt = buildFindingRemediationPrompt(applicationId, branch, ctx, snippet, isLikelySecretOrCredentialFinding(ctx));
+        if (prompt.length() > MAX_TOTAL_PROMPT_CHARS) {
+            log.warn("[AI] Prompt trop long ({} chars) — troncature à {}", prompt.length(), MAX_TOTAL_PROMPT_CHARS);
+            prompt = prompt.substring(0, MAX_TOTAL_PROMPT_CHARS) + "\n\n[... prompt tronqué pour respecter la limite du modèle ...]";
+        }
         try {
-            AiCallResult r = callAiProviderWithFallbackResult(provider, prompt);
+            AiCallResult r = callAiProviderWithFallbackResult(provider, prompt, "finding_remediation", REMEDIATION_SCHEMA);
             FindingAiRemediationResponse out = parseFindingRemediationResponse(r.text());
             return out.toBuilder()
                     .aiProviderUsed(r.providerUsed())
@@ -220,15 +261,6 @@ public class AiAnalysisService {
                 """;
     }
 
-    /** Prompt court pour DeepSeek-Coder (Ollama) ; mêmes règles secrets que le prompt long. */
-    private boolean useDeepSeekStyleRemediationPrompt() {
-        String p = aiProvider != null ? aiProvider.strip().toLowerCase(Locale.ROOT) : "";
-        return "ollama".equals(p)
-                && ollamaModel != null
-                && ollamaModel.toLowerCase(Locale.ROOT).contains("deepseek");
-    }
-
-    /** Contraintes métier : l'utilisateur voit le finding dans l'app, sans accès édition pipeline. */
     private static final String REMEDIATION_PLATFORM_AUDIENCE = """
             Contexte plateforme (à respecter strictement) :
             L'utilisateur lit ce finding dans une application DevSecOps : il voit les problèmes détectés sur son projet. En général il N'A PAS accès pour modifier les pipelines CI/CD (GitLab CI, GitHub Actions, .gitlab-ci.yml, jobs, runners) depuis cet écran. Il peut corriger le dépôt en local / IDE, pousser ses changements, et surtout relancer une analyse depuis cette plateforme.
@@ -238,38 +270,18 @@ public class AiAnalysisService {
             Stack du projet testé : le contexte finding commence par « TECHNOLOGIES_DEDUITES » (nom/description du projet sur la plateforme, dépôt GitHub/GitLab, chemins type package.json ou pom.xml, chemin d'artefact, extrait de code). Utilise ces indices pour proposer des commandes et exemples adaptés (npm/yarn/pnpm vs mvn/gradle vs pip, Angular/React, etc.). Si un indice contredit filePath ou packageName du finding, privilégie les faits du finding.
             """;
 
-    private String buildFindingRemediationPrompt(String findingContext, String codeSnippet, boolean secretOrCredentialFinding) {
+    private String buildFindingRemediationPrompt(UUID applicationId, String branch,
+                                                 String findingContext, String codeSnippet, boolean secretOrCredentialFinding) {
         String secretRules = remediationSecretRulesAppendix(secretOrCredentialFinding);
         String playbooksBlock = buildPlaybooksBlockForPrompt(findingContext, codeSnippet);
-
-        if (useDeepSeekStyleRemediationPrompt()) {
-            String snippetSection = codeSnippet.isBlank()
-                    ? "(Aucun extrait de code — base-toi sur le contexte du scanner.)"
-                    : "\nCode concerné :\n```\n%s\n```\n".formatted(codeSnippet);
-            return """
-                    Tu es un expert en sécurité. Analyse ce problème et donne une solution précise.
-
-                    %s
-
-                    %s
-
-                    %s
-
-                    Contexte du problème :
-                    %s
-                    %s
-
-                    Exigences de détail (obligatoire) :
-                    - remediationSteps : 4 à 8 étapes courtes et actionnables (une chaîne = une étape). Pas de généralités vagues du type « ajouter integrity » sans dire COMMENT (outil, commande, syntaxe).
-                    - Pour SRI / CDN / scripts ou CSS externes : inclure au moins une commande concrète pour calculer le hash (ex. openssl) ET un exemple de balise ou ligne complète (integrity="sha384-..." ou sha256-..., crossorigin="anonymous" si pertinent).
-                    - suggestedPatch : fragment réellement copiable (HTML, diff, config) quand une correction locale existe ; ne pas laisser vide si un extrait de code suffit.
-                    - verificationCommands : commandes sur poste développeur (openssl, npm, grep, build local) ; PAS « lancer semgrep en CI ». verificationHints : peut inclure « relancer l'analyse depuis la plateforme » après correction.
-
-                    Réponds UNIQUEMENT avec un JSON valide UTF-8, sans texte avant ou après, sans markdown, exactement aux clés :
-                    {"problemSummary":"...","impact":"...","location":"...","remediationSteps":["..."],"suggestedPatch":"...","fullFileRewrite":"","verificationHints":["..."],"verificationCommands":["..."]}
-                    (verificationCommands = commandes shell sur machine locale si pertinent ; sinon [].)
-                    """.formatted(REMEDIATION_PLATFORM_AUDIENCE, secretRules, playbooksBlock, findingContext, snippetSection);
+        if (playbooksBlock.length() > 9_000) {
+            playbooksBlock = playbooksBlock.substring(0, 9_000) + "\n[...playbooks tronqués]";
         }
+
+        String pipelineCtx = pipelineKnowledgeService.getPipelineContextBlock(applicationId, branch);
+        List<String> appDocs = pipelineKnowledgeService.retrieveAppDocs(applicationId, branch, findingContext, 1);
+        String appDocsBlock = appDocs.isEmpty() ? ""
+                : "\nDocuments spécifiques au projet analysé :\n" + String.join("\n---\n", appDocs) + "\n";
 
         String snippetSection = codeSnippet.isBlank()
                 ? "(Aucun extrait de code fourni — base-toi sur le contexte du scanner et propose une correction type : dépendance, config, ou pattern de code.)"
@@ -281,7 +293,7 @@ public class AiAnalysisService {
                 """.formatted(codeSnippet);
 
         return """
-                Tu es un expert sécurité applicative et développement DevSecOps. On te donne UN finding de scanner (SAST/SCA/secrets/etc.), pas tout le projet.
+                Tu es un expert senior en sécurité applicative (AppSec/DevSecOps). On te donne UN finding de scanner, pas tout le projet.
 
                 %s
 
@@ -289,31 +301,43 @@ public class AiAnalysisService {
 
                 %s
 
-                Tâche :
-                1) Expliquer clairement le problème et l'impact.
-                   - Si scanType=LICENSE : parler conformité/licence (pas d'attaquant, pas de sécurité), et dire explicitement si la licence est permissive (MIT/Apache/BSD) donc souvent OK selon politique.
-                2) Préciser où ça se situe (fichier/ligne si présents, sinon package/CVE).
-                3) Donner des étapes de remédiation que l'utilisateur peut faire sans accès pipeline : édition des fichiers du dépôt, commandes en local. Pour les findings SECRETS uniquement : rappeler variables d'environnement / secrets manager / fichiers .env non commités — pas pour SRI/HTML.
-                4) Proposer une correction sous forme de patch : pour SCA = commande de mise à jour locale ; pour code/markup = extrait corrigé ; pour secrets = placeholders + où stocker la valeur (hors dépôt).
-                5) fullFileRewrite : seulement si tu peux montrer le fichier ENTIER sans aucun secret littéral (sinon laisser vide et utiliser suggestedPatch).
-                6) verificationHints : inclure quand c'est pertinent « après correction, relancer l'analyse depuis le tableau de bord de l'application » plutôt que supposer un accès CI. Revue de code / tests locaux possibles.
-                7) verificationCommands : commandes sur la machine du développeur (npm, mvn, openssl, grep, build…). Ne pas imposer Semgrep/pipeline CI comme seule voie.
-
-                Exigences de détail (obligatoire — le développeur doit pouvoir corriger sans deviner) :
-                - Pour scanType=LICENSE : ne jamais inventer un scénario d'attaque. L'impact est légal/compliance. Si la licence est MIT/Apache/BSD et aucune politique n'interdit, proposer "documenter / accepter" plutôt que "remplacer".
-                - remediationSteps : tableau de 4 à 8 chaînes ; chaque chaîne = UNE étape précise (quoi modifier, avec quel outil ou quelle syntaxe). Interdit : une seule phrase vague du type « inclure le hash en base64 dans integrity » sans expliquer comment obtenir le hash et comment rédiger l'attribut. Interdit : « mettre integrity dans les variables d'environnement ».
-                - Exemples concrets : au moins une commande OU un fragment de code/HTML/config réel dans suggestedPatch ou réparti dans les étapes (ex. SRI : `openssl dgst -sha384 -binary fichier.css | openssl enc -base64` ou équivalent + ligne `<link rel="stylesheet" href="..." integrity="sha384-..." crossorigin="anonymous">`).
-                - suggestedPatch : si le finding concerne du code ou du markup, fournir un extrait corrigé copiable (même court) plutôt que de le laisser vide.
-                - verificationCommands : au moins une entrée lorsque le contexte permet une vérif en terminal local (openssl, npm audit, etc.).
-
-                Réponds UNIQUEMENT avec un JSON valide UTF-8, sans markdown ni texte hors JSON, exactement de la forme :
-                {"problemSummary":"...","impact":"...","location":"...","remediationSteps":["..."],"suggestedPatch":"...","fullFileRewrite":"","verificationHints":["..."],"verificationCommands":["..."]}
-
-                Contexte du finding (métadonnées + extrait evidence éventuel) :
                 %s
 
                 %s
-                """.formatted(REMEDIATION_PLATFORM_AUDIENCE, secretRules, playbooksBlock, findingContext, snippetSection);
+
+                HIÉRARCHIE DES SOURCES (ordre de priorité strict) :
+                1. Les données du finding ci-dessous (titre, sévérité, CVE/CWE, fichier, ligne, description scanner) = vérité terrain. Ne les contredis jamais.
+                2. L'extrait de code réel du dépôt s'il est fourni.
+                3. Le bloc PIPELINE_CONTEXT / TECHNOLOGIES_DEDUITES (stack réelle du projet analysé) : adapte commandes et exemples (npm vs mvn vs pip, Angular vs React...).
+                4. Les playbooks fournis.
+                5. Tes connaissances générales — UNIQUEMENT pour les bonnes pratiques et explications, JAMAIS pour inventer des faits.
+
+                RÈGLES ANTI-HALLUCINATION (obligatoires) :
+                - N'invente JAMAIS : identifiant CVE ou CWE absent du contexte, numéro de version, chemin de fichier, nom de package, URL.
+                - Si une information manque, mets "" (chaîne vide) dans le champ concerné, ou écris "Non déterminable à partir du contexte". Ne comble pas les trous.
+                - references : uniquement (a) les CVE/CWE explicitement présents dans le contexte, avec URL canonique (CWE → https://cwe.mitre.org/data/definitions/<numéro>.html ; CVE → https://nvd.nist.gov/vuln/detail/<CVE-ID>), (b) au plus une cheat sheet OWASP pertinente (https://cheatsheetseries.owasp.org/...) si tu es certain qu'elle existe, (c) rien d'autre. Si aucune référence sûre : tableau vide.
+                - confidence : HIGH si finding + code réel + playbook concordent ; MEDIUM si le contexte est partiel ; LOW si tu extrapoles.
+                - reproduction : uniquement si observable de façon sûre et légitime (ex. relancer le scanner localement, ouvrir la page et inspecter la balise). Jamais d'exploitation offensive. Sinon "".
+
+                CONTENU ATTENDU PAR CHAMP :
+                - problemSummary : 2-4 phrases claires, sans jargon inutile.
+                - rootCause : POURQUOI le problème existe (pattern de code, dépendance obsolète, config manquante...), pas une redite du résumé.
+                - impact : impact sécurité technique (ce qu'un attaquant peut faire / ce qui casse). Pour scanType=LICENSE : impact légal/conformité UNIQUEMENT, pas d'attaquant.
+                - businessRisk : conséquence métier concrète (fuite de données clients, indisponibilité, amende/conformité, réputation), 1-3 phrases proportionnées à la sévérité.
+                - location : fichier:ligne si présents, sinon package/composant/image. Distingue fichier source du dépôt vs rapport JSON produit par le CI.
+                - remediationSteps : 4 à 8 étapes, chacune actionnable SANS accès pipeline (édition locale, commandes poste dev, commit/push, relancer l'analyse depuis la plateforme). Chaque étape dit QUOI modifier et COMMENT (outil, commande, syntaxe).
+                - secureCodeBefore / secureCodeAfter : extrait vulnérable vs extrait corrigé, copiables, dans le langage du projet. Si non applicable (ex. pure mise à jour de version) : "" et mets la commande dans suggestedPatch.
+                - suggestedPatch : correctif copiable (diff, commande, balise, config).
+                - bestPractices : 2-5 pratiques durables liées à CETTE famille de problème (pas des généralités "faites des revues de code").
+                - verificationCommands : commandes poste développeur ; verificationHints : contrôles manuels + "relancer l'analyse depuis la plateforme".
+
+                La sortie est contrôlée par un schéma JSON strict. Remplis TOUS les champs.
+
+                Contexte du finding (métadonnées + evidence) :
+                %s
+
+                %s
+                """.formatted(REMEDIATION_PLATFORM_AUDIENCE, secretRules, pipelineCtx, appDocsBlock, playbooksBlock, findingContext, snippetSection);
     }
 
     private String buildPlaybooksBlockForPrompt(String findingContext, String codeSnippet) {
@@ -389,21 +413,57 @@ public class AiAnalysisService {
                     if (x.isTextual()) verifyCmds.add(x.asText());
                 }
             }
+            List<String> bestPractices = new ArrayList<>();
+            JsonNode bp = root.path("bestPractices");
+            if (bp.isArray()) {
+                for (JsonNode x : bp) {
+                    if (x.isTextual()) bestPractices.add(x.asText());
+                }
+            }
+            List<ReferenceItem> references = new ArrayList<>();
+            JsonNode refs = root.path("references");
+            if (refs.isArray()) {
+                for (JsonNode r : refs) {
+                    references.add(ReferenceItem.builder()
+                            .type(r.path("type").asText(""))
+                            .id(r.path("id").asText(""))
+                            .url(r.path("url").asText(""))
+                            .build());
+                }
+            }
             return FindingAiRemediationResponse.builder()
                     .problemSummary(root.path("problemSummary").asText(""))
+                    .rootCause(root.path("rootCause").asText(""))
                     .impact(root.path("impact").asText(""))
+                    .businessRisk(root.path("businessRisk").asText(""))
                     .location(root.path("location").asText(""))
+                    .reproduction(root.path("reproduction").asText(""))
                     .remediationSteps(steps)
                     .suggestedPatch(root.path("suggestedPatch").asText(""))
+                    .secureCodeBefore(root.path("secureCodeBefore").asText(""))
+                    .secureCodeAfter(root.path("secureCodeAfter").asText(""))
                     .fullFileRewrite(root.path("fullFileRewrite").asText(""))
+                    .bestPractices(bestPractices)
+                    .references(references)
                     .verificationHints(hints)
                     .verificationCommands(verifyCmds)
+                    .confidence(root.path("confidence").asText("MEDIUM"))
+                    .rawModelOutput(jsonText != null && jsonText.length() > 8000
+                            ? jsonText.substring(0, 8000) + "..." : jsonText)
                     .build();
         } catch (Exception e) {
             log.warn("Parse remédiation finding IA: {}", e.getMessage());
+            String rawOutput = (jsonText != null && jsonText.length() > 8000)
+                    ? jsonText.substring(0, 8000) + "..." : jsonText;
+            String textForSummary = rawOutput != null ? rawOutput.trim() : "";
+            if (textForSummary.length() > 3000) {
+                textForSummary = textForSummary.substring(0, 3000) + "\n\n[...suite dans Réponse brute]";
+            }
             return FindingAiRemediationResponse.builder()
-                    .rawModelOutput(toParse.length() > 8000 ? toParse.substring(0, 8000) + "..." : toParse)
-                    .problemSummary("Réponse IA non-JSON ; voir rawModelOutput.")
+                    .rawModelOutput(rawOutput)
+                    .problemSummary(textForSummary.isBlank()
+                            ? "Réponse IA non-JSON ; voir rawModelOutput."
+                            : textForSummary)
                     .build();
         }
     }
@@ -411,7 +471,8 @@ public class AiAnalysisService {
     /**
      * Chat pédagogique sur un finding (historique user/assistant). Réponses en texte libre (pas de JSON).
      */
-    public String chatAboutFinding(String findingContextBlock, String remediationSummary, String optionalCodeSnippet, List<ChatTurn> turns) {
+    public String chatAboutFinding(UUID applicationId, String branch,
+                                    String findingContextBlock, String remediationSummary, String optionalCodeSnippet, List<ChatTurn> turns) {
         if (!aiEnabled) {
             return "Analyse IA désactivée (ai.enabled=true).";
         }
@@ -446,7 +507,7 @@ public class AiAnalysisService {
                     ```
                     """.formatted(snippet);
         }
-        String system = buildFindingChatSystemPrompt(fc, remBlock, snippetBlock);
+        String system = buildFindingChatSystemPrompt(applicationId, branch, fc, remBlock, snippetBlock);
         List<java.util.Map<String, String>> messages = buildChatMessagesForApi(system, turns);
 
         try {
@@ -502,7 +563,8 @@ public class AiAnalysisService {
         }
     }
 
-    private String buildFindingChatSystemPrompt(String findingContext, String remediationBlock, String codeSnippetSection) {
+    private String buildFindingChatSystemPrompt(UUID applicationId, String branch,
+                                                String findingContext, String remediationBlock, String codeSnippetSection) {
         boolean secretCtx = isLikelySecretOrCredentialFinding(findingContext);
         String secretChat = secretCtx ? """
 
@@ -516,11 +578,15 @@ public class AiAnalysisService {
                 """ : "";
 
         String playbooks = buildPlaybooksBlockForChat(findingContext, codeSnippetSection);
+        String pipelineCtx = pipelineKnowledgeService.getPipelineContextBlock(applicationId, branch);
         return """
                 Tu es un assistant pédagogique sécurité / DevSecOps. Tu aides un développeur qui consulte un finding dans une application (tableau de bord sécurité) : il voit les résultats de scan sur son projet. N'invente pas de CVE ni de chemins absents du contexte.
 
                 Contexte utilisateur : en général il n'a pas accès pour modifier les pipelines CI/CD depuis cet écran ; il peut éditer son code en local, pousser, et relancer une analyse depuis l'application. Ne lui impose pas « modifie ton pipeline GitLab », « ajoute une étape Semgrep au CI » ou des hypothèses d'accès qu'il n'a peut-être pas. Pour SRI (integrity sur link/script), ne dis pas de passer par des variables d'environnement : c'est dans le HTML ou les templates du dépôt.
                 Le bloc « TECHNOLOGIES_DEDUITES » en tête du contexte résume la stack probable du projet testé : tiens-en compte pour les commandes et exemples (npm vs mvn vs pip…).
+                Le bloc PIPELINE_CONTEXT (s'il est présent) décrit la stack RÉELLE mesurée par le dernier pipeline : il prime sur TECHNOLOGIES_DEDUITES en cas de contradiction.
+
+                %s
 
                 %s
 
@@ -540,7 +606,7 @@ public class AiAnalysisService {
                 - Formate toujours tes réponses en Markdown lisible : titres courts avec ## si plusieurs parties, listes à puces ou numérotées, paragraphes séparés par une ligne vide.
                 - Pour toute commande shell (openssl, npm, git, curl, docker, etc.) ou sortie terminal : mets-la dans un bloc de code avec le langage bash, par exemple trois backticks puis bash puis la commande puis trois backticks — ne colle pas les commandes dans le corps du texte sans bloc.
                 - Réponses concises ; ne pas répéter tout le contexte à chaque tour.
-                """.formatted(playbooks, findingContext, remediationBlock, codeSnippetSection, secretChat);
+                """.formatted(playbooks, pipelineCtx, findingContext, remediationBlock, codeSnippetSection, secretChat);
     }
 
     private String buildPlaybooksBlockForChat(String findingContext, String codeSnippetSection) {
@@ -598,27 +664,43 @@ public class AiAnalysisService {
         return text.strip();
     }
 
-    /** Détecte un quota/ratelimit Groq (HTTP 429). */
+    /** Détecte un quota/ratelimit Groq (HTTP 429) ou payload trop gros (413). */
     private static boolean isGroqQuotaExceeded(Throwable e) {
         if (e instanceof HttpClientErrorException he) {
-            return he.getStatusCode() == HttpStatus.TOO_MANY_REQUESTS;
+            return he.getStatusCode() == HttpStatus.TOO_MANY_REQUESTS
+                    || he.getStatusCode().value() == 413;
         }
         return false;
     }
 
     /** Remédiation/artifact : Groq 429 → fallback Ollama pour cet appel. */
     private AiCallResult callAiProviderWithFallbackResult(String provider, String prompt) throws Exception {
+        return callAiProviderWithFallbackResult(provider, prompt, null, null, null);
+    }
+
+    private AiCallResult callAiProviderWithFallbackResult(String provider, String prompt,
+                                                          String schemaName, String jsonSchema) throws Exception {
+        return callAiProviderWithFallbackResult(provider, prompt, schemaName, jsonSchema, null);
+    }
+
+    private AiCallResult callAiProviderWithFallbackResult(String provider, String prompt,
+                                                          String schemaName, String jsonSchema,
+                                                          String groqModelOverride) throws Exception {
         if (!"groq".equals(provider)) {
-            String text = callAiProvider(provider, prompt);
+            String text = "ollama".equals(provider)
+                    ? callOllama(prompt, jsonSchema)
+                    : callAiProvider(provider, prompt);
             return new AiCallResult(text, provider, resolveModelName(provider), false);
         }
+        String effectiveGroqModel = (groqModelOverride != null && !groqModelOverride.isBlank())
+                ? groqModelOverride : groqModel;
         try {
-            String text = callGroq(prompt);
-            return new AiCallResult(text, "groq", groqModel, false);
+            String text = callGroq(prompt, schemaName, jsonSchema, groqModelOverride);
+            return new AiCallResult(text, "groq", effectiveGroqModel, false);
         } catch (Exception e) {
             if (isGroqQuotaExceeded(e)) {
                 log.warn("[AI][SWITCH] Groq quota (429) → Ollama (model={})", ollamaModel);
-                String text = callOllama(prompt);
+                String text = callOllama(prompt, jsonSchema);
                 return new AiCallResult(text, "ollama", ollamaModel, true);
             }
             throw e;
@@ -636,7 +718,6 @@ public class AiAnalysisService {
             return switch (provider) {
                 case "ollama" -> callOllamaChat(messages);
                 case "gemini" -> callGeminiFindingChatPlain(system, turns);
-                case "huggingface" -> callHuggingFaceFindingChatPlain(system, turns);
                 default -> throw new IllegalStateException("Provider inconnu: " + provider);
             };
         }
@@ -688,15 +769,6 @@ public class AiAnalysisService {
         return callGeminiPlainText(sb.toString());
     }
 
-    private String callHuggingFaceFindingChatPlain(String system, List<ChatTurn> turns) {
-        StringBuilder sb = new StringBuilder();
-        sb.append(system).append("\n\n");
-        for (ChatTurn t : turns) {
-            sb.append(t.role()).append(": ").append(t.content()).append("\n");
-        }
-        return callHuggingFacePlain(sb.toString());
-    }
-
     /** Gemini sans forcer le JSON (réponse texte). */
     private String callGeminiPlainText(String prompt) {
         String url = GEMINI_BASE_URL + geminiModel + ":generateContent?key=" + geminiApiKey;
@@ -723,32 +795,6 @@ public class AiAnalysisService {
         return parts.get(0).path("text").asText("").strip();
     }
 
-    private String callHuggingFacePlain(String prompt) {
-        String url = HUGGINGFACE_INFERENCE_URL + huggingfaceModel;
-        var body = new java.util.LinkedHashMap<String, Object>();
-        body.put("inputs", truncate(prompt, 12000));
-        body.put("parameters", java.util.Map.of(
-                "max_new_tokens", 2048,
-                "return_full_text", false
-        ));
-        HttpHeaders headers = new HttpHeaders();
-        headers.setContentType(MediaType.APPLICATION_JSON);
-        headers.setBearerAuth(huggingfaceToken);
-        HttpEntity<Object> entity = new HttpEntity<>(body, headers);
-        RestTemplate rest = new RestTemplate();
-        ResponseEntity<JsonNode> response = rest.exchange(url, HttpMethod.POST, entity, JsonNode.class);
-        if (response.getBody() == null) throw new RuntimeException("Réponse Hugging Face vide");
-        JsonNode resBody = response.getBody();
-        String text = null;
-        if (resBody.isArray() && resBody.size() > 0) {
-            text = resBody.path(0).path("generated_text").asText(null);
-        } else if (resBody.has("generated_text")) {
-            text = resBody.path("generated_text").asText(null);
-        }
-        if (text == null) throw new RuntimeException("Hugging Face sans texte");
-        return text.strip();
-    }
-
     private AnalyzeArtifactResponse errorResponse(String summary) {
         return AnalyzeArtifactResponse.builder().summary(summary).vulnerabilities(List.of()).build();
     }
@@ -757,8 +803,7 @@ public class AiAnalysisService {
         return switch (provider) {
             case "gemini" -> geminiApiKey != null && !geminiApiKey.isBlank();
             case "groq" -> groqApiKey != null && !groqApiKey.isBlank();
-            case "huggingface" -> huggingfaceToken != null && !huggingfaceToken.isBlank();
-            case "ollama" -> true; // pas de clé
+            case "ollama" -> true;
             default -> false;
         };
     }
@@ -767,9 +812,8 @@ public class AiAnalysisService {
         return switch (provider) {
             case "gemini" -> "Définissez ai.gemini.api-key. Ou utilisez ai.provider=groq avec ai.groq.api-key (gratuit, console.groq.com).";
             case "groq" -> "Définissez ai.groq.api-key. Clé gratuite sur https://console.groq.com (pas de carte requise).";
-            case "huggingface" -> "Définissez ai.huggingface.token sur https://huggingface.co/settings/tokens.";
-            case "ollama" -> "Lancez Ollama localement : ollama run llama2. Ou utilisez ai.provider=groq.";
-            default -> "Choisissez ai.provider=groq, huggingface, ollama ou gemini et configurez la clé correspondante.";
+            case "ollama" -> "Lancez Ollama localement : ollama run " + ollamaModel + ". Ou utilisez ai.provider=groq.";
+            default -> "Choisissez ai.provider=groq, ollama ou gemini et configurez la clé correspondante.";
         };
     }
 
@@ -777,7 +821,6 @@ public class AiAnalysisService {
         return switch (provider) {
             case "gemini" -> callGeminiWithRetry(prompt);
             case "groq" -> callGroq(prompt);
-            case "huggingface" -> callHuggingFace(prompt);
             case "ollama" -> callOllama(prompt);
             default -> throw new IllegalStateException("Provider inconnu: " + provider);
         };
@@ -879,14 +922,36 @@ public class AiAnalysisService {
         return parts.get(0).get("text").asText();
     }
 
-    private String callGroq(String prompt) {
+    private String callGroq(String prompt) { return callGroq(prompt, null, null, null); }
+
+    private String callGroq(String prompt, String schemaName, String jsonSchema) {
+        return callGroq(prompt, schemaName, jsonSchema, null);
+    }
+
+    private String callGroq(String prompt, String schemaName, String jsonSchema, String groqModelOverride) {
+        String model = (groqModelOverride != null && !groqModelOverride.isBlank()) ? groqModelOverride : groqModel;
         var body = new java.util.LinkedHashMap<String, Object>();
-        body.put("model", groqModel);
+        body.put("model", model);
         body.put("messages", List.of(
                 java.util.Map.of("role", "user", "content", prompt)
         ));
         body.put("temperature", 0.2);
-        body.put("max_tokens", 8192);
+        body.put("max_completion_tokens", 8192);
+        if (model != null && model.startsWith("openai/gpt-oss")) {
+            body.put("reasoning_effort", groqReasoningEffort);
+        }
+        if (jsonSchema != null && schemaName != null) {
+            try {
+                JsonNode schema = objectMapper.readTree(jsonSchema);
+                body.put("response_format", java.util.Map.of(
+                        "type", "json_schema",
+                        "json_schema", java.util.Map.of(
+                                "name", schemaName, "strict", true, "schema", schema)));
+            } catch (Exception e) {
+                log.warn("Schéma JSON invalide, fallback json_object: {}", e.getMessage());
+                body.put("response_format", java.util.Map.of("type", "json_object"));
+            }
+        }
 
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
@@ -897,48 +962,15 @@ public class AiAnalysisService {
         if (response.getBody() == null) throw new RuntimeException("Réponse Groq vide");
         JsonNode choice = response.getBody().path("choices").path(0);
         String text = choice.path("message").path("content").asText(null);
-        if (text == null) throw new RuntimeException("Groq n'a pas renvoyé de contenu");
-        return extractJsonFromResponse(text);
-    }
-
-    /** Hugging Face Inference API - token sur huggingface.co/settings/tokens */
-    private String callHuggingFace(String prompt) {
-        String url = HUGGINGFACE_INFERENCE_URL + huggingfaceModel;
-        var body = new java.util.LinkedHashMap<String, Object>();
-        body.put("inputs", prompt);
-        body.put("parameters", java.util.Map.of(
-                "max_new_tokens", 4096,
-                "return_full_text", false
-        ));
-
-        HttpHeaders headers = new HttpHeaders();
-        headers.setContentType(MediaType.APPLICATION_JSON);
-        headers.setBearerAuth(huggingfaceToken);
-        HttpEntity<Object> entity = new HttpEntity<>(body, headers);
-        RestTemplate rest = new RestTemplate();
-        ResponseEntity<JsonNode> response = rest.exchange(url, HttpMethod.POST, entity, JsonNode.class);
-        if (response.getBody() == null) throw new RuntimeException("Réponse Hugging Face vide");
-        JsonNode resBody = response.getBody();
-        String text = null;
-        if (resBody.isArray() && resBody.size() > 0) {
-            text = resBody.path(0).path("generated_text").asText(null);
-        } else if (resBody.has("generated_text")) {
-            text = resBody.path("generated_text").asText(null);
-        }
-        if (text == null) throw new RuntimeException("Hugging Face n'a pas renvoyé de texte");
-        return extractJsonFromResponse(text);
+        if (text == null || text.isBlank()) throw new RuntimeException("Groq n'a pas renvoyé de contenu");
+        return text.strip();
     }
 
     /** Options de génération Ollama ({@code /api/generate} et {@code /api/chat}). */
     private void addOllamaGenerationOptions(java.util.LinkedHashMap<String, Object> body) {
         var opts = new java.util.LinkedHashMap<String, Object>();
         opts.put("num_predict", Math.max(512, ollamaNumPredict));
-        if (ollamaModel != null && ollamaModel.toLowerCase(Locale.ROOT).contains("deepseek")) {
-            opts.put("temperature", 0.1);
-            opts.put("top_p", 0.95);
-        } else {
-            opts.put("temperature", ollamaTemperature);
-        }
+        opts.put("temperature", ollamaTemperature);
         body.put("options", opts);
     }
 
@@ -1019,13 +1051,18 @@ public class AiAnalysisService {
         return s.substring(start);
     }
 
-    /** Ollama : local, pas de clé — ex. {@code ollama run deepseek-coder:6.7b-instruct} */
-    private String callOllama(String prompt) {
+    private String callOllama(String prompt) { return callOllama(prompt, null); }
+
+    private String callOllama(String prompt, String jsonSchema) {
         String url = ollamaUrl.replaceAll("/+$", "") + "/api/generate";
         var body = new java.util.LinkedHashMap<String, Object>();
         body.put("model", ollamaModel);
         body.put("prompt", prompt);
         body.put("stream", false);
+        if (jsonSchema != null) {
+            try { body.put("format", objectMapper.readTree(jsonSchema)); }
+            catch (Exception e) { log.warn("Schéma Ollama ignoré: {}", e.getMessage()); }
+        }
         addOllamaGenerationOptions(body);
 
         HttpHeaders headers = new HttpHeaders();
