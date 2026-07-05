@@ -16,11 +16,16 @@ public class CacheConfig {
     @Bean
     public CacheManager cacheManager() {
         CaffeineCacheManager cacheManager = new CaffeineCacheManager(
-                "pipelineSummaries", "pipelines", "jobs", "defectDojoDashboard"
+                "pipelineSummaries", "pipelines", "jobs"
         );
         cacheManager.setCaffeine(Caffeine.newBuilder()
                 .expireAfterWrite(10, TimeUnit.MINUTES)
                 .maximumSize(1000));
+        cacheManager.registerCustomCache("defectDojoDashboard",
+                Caffeine.newBuilder()
+                        .expireAfterWrite(60, TimeUnit.SECONDS)
+                        .maximumSize(1000)
+                        .build());
         return cacheManager;
     }
 }

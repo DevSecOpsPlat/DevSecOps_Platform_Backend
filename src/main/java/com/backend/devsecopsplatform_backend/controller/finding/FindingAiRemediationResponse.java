@@ -48,4 +48,10 @@ public class FindingAiRemediationResponse {
     private String aiModelUsed;
     private Boolean quotaFallbackUsed;
     private String aiModelTier;
+    /** CACHE | STATIC | GROQ | OPENROUTER | OLLAMA */
+    private String responseSource;
+    /** PENDING | COMPLETE | FAILED — présent si analyse Ollama asynchrone */
+    private String status;
+    /** Identifiant de job pour polling si status=PENDING */
+    private String jobId;
 }

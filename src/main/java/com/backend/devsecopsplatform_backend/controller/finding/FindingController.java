@@ -12,6 +12,8 @@ import com.backend.devsecopsplatform_backend.repository.FindingOccurrenceReposit
 import com.backend.devsecopsplatform_backend.repository.FindingRepository;
 import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
 import com.backend.devsecopsplatform_backend.service.AiAnalysisService;
+import com.backend.devsecopsplatform_backend.service.ai.RemediationRequestContext;
+import com.backend.devsecopsplatform_backend.service.ai.StaticRemediationTemplateService;
 import com.backend.devsecopsplatform_backend.service.finding.ProjectStackInference;
 import com.backend.devsecopsplatform_backend.service.SourceSnippetFetcherService;
 import com.backend.devsecopsplatform_backend.service.finding.FindingIngestionService;
@@ -176,7 +178,14 @@ public class FindingController {
             var envOpt = ephemeralEnvironmentRepository.findById(effectiveEnvId);
             if (envOpt.isPresent()) branch = envOpt.get().getGitBranch();
         }
-        FindingAiRemediationResponse out = aiAnalysisService.analyzeFindingRemediation(resolvedAppId, branch, ctx, snippet);
+        FindingAiRemediationResponse out = aiAnalysisService.analyzeFindingRemediation(
+                resolvedAppId, branch, ctx, snippet,
+                new RemediationRequestContext(
+                        StaticRemediationTemplateService.extractRuleKey(ctx),
+                        f.getFilePath(),
+                        f.getLineStart(),
+                        request != null && request.isDeepAnalysis()
+                ));
         return ResponseEntity.ok(out.toBuilder().codeContextSource(codeContextSource).build());
     }
 

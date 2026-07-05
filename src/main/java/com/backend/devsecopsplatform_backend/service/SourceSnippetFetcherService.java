@@ -4,6 +4,7 @@ import com.backend.devsecopsplatform_backend.entity.AppService;
 import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
 import com.backend.devsecopsplatform_backend.repository.AppServiceRepository;
 import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
+import com.backend.devsecopsplatform_backend.service.ai.CodeContextExtractor;
 import com.backend.devsecopsplatform_backend.service.application.ApplicationService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -42,9 +43,8 @@ public class SourceSnippetFetcherService {
 
     public record CodeSnippetFetch(String content, String source) {}
 
-    private static final int CONTEXT_LINES = 55;
-    private static final int MAX_CHARS = 48_000;
-    private static final int MAX_LINES_WHEN_NO_HINT = 220;
+    private static final int MAX_CHARS = 24_000;
+    private static final int MAX_LINES_WHEN_NO_HINT = 160;
 
     private static final Pattern GITHUB_SSH = Pattern.compile("git@github\\.com:([^/]+)/([^/]+?)(?:\\.git)?\\s*$", Pattern.CASE_INSENSITIVE);
 
@@ -317,21 +317,17 @@ public class SourceSnippetFetcherService {
     }
 
     static String windowAroundLines(String full, Integer lineStart, Integer lineEnd) {
-        String[] lines = full.split("\r\n|\n|\r", -1);
-        int start = 0;
-        int end = lines.length;
         if (lineStart != null && lineStart > 0) {
-            int idx0 = lineStart - 1;
-            start = Math.max(0, idx0 - CONTEXT_LINES);
             int hi = (lineEnd != null && lineEnd > 0) ? lineEnd : lineStart;
-            end = Math.min(lines.length, hi + CONTEXT_LINES);
-        } else {
-            if (lines.length > MAX_LINES_WHEN_NO_HINT) {
-                end = MAX_LINES_WHEN_NO_HINT;
-            }
+            return CodeContextExtractor.extractSnippet(full, hi, MAX_CHARS);
+        }
+        String[] lines = full.split("\r\n|\n|\r", -1);
+        int end = lines.length;
+        if (lines.length > MAX_LINES_WHEN_NO_HINT) {
+            end = MAX_LINES_WHEN_NO_HINT;
         }
         StringBuilder sb = new StringBuilder();
-        for (int i = start; i < end; i++) {
+        for (int i = 0; i < end; i++) {
             sb.append(String.format("%5d| %s%n", i + 1, lines[i]));
         }
         String out = sb.toString();

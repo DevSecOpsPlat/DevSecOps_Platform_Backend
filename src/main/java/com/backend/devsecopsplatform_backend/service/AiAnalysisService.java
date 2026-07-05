@@ -9,12 +9,21 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import com.backend.devsecopsplatform_backend.service.ai.AiRemediationCacheService;
+import com.backend.devsecopsplatform_backend.service.ai.AiRemediationJobService;
+import com.backend.devsecopsplatform_backend.service.ai.AsyncRemediationPendingException;
+import com.backend.devsecopsplatform_backend.service.ai.RemediationRequestContext;
+import com.backend.devsecopsplatform_backend.service.ai.StaticRemediationTemplateService;
 import org.springframework.http.*;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.HttpClientErrorException;
+import org.springframework.web.client.HttpServerErrorException;
 import org.springframework.web.client.RestTemplate;
 
+import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Optional;
 import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
@@ -36,9 +45,13 @@ public class AiAnalysisService {
     private static final String GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
     private static final String OLLAMA_DEFAULT_URL = "http://localhost:11434";
     private static final int MAX_ARTIFACT_LENGTH = 120_000;
+    private static final String OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
     private static final int MAX_FINDING_CONTEXT_CHARS = 12_000;
+    private static final int MAX_FINDING_CONTEXT_COMPACT = 7_000;
     private static final int MAX_CODE_SNIPPET_CHARS = 10_000;
+    private static final int MAX_CODE_SNIPPET_COMPACT = 6_000;
     private static final int MAX_TOTAL_PROMPT_CHARS = 28_000;
+    private static final int MAX_TOTAL_PROMPT_COMPACT = 16_000;
     private static final int DEFAULT_RETRY_DELAY_SECONDS = 45;
     private static final int MAX_CHAT_TURNS = 24;
     private static final int MAX_CHAT_MESSAGE_CHARS = 10_000;
@@ -88,6 +101,9 @@ public class AiAnalysisService {
     private final ObjectMapper objectMapper;
     private final PlaybookRagService playbookRagService;
     private final PipelineKnowledgeService pipelineKnowledgeService;
+    private final AiRemediationCacheService remediationCacheService;
+    private final StaticRemediationTemplateService staticRemediationTemplateService;
+    private final AiRemediationJobService remediationJobService;
 
     public record ChatTurn(String role, String content) {}
 
@@ -96,6 +112,14 @@ public class AiAnalysisService {
 
     @Value("${ai.enabled:true}")
     private boolean aiEnabled;
+
+    /** Cache BDD des remédiations (désactiver pour tester Groq/OpenRouter/Ollama à chaque requête). */
+    @Value("${ai.remediation.cache.enabled:true}")
+    private boolean remediationCacheEnabled;
+
+    /** Templates OWASP statiques sans appel IA (désactiver pour forcer les modèles cloud). */
+    @Value("${ai.remediation.static-templates.enabled:true}")
+    private boolean remediationStaticTemplatesEnabled;
 
     // Gemini
     @Value("${ai.gemini.api-key:}")
@@ -112,6 +136,29 @@ public class AiAnalysisService {
     private String groqModelFast;
     @Value("${ai.groq.reasoning-effort:low}")
     private String groqReasoningEffort;
+    @Value("${ai.groq.fallback-to-ollama:true}")
+    private boolean groqFallbackToOllama;
+    @Value("${ai.groq.fallback-to-gemini:true}")
+    private boolean groqFallbackToGemini;
+    @Value("${ai.groq.fallback-to-openrouter:true}")
+    private boolean groqFallbackToOpenrouter;
+
+    // OpenRouter (secours cloud gratuit, modèles code)
+    @Value("${ai.openrouter.api-key:}")
+    private String openrouterApiKey;
+    /** Liste CSV essayée dans l'ordre ; openrouter/free = routeur auto des modèles gratuits disponibles. */
+    @Value("${ai.openrouter.models:openrouter/free,openai/gpt-oss-20b:free,qwen/qwen3-coder:free,cohere/north-mini-code:free,meta-llama/llama-3.3-70b-instruct:free}")
+    private String openrouterModelsCsv;
+    @Value("${ai.openrouter.model:qwen/qwen3-coder:free}")
+    private String openrouterModel;
+    @Value("${ai.openrouter.model-fallback:openai/gpt-oss-20b:free}")
+    private String openrouterModelFallback;
+    @Value("${ai.openrouter.retry-on-429:true}")
+    private boolean openrouterRetryOn429;
+    @Value("${ai.openrouter.max-retries-per-model:2}")
+    private int openrouterMaxRetriesPerModel;
+    @Value("${ai.openrouter.http-referer:}")
+    private String openrouterHttpReferer;
 
     // Ollama (local, pas de clé)
     @Value("${ai.ollama.url:http://localhost:11434}")
@@ -122,6 +169,11 @@ public class AiAnalysisService {
     private double ollamaTemperature;
     @Value("${ai.ollama.num-predict:8192}")
     private int ollamaNumPredict;
+    /** 0 = CPU uniquement (évite erreurs CUDA) ; -1 = laisser Ollama choisir le GPU. */
+    @Value("${ai.ollama.num-gpu:0}")
+    private int ollamaNumGpu;
+    @Value("${ai.ollama.read-timeout-seconds:600}")
+    private int ollamaReadTimeoutSeconds;
 
     /**
      * Analyse le contenu d'un artifact (JSON ou texte) et renvoie les vulnérabilités
@@ -170,17 +222,53 @@ public class AiAnalysisService {
      */
     public FindingAiRemediationResponse analyzeFindingRemediation(UUID applicationId, String branch,
                                                                    String findingContextBlock, String optionalCodeSnippet) {
+        return analyzeFindingRemediation(applicationId, branch, findingContextBlock, optionalCodeSnippet,
+                RemediationRequestContext.fromFindingContext(findingContextBlock, false));
+    }
+
+    public FindingAiRemediationResponse analyzeFindingRemediation(UUID applicationId, String branch,
+                                                                   String findingContextBlock, String optionalCodeSnippet,
+                                                                   RemediationRequestContext reqCtx) {
         if (!aiEnabled) {
-            return FindingAiRemediationResponse.builder()
-                    .problemSummary("Analyse IA désactivée (ai.enabled=true).")
-                    .aiProviderUsed("disabled")
-                    .aiModelUsed(null)
-                    .quotaFallbackUsed(false)
-                    .aiModelTier("DEFAULT")
-                    .build();
+            return disabledRemediationResponse();
         }
         String provider = (aiProvider != null) ? aiProvider.strip().toLowerCase() : "groq";
-        if (!isProviderConfigured(provider)) {
+        RemediationRequestContext meta = reqCtx != null
+                ? reqCtx
+                : RemediationRequestContext.fromFindingContext(findingContextBlock, false);
+        boolean compact = !meta.deepAnalysis();
+
+        String snippet = optionalCodeSnippet != null ? optionalCodeSnippet : "";
+        String cacheKey = remediationCacheService.computeCacheKey(
+                meta.ruleKey(), meta.filePath(), meta.line(), snippet, meta.deepAnalysis());
+
+        Optional<FindingAiRemediationResponse> cached = remediationCacheEnabled
+                ? remediationCacheService.get(cacheKey)
+                : Optional.empty();
+        if (cached.isPresent()) {
+            remediationCacheService.touchHit(cacheKey);
+            log.info("[AI] Cache hit ({})", cacheKey.substring(0, 8));
+            return cached.get();
+        }
+        if (!remediationCacheEnabled) {
+            log.debug("[AI] Cache remédiation désactivé (ai.remediation.cache.enabled=false)");
+        }
+
+        if (remediationStaticTemplatesEnabled && !meta.deepAnalysis()) {
+            Optional<FindingAiRemediationResponse> staticHit =
+                    staticRemediationTemplateService.match(findingContextBlock, false);
+            if (staticHit.isPresent()) {
+                FindingAiRemediationResponse r = personalizeStaticResponse(staticHit.get(), findingContextBlock);
+                if (remediationCacheEnabled) {
+                    remediationCacheService.put(cacheKey, r, "STATIC", "static-template", r.getAiModelUsed());
+                }
+                return r;
+            }
+        } else if (!remediationStaticTemplatesEnabled) {
+            log.debug("[AI] Templates statiques désactivés (ai.remediation.static-templates.enabled=false)");
+        }
+
+        if (!isProviderConfigured(provider) && !groqFallbackToOpenrouter && !groqFallbackToOllama) {
             return FindingAiRemediationResponse.builder()
                     .problemSummary("Provider '" + provider + "' non configuré. " + getConfigHint(provider))
                     .aiProviderUsed(provider)
@@ -190,28 +278,55 @@ public class AiAnalysisService {
                     .build();
         }
 
+        int maxCtx = compact ? MAX_FINDING_CONTEXT_COMPACT : MAX_FINDING_CONTEXT_CHARS;
+        int maxSnippet = compact ? MAX_CODE_SNIPPET_COMPACT : MAX_CODE_SNIPPET_CHARS;
+        int maxPrompt = compact ? MAX_TOTAL_PROMPT_COMPACT : MAX_TOTAL_PROMPT_CHARS;
+
         String ctx = findingContextBlock != null ? findingContextBlock : "";
-        if (ctx.length() > MAX_FINDING_CONTEXT_CHARS) {
-            ctx = ctx.substring(0, MAX_FINDING_CONTEXT_CHARS) + "\n\n[... contexte tronqué ...]";
+        if (ctx.length() > maxCtx) {
+            ctx = ctx.substring(0, maxCtx) + "\n\n[... contexte tronqué ...]";
         }
-        String snippet = optionalCodeSnippet != null ? optionalCodeSnippet : "";
-        if (snippet.length() > MAX_CODE_SNIPPET_CHARS) {
-            snippet = snippet.substring(0, MAX_CODE_SNIPPET_CHARS) + "\n\n[... snippet tronqué ...]";
+        if (snippet.length() > maxSnippet) {
+            snippet = snippet.substring(0, maxSnippet) + "\n\n[... snippet tronqué ...]";
         }
 
-        String prompt = buildFindingRemediationPrompt(applicationId, branch, ctx, snippet, isLikelySecretOrCredentialFinding(ctx));
-        if (prompt.length() > MAX_TOTAL_PROMPT_CHARS) {
-            log.warn("[AI] Prompt trop long ({} chars) — troncature à {}", prompt.length(), MAX_TOTAL_PROMPT_CHARS);
-            prompt = prompt.substring(0, MAX_TOTAL_PROMPT_CHARS) + "\n\n[... prompt tronqué pour respecter la limite du modèle ...]";
+        String prompt = buildFindingRemediationPrompt(applicationId, branch, ctx, snippet,
+                isLikelySecretOrCredentialFinding(ctx), compact);
+        if (prompt.length() > maxPrompt) {
+            log.warn("[AI] Prompt trop long ({} chars) — troncature à {}", prompt.length(), maxPrompt);
+            prompt = prompt.substring(0, maxPrompt) + "\n\n[... prompt tronqué ...]";
         }
+
+        String groqModelChoice = compact ? groqModelFast : groqModel;
         try {
-            AiCallResult r = callAiProviderWithFallbackResult(provider, prompt, "finding_remediation", REMEDIATION_SCHEMA);
+            AiCallResult r = callAiProviderWithFallbackResult(
+                    provider, prompt, "finding_remediation", REMEDIATION_SCHEMA, groqModelChoice, cacheKey);
+            log.info("[AI] Remédiation OK — provider={} model={} fallback={}",
+                    r.providerUsed(), r.modelUsed(), r.quotaFallbackUsed());
             FindingAiRemediationResponse out = parseFindingRemediationResponse(r.text());
-            return out.toBuilder()
+            out = out.toBuilder()
                     .aiProviderUsed(r.providerUsed())
                     .aiModelUsed(r.modelUsed())
                     .quotaFallbackUsed(r.quotaFallbackUsed())
                     .aiModelTier(r.quotaFallbackUsed() ? "HIGH" : "DEFAULT")
+                    .responseSource(r.providerUsed() != null ? r.providerUsed().toUpperCase(Locale.ROOT) : null)
+                    .status("COMPLETE")
+                    .build();
+            if (remediationCacheEnabled) {
+                remediationCacheService.put(cacheKey, out, out.getResponseSource(), r.providerUsed(), r.modelUsed());
+            }
+            return out;
+        } catch (AsyncRemediationPendingException pending) {
+            return FindingAiRemediationResponse.builder()
+                    .status("PENDING")
+                    .jobId(pending.getJobId())
+                    .problemSummary("Analyse locale en cours (Ollama) — vous pouvez rester sur cette page, le résultat s'affichera automatiquement.")
+                    .aiProviderUsed("ollama")
+                    .aiModelUsed(ollamaModel)
+                    .quotaFallbackUsed(true)
+                    .aiModelTier("HIGH")
+                    .responseSource("OLLAMA")
+                    .confidence("MEDIUM")
                     .build();
         } catch (Exception e) {
             log.error("Erreur remédiation finding IA ({}): {}", provider, e.getMessage());
@@ -221,8 +336,68 @@ public class AiAnalysisService {
                     .aiModelUsed(resolveModelName(provider))
                     .quotaFallbackUsed(false)
                     .aiModelTier("DEFAULT")
+                    .status("FAILED")
                     .build();
         }
+    }
+
+    public Optional<FindingAiRemediationResponse> pollRemediationJob(String jobId) {
+        if (jobId == null || jobId.isBlank()) {
+            return Optional.empty();
+        }
+        return remediationJobService.get(jobId).map(st -> {
+            if ("COMPLETE".equals(st.status()) && st.result() != null) {
+                remediationJobService.evict(jobId);
+                return st.result().toBuilder().status("COMPLETE").jobId(null).build();
+            }
+            if ("FAILED".equals(st.status())) {
+                remediationJobService.evict(jobId);
+                return FindingAiRemediationResponse.builder()
+                        .status("FAILED")
+                        .problemSummary(st.error() != null ? st.error() : "Analyse Ollama échouée.")
+                        .aiProviderUsed("ollama")
+                        .build();
+            }
+            return FindingAiRemediationResponse.builder()
+                    .status("PENDING")
+                    .jobId(jobId)
+                    .problemSummary("Analyse locale en cours (Ollama)…")
+                    .aiProviderUsed("ollama")
+                    .aiModelUsed(ollamaModel)
+                    .build();
+        });
+    }
+
+    private FindingAiRemediationResponse disabledRemediationResponse() {
+        return FindingAiRemediationResponse.builder()
+                .problemSummary("Analyse IA désactivée (ai.enabled=true).")
+                .aiProviderUsed("disabled")
+                .quotaFallbackUsed(false)
+                .aiModelTier("DEFAULT")
+                .build();
+    }
+
+    private FindingAiRemediationResponse personalizeStaticResponse(FindingAiRemediationResponse base, String findingContext) {
+        String file = extractContextField(findingContext, "Fichier:");
+        String line = extractContextField(findingContext, "Ligne:");
+        String location = base.getLocation();
+        if ((location == null || location.isBlank() || location.startsWith("Voir fichier"))
+                && file != null && !file.isBlank()) {
+            location = line != null && !line.isBlank() ? file + ":" + line : file;
+        }
+        return base.toBuilder().location(location).build();
+    }
+
+    private static String extractContextField(String ctx, String prefix) {
+        if (ctx == null) {
+            return null;
+        }
+        for (String line : ctx.split("\n")) {
+            if (line.startsWith(prefix)) {
+                return line.substring(prefix.length()).trim();
+            }
+        }
+        return null;
     }
 
     private record AiCallResult(String text, String providerUsed, String modelUsed, boolean quotaFallbackUsed) {}
@@ -231,6 +406,7 @@ public class AiAnalysisService {
         if (provider == null) return null;
         return switch (provider) {
             case "groq" -> groqModel;
+            case "openrouter" -> openrouterModel;
             case "ollama" -> ollamaModel;
             case "gemini" -> geminiModel;
             default -> null;
@@ -270,18 +446,46 @@ public class AiAnalysisService {
             Stack du projet testé : le contexte finding commence par « TECHNOLOGIES_DEDUITES » (nom/description du projet sur la plateforme, dépôt GitHub/GitLab, chemins type package.json ou pom.xml, chemin d'artefact, extrait de code). Utilise ces indices pour proposer des commandes et exemples adaptés (npm/yarn/pnpm vs mvn/gradle vs pip, Angular/React, etc.). Si un indice contredit filePath ou packageName du finding, privilégie les faits du finding.
             """;
 
+    /** Consigne langue injectée dans tous les appels LLM (Groq, OpenRouter, Ollama). */
+    private static final String RESPONSE_LANGUAGE_FR = """
+            LANGUE OBLIGATOIRE — FRANÇAIS :
+            - Rédige TOUT le contenu destiné à l'utilisateur en français (fr-FR).
+            - Interdit de répondre en anglais pour les explications, étapes, résumés, risques métier.
+            - Exceptions autorisées en anglais : identifiants CVE/CWE, noms de fichiers, commandes shell, extraits de code, URLs, enums JSON (HIGH/MEDIUM/LOW, CWE/CVE/OWASP/DOC).
+            - remediationSteps, problemSummary, rootCause, impact, businessRisk, bestPractices, verificationHints : toujours en français.
+            """;
+
+    private static List<java.util.Map<String, String>> llmMessagesWithFrenchSystem(String userPrompt) {
+        List<java.util.Map<String, String>> messages = new ArrayList<>();
+        messages.add(java.util.Map.of("role", "system", "content", RESPONSE_LANGUAGE_FR));
+        messages.add(java.util.Map.of("role", "user", "content", userPrompt));
+        return messages;
+    }
+
     private String buildFindingRemediationPrompt(UUID applicationId, String branch,
                                                  String findingContext, String codeSnippet, boolean secretOrCredentialFinding) {
+        return buildFindingRemediationPrompt(applicationId, branch, findingContext, codeSnippet, secretOrCredentialFinding, false);
+    }
+
+    private String buildFindingRemediationPrompt(UUID applicationId, String branch,
+                                                 String findingContext, String codeSnippet,
+                                                 boolean secretOrCredentialFinding, boolean compact) {
         String secretRules = remediationSecretRulesAppendix(secretOrCredentialFinding);
-        String playbooksBlock = buildPlaybooksBlockForPrompt(findingContext, codeSnippet);
-        if (playbooksBlock.length() > 9_000) {
-            playbooksBlock = playbooksBlock.substring(0, 9_000) + "\n[...playbooks tronqués]";
+        String playbooksBlock = buildPlaybooksBlockForPrompt(findingContext, codeSnippet, compact ? 1 : 2);
+        int playbookMax = compact ? 3_500 : 9_000;
+        if (playbooksBlock.length() > playbookMax) {
+            playbooksBlock = playbooksBlock.substring(0, playbookMax) + "\n[...playbooks tronqués]";
         }
 
-        String pipelineCtx = pipelineKnowledgeService.getPipelineContextBlock(applicationId, branch);
-        List<String> appDocs = pipelineKnowledgeService.retrieveAppDocs(applicationId, branch, findingContext, 1);
-        String appDocsBlock = appDocs.isEmpty() ? ""
-                : "\nDocuments spécifiques au projet analysé :\n" + String.join("\n---\n", appDocs) + "\n";
+        String pipelineCtx = compact
+                ? truncateField(pipelineKnowledgeService.getPipelineContextBlock(applicationId, branch), 1_800)
+                : pipelineKnowledgeService.getPipelineContextBlock(applicationId, branch);
+        String appDocsBlock = "";
+        if (!compact) {
+            List<String> appDocs = pipelineKnowledgeService.retrieveAppDocs(applicationId, branch, findingContext, 1);
+            appDocsBlock = appDocs.isEmpty() ? ""
+                    : "\nDocuments spécifiques au projet analysé :\n" + String.join("\n---\n", appDocs) + "\n";
+        }
 
         String snippetSection = codeSnippet.isBlank()
                 ? "(Aucun extrait de code fourni — base-toi sur le contexte du scanner et propose une correction type : dépendance, config, ou pattern de code.)"
@@ -305,31 +509,25 @@ public class AiAnalysisService {
 
                 %s
 
+                %s
+
+                %s
+
                 HIÉRARCHIE DES SOURCES (ordre de priorité strict) :
                 1. Les données du finding ci-dessous (titre, sévérité, CVE/CWE, fichier, ligne, description scanner) = vérité terrain. Ne les contredis jamais.
-                2. L'extrait de code réel du dépôt s'il est fourni.
-                3. Le bloc PIPELINE_CONTEXT / TECHNOLOGIES_DEDUITES (stack réelle du projet analysé) : adapte commandes et exemples (npm vs mvn vs pip, Angular vs React...).
+                2. L'extrait de code réel du dépôt s'il est fourni (méthode/fonction englobante si présent).
+                3. Le bloc PIPELINE_CONTEXT / TECHNOLOGIES_DEDUITES : adapte commandes et exemples.
                 4. Les playbooks fournis.
-                5. Tes connaissances générales — UNIQUEMENT pour les bonnes pratiques et explications, JAMAIS pour inventer des faits.
+                5. Tes connaissances générales — UNIQUEMENT pour les bonnes pratiques, JAMAIS pour inventer des faits.
 
                 RÈGLES ANTI-HALLUCINATION (obligatoires) :
                 - N'invente JAMAIS : identifiant CVE ou CWE absent du contexte, numéro de version, chemin de fichier, nom de package, URL.
-                - Si une information manque, mets "" (chaîne vide) dans le champ concerné, ou écris "Non déterminable à partir du contexte". Ne comble pas les trous.
-                - references : uniquement (a) les CVE/CWE explicitement présents dans le contexte, avec URL canonique (CWE → https://cwe.mitre.org/data/definitions/<numéro>.html ; CVE → https://nvd.nist.gov/vuln/detail/<CVE-ID>), (b) au plus une cheat sheet OWASP pertinente (https://cheatsheetseries.owasp.org/...) si tu es certain qu'elle existe, (c) rien d'autre. Si aucune référence sûre : tableau vide.
-                - confidence : HIGH si finding + code réel + playbook concordent ; MEDIUM si le contexte est partiel ; LOW si tu extrapoles.
-                - reproduction : uniquement si observable de façon sûre et légitime (ex. relancer le scanner localement, ouvrir la page et inspecter la balise). Jamais d'exploitation offensive. Sinon "".
+                - Si une information manque, mets "" ou "Non déterminable à partir du contexte".
+                - references : uniquement CVE/CWE du contexte avec URL canonique, ou OWASP cheat sheet pertinente, sinon [].
+                - confidence : HIGH si finding + code + playbook concordent ; MEDIUM si partiel ; LOW si extrapolation.
+                - reproduction : uniquement si observable de façon sûre, sinon "".
 
-                CONTENU ATTENDU PAR CHAMP :
-                - problemSummary : 2-4 phrases claires, sans jargon inutile.
-                - rootCause : POURQUOI le problème existe (pattern de code, dépendance obsolète, config manquante...), pas une redite du résumé.
-                - impact : impact sécurité technique (ce qu'un attaquant peut faire / ce qui casse). Pour scanType=LICENSE : impact légal/conformité UNIQUEMENT, pas d'attaquant.
-                - businessRisk : conséquence métier concrète (fuite de données clients, indisponibilité, amende/conformité, réputation), 1-3 phrases proportionnées à la sévérité.
-                - location : fichier:ligne si présents, sinon package/composant/image. Distingue fichier source du dépôt vs rapport JSON produit par le CI.
-                - remediationSteps : 4 à 8 étapes, chacune actionnable SANS accès pipeline (édition locale, commandes poste dev, commit/push, relancer l'analyse depuis la plateforme). Chaque étape dit QUOI modifier et COMMENT (outil, commande, syntaxe).
-                - secureCodeBefore / secureCodeAfter : extrait vulnérable vs extrait corrigé, copiables, dans le langage du projet. Si non applicable (ex. pure mise à jour de version) : "" et mets la commande dans suggestedPatch.
-                - suggestedPatch : correctif copiable (diff, commande, balise, config).
-                - bestPractices : 2-5 pratiques durables liées à CETTE famille de problème (pas des généralités "faites des revues de code").
-                - verificationCommands : commandes poste développeur ; verificationHints : contrôles manuels + "relancer l'analyse depuis la plateforme".
+                CONTENU ATTENDU : problemSummary (2-4 phrases), rootCause, impact, businessRisk, location, remediationSteps (4-8 étapes actionnables sans accès pipeline), suggestedPatch, secureCodeBefore/After si applicable, bestPractices (2-5), verificationCommands/Hints.
 
                 La sortie est contrôlée par un schéma JSON strict. Remplis TOUS les champs.
 
@@ -337,12 +535,26 @@ public class AiAnalysisService {
                 %s
 
                 %s
-                """.formatted(REMEDIATION_PLATFORM_AUDIENCE, secretRules, pipelineCtx, appDocsBlock, playbooksBlock, findingContext, snippetSection);
+                """.formatted(
+                RESPONSE_LANGUAGE_FR,
+                compact ? "(Mode compact — réponse concise en français, pas de verbosité.)" : "",
+                REMEDIATION_PLATFORM_AUDIENCE, secretRules, pipelineCtx, appDocsBlock, playbooksBlock, findingContext, snippetSection);
+    }
+
+    private static String truncateField(String s, int max) {
+        if (s == null || s.length() <= max) {
+            return s != null ? s : "";
+        }
+        return s.substring(0, max) + "\n[...tronqué]";
     }
 
     private String buildPlaybooksBlockForPrompt(String findingContext, String codeSnippet) {
+        return buildPlaybooksBlockForPrompt(findingContext, codeSnippet, 2);
+    }
+
+    private String buildPlaybooksBlockForPrompt(String findingContext, String codeSnippet, int maxHits) {
         String combined = (findingContext == null ? "" : findingContext) + "\n\n" + (codeSnippet == null ? "" : codeSnippet);
-        List<String> hits = playbookRagService.retrievePlaybooks(combined, 2);
+        List<String> hits = playbookRagService.retrievePlaybooks(combined, maxHits);
         if (hits.isEmpty()) {
             return "Playbooks (références) : (aucun playbook spécifique sélectionné)\n";
         }
@@ -580,7 +792,9 @@ public class AiAnalysisService {
         String playbooks = buildPlaybooksBlockForChat(findingContext, codeSnippetSection);
         String pipelineCtx = pipelineKnowledgeService.getPipelineContextBlock(applicationId, branch);
         return """
-                Tu es un assistant pédagogique sécurité / DevSecOps. Tu aides un développeur qui consulte un finding dans une application (tableau de bord sécurité) : il voit les résultats de scan sur son projet. N'invente pas de CVE ni de chemins absents du contexte.
+                Tu es un assistant pédagogique sécurité / DevSecOps. Tu aides un développeur francophone qui consulte un finding dans une application (tableau de bord sécurité).
+
+                LANGUE : réponds EXCLUSIVEMENT en français. Jamais en anglais (sauf termes techniques CVE, commandes, code).
 
                 Contexte utilisateur : en général il n'a pas accès pour modifier les pipelines CI/CD depuis cet écran ; il peut éditer son code en local, pousser, et relancer une analyse depuis l'application. Ne lui impose pas « modifie ton pipeline GitLab », « ajoute une étape Semgrep au CI » ou des hypothèses d'accès qu'il n'a peut-être pas. Pour SRI (integrity sur link/script), ne dis pas de passer par des variables d'environnement : c'est dans le HTML ou les templates du dépôt.
                 Le bloc « TECHNOLOGIES_DEDUITES » en tête du contexte résume la stack probable du projet testé : tiens-en compte pour les commandes et exemples (npm vs mvn vs pip…).
@@ -597,14 +811,13 @@ public class AiAnalysisService {
                 %s
 
                 Règles générales :
-                - Réponds en français, clair et structuré si utile.
                 - Tu peux t'appuyer sur l'extrait de code fourni quand il est présent pour expliquer ligne par ligne ou proposer une correction localisée.
                 - Explique la différence entre un « fichier dans le dépôt source » et un « rapport JSON produit par le job CI » (ex. reports/.../npm-audit.json).
                 - Pour SCA/npm audit : une alerte porte souvent sur un PACKAGE (ex. aws-sdk dans node_modules), pas sur un fichier source nommé comme le titre du finding.
                 - Si l'utilisateur dit qu'il ne trouve pas un « fichier », précise que le titre peut être la vulnérabilité / le module, pas un chemin disque dans son repo.
                 - Pour clés, tokens, Cognito ClientId, etc. : priorité aux variables de configuration / secrets managers, pas aux littéraux dans le code.
                 - Formate toujours tes réponses en Markdown lisible : titres courts avec ## si plusieurs parties, listes à puces ou numérotées, paragraphes séparés par une ligne vide.
-                - Pour toute commande shell (openssl, npm, git, curl, docker, etc.) ou sortie terminal : mets-la dans un bloc de code avec le langage bash, par exemple trois backticks puis bash puis la commande puis trois backticks — ne colle pas les commandes dans le corps du texte sans bloc.
+                - Pour toute commande shell (openssl, npm, git, curl, docker, etc.) ou sortie terminal : mets-la dans un bloc de code avec le langage bash.
                 - Réponses concises ; ne pas répéter tout le contexte à chaque tour.
                 """.formatted(playbooks, pipelineCtx, findingContext, remediationBlock, codeSnippetSection, secretChat);
     }
@@ -686,11 +899,31 @@ public class AiAnalysisService {
     private AiCallResult callAiProviderWithFallbackResult(String provider, String prompt,
                                                           String schemaName, String jsonSchema,
                                                           String groqModelOverride) throws Exception {
+        return callAiProviderWithFallbackResult(provider, prompt, schemaName, jsonSchema, groqModelOverride, null);
+    }
+
+    private AiCallResult callAiProviderWithFallbackResult(String provider, String prompt,
+                                                          String schemaName, String jsonSchema,
+                                                          String groqModelOverride, String cacheKey) throws Exception {
         if (!"groq".equals(provider)) {
-            String text = "ollama".equals(provider)
-                    ? callOllama(prompt, jsonSchema)
-                    : callAiProvider(provider, prompt);
+            if ("ollama".equals(provider)) {
+                String text = callOllama(prompt, jsonSchema);
+                return new AiCallResult(text, provider, ollamaModel, false);
+            }
+            if ("openrouter".equals(provider)) {
+                OpenRouterCallResult or = callOpenRouterWithModelFallback(prompt, schemaName, jsonSchema);
+                return new AiCallResult(or.text(), "openrouter", or.modelUsed(), false);
+            }
+            String text = callAiProvider(provider, prompt);
             return new AiCallResult(text, provider, resolveModelName(provider), false);
+        }
+        if (!isProviderConfigured("groq")) {
+            if (isProviderConfigured("openrouter")) {
+                log.info("[AI] Groq non configuré — OpenRouter");
+                OpenRouterCallResult or = callOpenRouterWithModelFallback(prompt, schemaName, jsonSchema);
+                return new AiCallResult(or.text(), "openrouter", or.modelUsed(), false);
+            }
+            return tryGroqQuotaFallbacks(prompt, jsonSchema, cacheKey);
         }
         String effectiveGroqModel = (groqModelOverride != null && !groqModelOverride.isBlank())
                 ? groqModelOverride : groqModel;
@@ -699,12 +932,91 @@ public class AiAnalysisService {
             return new AiCallResult(text, "groq", effectiveGroqModel, false);
         } catch (Exception e) {
             if (isGroqQuotaExceeded(e)) {
-                log.warn("[AI][SWITCH] Groq quota (429) → Ollama (model={})", ollamaModel);
-                String text = callOllama(prompt, jsonSchema);
-                return new AiCallResult(text, "ollama", ollamaModel, true);
+                return tryGroqQuotaFallbacks(prompt, jsonSchema, cacheKey);
             }
             throw e;
         }
+    }
+
+    /** Groq quota (429) → OpenRouter → Gemini → Ollama (async si cacheKey). */
+    private AiCallResult tryGroqQuotaFallbacks(String prompt, String jsonSchema, String cacheKey) throws Exception {
+        Exception lastError = null;
+        if (groqFallbackToOpenrouter && isProviderConfigured("openrouter")) {
+            try {
+                log.warn("[AI][SWITCH] Groq quota (429) → OpenRouter ({})", openRouterModelsToTry());
+                OpenRouterCallResult or = callOpenRouterWithModelFallback(prompt, "finding_remediation", jsonSchema);
+                return new AiCallResult(or.text(), "openrouter", or.modelUsed(), true);
+            } catch (Exception orErr) {
+                lastError = orErr;
+                log.warn("[AI][SWITCH] OpenRouter fallback échoué : {}", orErr.getMessage());
+            }
+        }
+        if (groqFallbackToGemini && isProviderConfigured("gemini")) {
+            try {
+                log.warn("[AI][SWITCH] Groq quota → Gemini (model={})", geminiModel);
+                String text = callGemini(prompt);
+                return new AiCallResult(text, "gemini", geminiModel, true);
+            } catch (Exception gemErr) {
+                lastError = gemErr;
+                log.warn("[AI][SWITCH] Gemini fallback échoué : {}", gemErr.getMessage());
+            }
+        }
+        if (groqFallbackToOllama) {
+            if (cacheKey != null) {
+                log.warn("[AI][SWITCH] Groq quota → Ollama async (model={})", ollamaModel);
+                String jobId = remediationJobService.submit("ollama-remediation", () ->
+                        runOllamaRemediationJob(prompt, jsonSchema, cacheKey));
+                throw new AsyncRemediationPendingException(jobId);
+            }
+            try {
+                log.warn("[AI][SWITCH] Groq quota (429) → Ollama sync (model={})", ollamaModel);
+                String text = callOllama(prompt, jsonSchema);
+                return new AiCallResult(text, "ollama", ollamaModel, true);
+            } catch (Exception ollamaErr) {
+                lastError = ollamaErr;
+                log.warn("[AI][SWITCH] Ollama fallback échoué : {}", ollamaErr.getMessage());
+            }
+        }
+        if (lastError != null) {
+            throw new RuntimeException(
+                    "Quota Groq dépassé et secours indisponible. "
+                            + summarizeOllamaFailure(lastError),
+                    lastError);
+        }
+        throw new RuntimeException(
+                "Tous les providers cloud sont indisponibles (Groq quota, OpenRouter :free saturé, Gemini quota). "
+                        + "Solutions : 1) attendre 1–2 min et réessayer ; 2) lancer Ollama : « ollama serve » puis « ollama pull "
+                        + ollamaModel + " » ; 3) définir ai.provider=openrouter si Groq est épuisé.");
+    }
+
+    private FindingAiRemediationResponse runOllamaRemediationJob(String prompt, String jsonSchema, String cacheKey) {
+        String text = callOllama(prompt, jsonSchema);
+        FindingAiRemediationResponse out = parseFindingRemediationResponse(text);
+        out = out.toBuilder()
+                .aiProviderUsed("ollama")
+                .aiModelUsed(ollamaModel)
+                .quotaFallbackUsed(true)
+                .responseSource("OLLAMA")
+                .status("COMPLETE")
+                .build();
+        if (remediationCacheEnabled) {
+            remediationCacheService.put(cacheKey, out, "OLLAMA", "ollama", ollamaModel);
+        }
+        return out;
+    }
+
+    private AiCallResult tryGroqQuotaFallbacksChat(List<java.util.Map<String, String>> messages) throws Exception {
+        Exception lastError = null;
+        if (groqFallbackToOllama) {
+            try {
+                log.warn("[AI][SWITCH] Groq chat quota (429) → Ollama (model={})", ollamaModel);
+                return new AiCallResult(callOllamaChat(messages), "ollama", ollamaModel, true);
+            } catch (Exception ollamaErr) {
+                lastError = ollamaErr;
+                log.warn("[AI][SWITCH] Ollama chat fallback échoué : {}", ollamaErr.getMessage());
+            }
+        }
+        throw lastError != null ? lastError : new RuntimeException("Quota Groq dépassé — secours chat indisponible.");
     }
 
     /** Chat : Groq 429 → fallback Ollama pour cet appel. */
@@ -725,14 +1037,30 @@ public class AiAnalysisService {
             return callGroqChat(messages);
         } catch (Exception e) {
             if (isGroqQuotaExceeded(e)) {
-                log.warn("[AI][SWITCH] Groq chat quota (429) → Ollama (model={})", ollamaModel);
-                return callOllamaChat(messages);
+                if (groqFallbackToGemini && isProviderConfigured("gemini")) {
+                    log.warn("[AI][SWITCH] Groq chat quota → Gemini");
+                    return callGeminiFindingChatPlain(system, turns);
+                }
+                AiCallResult r = tryGroqQuotaFallbacksChat(messages);
+                return r.text();
             }
             throw e;
         }
     }
 
     private String callOllamaChat(List<java.util.Map<String, String>> messages) {
+        try {
+            return callOllamaChatInternal(messages, ollamaNumGpu);
+        } catch (RuntimeException e) {
+            if (ollamaNumGpu != 0 && isOllamaCudaOrGpuFailure(e.getMessage())) {
+                log.warn("[AI] Ollama chat GPU/CUDA en échec — nouvel essai en CPU (num_gpu=0)");
+                return callOllamaChatInternal(messages, 0);
+            }
+            throw e;
+        }
+    }
+
+    private String callOllamaChatInternal(List<java.util.Map<String, String>> messages, int numGpu) {
         String url = ollamaUrl.replaceAll("/+$", "") + "/api/chat";
         var body = new java.util.LinkedHashMap<String, Object>();
         body.put("model", ollamaModel);
@@ -742,18 +1070,24 @@ public class AiAnalysisService {
         }
         body.put("messages", msgList);
         body.put("stream", false);
-        addOllamaGenerationOptions(body);
+        if (msgList.stream().noneMatch(m -> "system".equals(m.get("role")))) {
+            msgList.add(0, new java.util.LinkedHashMap<>(java.util.Map.of("role", "system", "content", RESPONSE_LANGUAGE_FR)));
+        }
+        addOllamaGenerationOptions(body, numGpu);
 
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
         HttpEntity<Object> entity = new HttpEntity<>(body, headers);
-        RestTemplate rest = new RestTemplate();
+        RestTemplate rest = createOllamaRestTemplate();
         try {
             ResponseEntity<JsonNode> response = rest.exchange(url, HttpMethod.POST, entity, JsonNode.class);
             if (response.getBody() == null) throw new RuntimeException("Réponse Ollama vide");
             String text = response.getBody().path("message").path("content").asText(null);
             if (text == null || text.isBlank()) throw new RuntimeException("Ollama n'a pas renvoyé de contenu");
             return cleanDeepSeekResponse(text).strip();
+        } catch (HttpServerErrorException e) {
+            String detail = truncateOllamaErrorBody(e.getResponseBodyAsString());
+            throw new RuntimeException("Ollama erreur " + e.getStatusCode().value() + " : " + detail, e);
         } catch (org.springframework.web.client.ResourceAccessException e) {
             throw new RuntimeException("Ollama inaccessible à " + ollamaUrl + ". Vérifie le service et ai.ollama.model.", e);
         }
@@ -803,6 +1137,7 @@ public class AiAnalysisService {
         return switch (provider) {
             case "gemini" -> geminiApiKey != null && !geminiApiKey.isBlank();
             case "groq" -> groqApiKey != null && !groqApiKey.isBlank();
+            case "openrouter" -> openrouterApiKey != null && !openrouterApiKey.isBlank();
             case "ollama" -> true;
             default -> false;
         };
@@ -812,8 +1147,9 @@ public class AiAnalysisService {
         return switch (provider) {
             case "gemini" -> "Définissez ai.gemini.api-key. Ou utilisez ai.provider=groq avec ai.groq.api-key (gratuit, console.groq.com).";
             case "groq" -> "Définissez ai.groq.api-key. Clé gratuite sur https://console.groq.com (pas de carte requise).";
+            case "openrouter" -> "Définissez ai.openrouter.api-key. Clé gratuite sur https://openrouter.ai/keys";
             case "ollama" -> "Lancez Ollama localement : ollama run " + ollamaModel + ". Ou utilisez ai.provider=groq.";
-            default -> "Choisissez ai.provider=groq, ollama ou gemini et configurez la clé correspondante.";
+            default -> "Choisissez ai.provider=groq, openrouter, ollama ou gemini et configurez la clé correspondante.";
         };
     }
 
@@ -828,9 +1164,11 @@ public class AiAnalysisService {
 
     private String buildPrompt(String artifactContent, String sourceHint) {
         return """
+            %s
+
             Tu es un expert en sécurité applicative. Analyse ce rapport d'artifact de pipeline de sécurité%s.
             Identifie toutes les vulnérabilités ou problèmes de sécurité (CVE, faiblesses, dépendances vulnérables, etc.).
-            Pour chaque élément, fournis :
+            Pour chaque élément, fournis EN FRANÇAIS :
             1) Un titre court
             2) La sévérité (CRITICAL, HIGH, MEDIUM, LOW, INFO)
             3) L'emplacement (fichier, dépendance, ligne, composant - où le trouver)
@@ -838,11 +1176,12 @@ public class AiAnalysisService {
             5) Comment corriger / remédiation concrète
 
             Réponds UNIQUEMENT avec un JSON valide, sans markdown ni texte autour, de la forme :
-            {"summary": "résumé en une phrase du rapport (nombre de vulnérabilités, état)", "vulnerabilities": [{"title": "...", "severity": "...", "location": "...", "description": "...", "remediation": "..."}]}
+            {"summary": "résumé en une phrase en français", "vulnerabilities": [{"title": "...", "severity": "...", "location": "...", "description": "...", "remediation": "..."}]}
+            Les champs summary, title, description et remediation doivent être en français.
 
             Contenu de l'artifact :
             %s
-            """.formatted(sourceHint, artifactContent);
+            """.formatted(RESPONSE_LANGUAGE_FR, sourceHint, artifactContent);
     }
 
     /**
@@ -875,8 +1214,22 @@ public class AiAnalysisService {
 
     private String buildUserFriendlyErrorMessage(Exception e, String provider) {
         String msg = e.getMessage() != null ? e.getMessage() : "";
+        if (msg.contains("Quota Groq dépassé et secours Ollama")) {
+            return msg.length() > 400 ? msg.substring(0, 400) + "..." : msg;
+        }
+        if (isOllamaCudaOrGpuFailure(msg)) {
+            return """
+                    Ollama local en échec (GPU/CUDA). Solutions :
+                    1) Relancer Ollama en CPU : définir OLLAMA_NUM_GPU=0 puis redémarrer Ollama ;
+                    2) Mettre à jour les pilotes NVIDIA ou utiliser un modèle plus léger (ai.ollama.model=qwen2.5-coder:7b) ;
+                    3) Désactiver le secours Ollama : ai.groq.fallback-to-ollama=false et attendre le quota Groq ;
+                    4) Utiliser uniquement Groq : vérifier AI_GROQ_API_KEY et réessayer dans 1–2 min.""";
+        }
         if (msg.contains("429") || msg.contains("quota") || msg.contains("RESOURCE_EXHAUSTED")) {
-            return "Quota API dépassé (" + provider + "). Réessayez dans 1 à 2 minutes. Ou testez un autre provider : ai.provider=groq (gratuit, console.groq.com).";
+            if ("groq".equals(provider) && groqFallbackToOllama) {
+                return "Quota Groq dépassé. Réessayez dans 1 à 2 minutes, ou désactivez le secours Ollama (ai.groq.fallback-to-ollama=false) si Ollama local est indisponible.";
+            }
+            return "Quota API dépassé (" + provider + "). Réessayez dans 1 à 2 minutes.";
         }
         if (msg.contains("404") || msg.contains("NOT_FOUND")) {
             return "Modèle ou ressource introuvable. Vérifiez ai." + provider + ".model ou changez de provider (ex: ai.provider=groq).";
@@ -885,6 +1238,25 @@ public class AiAnalysisService {
             return "Clé API invalide (" + provider + "). Vérifiez ai." + (provider.equals("groq") ? "groq.api-key" : provider + ".api-key/token") + ".";
         }
         return "Erreur lors de l'analyse IA (" + provider + "): " + (msg.length() > 200 ? msg.substring(0, 200) + "..." : msg);
+    }
+
+    private static boolean isOllamaCudaOrGpuFailure(String msg) {
+        if (msg == null || msg.isBlank()) {
+            return false;
+        }
+        String lower = msg.toLowerCase(Locale.ROOT);
+        return lower.contains("cuda")
+                || lower.contains("llama runner")
+                || lower.contains("11434/api/generate")
+                || lower.contains("11434/api/chat");
+    }
+
+    private static String summarizeOllamaFailure(Throwable e) {
+        String msg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+        if (isOllamaCudaOrGpuFailure(msg)) {
+            return "GPU/CUDA Ollama indisponible — essayez OLLAMA_NUM_GPU=0 ou ai.groq.fallback-to-ollama=false";
+        }
+        return msg.length() > 180 ? msg.substring(0, 180) + "..." : msg;
     }
 
     private String callGemini(String prompt) {
@@ -932,9 +1304,7 @@ public class AiAnalysisService {
         String model = (groqModelOverride != null && !groqModelOverride.isBlank()) ? groqModelOverride : groqModel;
         var body = new java.util.LinkedHashMap<String, Object>();
         body.put("model", model);
-        body.put("messages", List.of(
-                java.util.Map.of("role", "user", "content", prompt)
-        ));
+        body.put("messages", llmMessagesWithFrenchSystem(prompt));
         body.put("temperature", 0.2);
         body.put("max_completion_tokens", 8192);
         if (model != null && model.startsWith("openai/gpt-oss")) {
@@ -966,11 +1336,148 @@ public class AiAnalysisService {
         return text.strip();
     }
 
+    private record OpenRouterCallResult(String text, String modelUsed) {}
+
+    private OpenRouterCallResult callOpenRouterWithModelFallback(String prompt, String schemaName, String jsonSchema) {
+        Exception lastError = null;
+        List<String> models = openRouterModelsToTry();
+        log.info("[AI] OpenRouter — modèles à essayer : {}", models);
+        for (String model : models) {
+            int attempt = 0;
+            while (true) {
+                try {
+                    log.info("[AI] OpenRouter → model={} (essai {})", model, attempt + 1);
+                    OpenRouterCallResult result = callOpenRouterModel(prompt, schemaName, jsonSchema, model);
+                    log.info("[AI] OpenRouter OK — demandé={}, utilisé={}", model, result.modelUsed());
+                    return result;
+                } catch (Exception e) {
+                    lastError = e;
+                    if (openrouterRetryOn429 && isOpenRouterRateLimited(e) && attempt < openrouterMaxRetriesPerModel) {
+                        int delaySec = parseOpenRouterRetrySeconds(e);
+                        log.warn("[AI] OpenRouter model={} rate-limit 429 — nouvel essai dans {}s", model, delaySec);
+                        try {
+                            Thread.sleep(delaySec * 1000L);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            throw new RuntimeException("OpenRouter interrompu", ie);
+                        }
+                        attempt++;
+                        continue;
+                    }
+                    log.warn("[AI] OpenRouter model={} échoué : {}", model, shortenApiError(e));
+                    break;
+                }
+            }
+        }
+        throw new RuntimeException(
+                "OpenRouter indisponible (essayé : " + String.join(", ", models) + "). "
+                        + "Les modèles :free sont souvent saturés — réessayez dans 1–2 min ou lancez Ollama local.",
+                lastError);
+    }
+
+    private static boolean isOpenRouterRateLimited(Throwable e) {
+        if (e instanceof HttpClientErrorException he) {
+            return he.getStatusCode() == HttpStatus.TOO_MANY_REQUESTS;
+        }
+        String msg = e.getMessage() != null ? e.getMessage() : "";
+        return msg.contains("429") || msg.contains("rate-limited") || msg.contains("rate limit");
+    }
+
+    /** Extrait retry_after_seconds du JSON d'erreur OpenRouter, sinon 15s. */
+    private static int parseOpenRouterRetrySeconds(Throwable e) {
+        String body = e instanceof HttpClientErrorException he ? he.getResponseBodyAsString() : "";
+        if (body != null && !body.isBlank()) {
+            Matcher m = Pattern.compile("\"retry_after_seconds\"\\s*:\\s*(\\d+)").matcher(body);
+            if (m.find()) {
+                return Math.min(60, Math.max(3, Integer.parseInt(m.group(1)) + 1));
+            }
+            Matcher retryAfter = Pattern.compile("Please retry in (\\d+(?:\\.\\d+)?)\\s*s", Pattern.CASE_INSENSITIVE).matcher(body);
+            if (retryAfter.find()) {
+                return Math.min(60, Math.max(3, (int) Math.ceil(Double.parseDouble(retryAfter.group(1))) + 1));
+            }
+        }
+        return 15;
+    }
+
+    private static String shortenApiError(Throwable e) {
+        String msg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+        if (msg.length() > 280) {
+            return msg.substring(0, 280) + "...";
+        }
+        return msg;
+    }
+
+    private List<String> openRouterModelsToTry() {
+        List<String> models = new ArrayList<>();
+        if (openrouterModelsCsv != null && !openrouterModelsCsv.isBlank()) {
+            for (String part : openrouterModelsCsv.split(",")) {
+                String m = part.trim();
+                if (!m.isEmpty() && !models.contains(m)) {
+                    models.add(m);
+                }
+            }
+        }
+        if (models.isEmpty()) {
+            if (openrouterModel != null && !openrouterModel.isBlank()) {
+                models.add(openrouterModel.strip());
+            }
+            if (openrouterModelFallback != null && !openrouterModelFallback.isBlank()) {
+                String fb = openrouterModelFallback.strip();
+                if (!models.contains(fb)) {
+                    models.add(fb);
+                }
+            }
+        }
+        return models;
+    }
+
+    private OpenRouterCallResult callOpenRouterModel(String prompt, String schemaName, String jsonSchema, String model) {
+        var body = new java.util.LinkedHashMap<String, Object>();
+        body.put("model", model);
+        body.put("messages", llmMessagesWithFrenchSystem(prompt));
+        body.put("temperature", 0.2);
+        body.put("max_tokens", 4096);
+        if (jsonSchema != null) {
+            body.put("response_format", java.util.Map.of("type", "json_object"));
+        }
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.setBearerAuth(openrouterApiKey);
+        if (openrouterHttpReferer != null && !openrouterHttpReferer.isBlank()) {
+            headers.set("HTTP-Referer", openrouterHttpReferer);
+            headers.set("X-Title", "DevSecOps Platform");
+        }
+        HttpEntity<Object> entity = new HttpEntity<>(body, headers);
+        RestTemplate rest = new RestTemplate();
+        try {
+            ResponseEntity<JsonNode> response = rest.exchange(OPENROUTER_URL, HttpMethod.POST, entity, JsonNode.class);
+            if (response.getBody() == null) {
+                throw new RuntimeException("Réponse OpenRouter vide");
+            }
+            String text = response.getBody().path("choices").path(0).path("message").path("content").asText(null);
+            if (text == null || text.isBlank()) {
+                throw new RuntimeException("OpenRouter n'a pas renvoyé de contenu");
+            }
+            String resolvedModel = response.getBody().path("model").asText(model);
+            return new OpenRouterCallResult(text.strip(), resolvedModel);
+        } catch (HttpClientErrorException e) {
+            throw e;
+        }
+    }
+
     /** Options de génération Ollama ({@code /api/generate} et {@code /api/chat}). */
     private void addOllamaGenerationOptions(java.util.LinkedHashMap<String, Object> body) {
+        addOllamaGenerationOptions(body, ollamaNumGpu);
+    }
+
+    private void addOllamaGenerationOptions(java.util.LinkedHashMap<String, Object> body, int numGpu) {
         var opts = new java.util.LinkedHashMap<String, Object>();
         opts.put("num_predict", Math.max(512, ollamaNumPredict));
         opts.put("temperature", ollamaTemperature);
+        if (numGpu >= 0) {
+            opts.put("num_gpu", numGpu);
+        }
         body.put("options", opts);
     }
 
@@ -1053,31 +1560,60 @@ public class AiAnalysisService {
 
     private String callOllama(String prompt) { return callOllama(prompt, null); }
 
+    private RestTemplate createOllamaRestTemplate() {
+        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
+        factory.setConnectTimeout(Duration.ofSeconds(30));
+        factory.setReadTimeout(Duration.ofSeconds(Math.max(60, ollamaReadTimeoutSeconds)));
+        return new RestTemplate(factory);
+    }
+
     private String callOllama(String prompt, String jsonSchema) {
+        try {
+            return callOllamaInternal(prompt, jsonSchema, ollamaNumGpu);
+        } catch (RuntimeException e) {
+            if (ollamaNumGpu != 0 && isOllamaCudaOrGpuFailure(e.getMessage())) {
+                log.warn("[AI] Ollama GPU/CUDA en échec — nouvel essai en CPU (num_gpu=0)");
+                return callOllamaInternal(prompt, jsonSchema, 0);
+            }
+            throw e;
+        }
+    }
+
+    private String callOllamaInternal(String prompt, String jsonSchema, int numGpu) {
         String url = ollamaUrl.replaceAll("/+$", "") + "/api/generate";
         var body = new java.util.LinkedHashMap<String, Object>();
         body.put("model", ollamaModel);
-        body.put("prompt", prompt);
+        body.put("prompt", RESPONSE_LANGUAGE_FR + "\n\n" + prompt);
         body.put("stream", false);
         if (jsonSchema != null) {
             try { body.put("format", objectMapper.readTree(jsonSchema)); }
             catch (Exception e) { log.warn("Schéma Ollama ignoré: {}", e.getMessage()); }
         }
-        addOllamaGenerationOptions(body);
+        addOllamaGenerationOptions(body, numGpu);
 
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
         HttpEntity<Object> entity = new HttpEntity<>(body, headers);
-        RestTemplate rest = new RestTemplate();
+        RestTemplate rest = createOllamaRestTemplate();
         try {
             ResponseEntity<JsonNode> response = rest.exchange(url, HttpMethod.POST, entity, JsonNode.class);
             if (response.getBody() == null) throw new RuntimeException("Réponse Ollama vide");
             String text = response.getBody().path("response").asText(null);
             if (text == null || text.isBlank()) throw new RuntimeException("Ollama n'a pas renvoyé de contenu");
             return extractJsonFromResponse(text);
+        } catch (HttpServerErrorException e) {
+            String detail = truncateOllamaErrorBody(e.getResponseBodyAsString());
+            throw new RuntimeException("Ollama erreur " + e.getStatusCode().value() + " : " + detail, e);
         } catch (org.springframework.web.client.ResourceAccessException e) {
             throw new RuntimeException("Ollama inaccessible à " + ollamaUrl + ". Lancez « ollama run " + ollamaModel + " ».", e);
         }
+    }
+
+    private static String truncateOllamaErrorBody(String body) {
+        if (body == null || body.isBlank()) {
+            return "réponse vide";
+        }
+        return body.length() > 220 ? body.substring(0, 220) + "..." : body;
     }
 
     /**

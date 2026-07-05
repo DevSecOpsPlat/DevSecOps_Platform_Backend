@@ -1,0 +1,268 @@
+[
+  {
+    "id": "sqli",
+    "match": {
+      "cwe": ["89"],
+      "keywords": ["sql injection", "sqli", "jdbc", "prepared statement", "concatenation sql"]
+    },
+    "response": {
+      "problemSummary": "Une requête SQL est construite en concaténant des entrées utilisateur, ce qui permet à un attaquant d'injecter du SQL arbitraire.",
+      "rootCause": "Utilisation de concaténation de chaînes ou de formatage dynamique pour assembler une requête SQL au lieu de requêtes paramétrées.",
+      "impact": "Lecture, modification ou suppression de données en base ; contournement d'authentification ; exécution de commandes selon le SGBD et les privilèges.",
+      "businessRisk": "Fuite ou corruption de données clients, indisponibilité du service, non-conformité (RGPD) et atteinte à la réputation.",
+      "location": "Voir fichier et ligne indiqués par le scanner.",
+      "reproduction": "Relancer l'analyse SAST sur le fichier concerné après correction ; en revue manuelle, vérifier qu'aucune variable utilisateur n'est concaténée dans le SQL.",
+      "remediationSteps": [
+        "Identifier la requête SQL vulnérable et les paramètres issus de l'utilisateur ou de l'API.",
+        "Remplacer la concaténation par une requête préparée (PreparedStatement en Java, paramètres nommés avec JPA/Hibernate).",
+        "Valider et typer les entrées (long, UUID, enum) avant de les lier aux paramètres.",
+        "Limiter les privilèges du compte base de données (principe du moindre privilège).",
+        "Commit/push puis relancer l'analyse depuis le tableau de bord sécurité de la plateforme."
+      ],
+      "suggestedPatch": "// Java — PreparedStatement\nString sql = \"SELECT * FROM users WHERE email = ?\";\ntry (PreparedStatement ps = conn.prepareStatement(sql)) {\n  ps.setString(1, userEmail);\n  try (ResultSet rs = ps.executeQuery()) { /* ... */ }\n}",
+      "secureCodeBefore": "String q = \"SELECT * FROM users WHERE email='\" + email + \"'\";",
+      "secureCodeAfter": "PreparedStatement ps = conn.prepareStatement(\"SELECT * FROM users WHERE email = ?\");\nps.setString(1, email);",
+      "bestPractices": [
+        "Toujours utiliser des requêtes paramétrées ou un ORM avec binding sûr.",
+        "Ne jamais construire du SQL avec String.format ou + sur des entrées externes.",
+        "Activer les règles SAST SQLi en CI et corriger avant merge."
+      ],
+      "references": [
+        {"type": "CWE", "id": "CWE-89", "url": "https://cwe.mitre.org/data/definitions/89.html"},
+        {"type": "OWASP", "id": "SQL Injection", "url": "https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html"}
+      ],
+      "verificationHints": ["Vérifier qu'aucune concaténation SQL ne subsiste dans le fichier.", "Relancer le scan depuis la plateforme."],
+      "verificationCommands": ["grep -n \"+.*SELECT\\|Statement.execute\" src/"],
+      "confidence": "HIGH"
+    }
+  },
+  {
+    "id": "xss",
+    "match": {
+      "cwe": ["79", "80"],
+      "keywords": ["cross-site scripting", "xss", "innerhtml", "dangerouslysetinnerhtml", "document.write"]
+    },
+    "response": {
+      "problemSummary": "Des données non fiables sont affichées ou injectées dans le DOM sans échappement, permettant l'exécution de scripts dans le navigateur des victimes.",
+      "rootCause": "Insertion de contenu utilisateur dans le HTML/JS sans encodage contextuel (HTML, attribut, URL).",
+      "impact": "Vol de session/cookies, défacement, actions à la place de l'utilisateur, phishing.",
+      "businessRisk": "Compromission de comptes utilisateurs, perte de confiance, obligations de notification en cas de fuite.",
+      "location": "Voir fichier et ligne indiqués par le scanner.",
+      "reproduction": "",
+      "remediationSteps": [
+        "Repérer où des données utilisateur ou API sont rendues dans le DOM.",
+        "Utiliser l'encodage automatique du framework (Angular {{ }}, React text nodes) au lieu de innerHTML.",
+        "Si HTML riche est requis, passer par une bibliothèque de sanitization (DOMPurify) avec liste blanche stricte.",
+        "Définir une Content-Security-Policy restrictive en complément.",
+        "Commit/push et relancer l'analyse depuis la plateforme."
+      ],
+      "suggestedPatch": "// Angular — éviter [innerHTML] sans sanitizer\n// Préférer {{ userInput }} ou DomSanitizer.sanitize(...)",
+      "secureCodeBefore": "element.innerHTML = userComment;",
+      "secureCodeAfter": "element.textContent = userComment;\n// ou sanitizer.bypassSecurityTrustHtml(DomPurify.sanitize(userComment))",
+      "bestPractices": [
+        "Encoder selon le contexte (HTML, attribut, JS, URL).",
+        "CSP + HttpOnly cookies pour limiter l'impact.",
+        "Valider côté serveur en plus du client."
+      ],
+      "references": [
+        {"type": "CWE", "id": "CWE-79", "url": "https://cwe.mitre.org/data/definitions/79.html"},
+        {"type": "OWASP", "id": "XSS Prevention", "url": "https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html"}
+      ],
+      "verificationHints": ["Rechercher innerHTML, bypassSecurityTrust, dangerouslySetInnerHTML.", "Relancer le scan SAST/DAST."],
+      "verificationCommands": [],
+      "confidence": "HIGH"
+    }
+  },
+  {
+    "id": "hardcoded-secret",
+    "match": {
+      "cwe": ["798", "321", "259"],
+      "keywords": ["hardcoded", "secret", "password", "api key", "apikey", "token", "credential", "private key"]
+    },
+    "response": {
+      "problemSummary": "Un secret (mot de passe, clé API, token) est présent en clair dans le code source versionné.",
+      "rootCause": "Configuration sensible commitée dans le dépôt au lieu d'être externalisée.",
+      "impact": "Toute personne avec accès au repo (ou fuite Git) peut utiliser le secret ; rotation difficile.",
+      "businessRisk": "Accès non autorisé aux services cloud/API, facturation frauduleuse, violation de conformité.",
+      "location": "Voir fichier et ligne indiqués par le scanner.",
+      "reproduction": "",
+      "remediationSteps": [
+        "Révoquer/rotater immédiatement le secret exposé chez le fournisseur (AWS, GitHub, etc.).",
+        "Supprimer la valeur du code ; la lire via variable d'environnement ou gestionnaire de secrets.",
+        "Ajouter le fichier de secrets au .gitignore (.env.local, etc.).",
+        "Pour le front (Vite/React) : préfixe VITE_ / REACT_APP_ et injection au build — jamais de secret serveur côté client.",
+        "Commit/push (sans le secret) et relancer l'analyse depuis la plateforme."
+      ],
+      "suggestedPatch": "// Lire depuis l'environnement\nconst apiKey = import.meta.env.VITE_API_KEY;\n// ou process.env.API_KEY côté Node",
+      "secureCodeBefore": "const API_KEY = \"sk-live-xxxxx\";",
+      "secureCodeAfter": "const API_KEY = process.env.API_KEY;",
+      "bestPractices": [
+        "Secrets manager (AWS SM, Vault) ou variables CI masquées.",
+        "Scanner les commits (gitleaks, trufflehog) en CI.",
+        "Rotation régulière des clés."
+      ],
+      "references": [
+        {"type": "CWE", "id": "CWE-798", "url": "https://cwe.mitre.org/data/definitions/798.html"},
+        {"type": "OWASP", "id": "Secrets Management", "url": "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html"}
+      ],
+      "verificationHints": ["Confirmer que la clé a été révoquée côté provider.", "Relancer le scan secrets."],
+      "verificationCommands": ["gitleaks detect --source ."],
+      "confidence": "HIGH"
+    }
+  },
+  {
+    "id": "weak-crypto",
+    "match": {
+      "cwe": ["327", "326", "328"],
+      "keywords": ["md5", "sha1", "des ", "rc4", "weak cipher", "ecb mode", "crypto"]
+    },
+    "response": {
+      "problemSummary": "Un algorithme cryptographique obsolète ou mal configuré affaiblisse la confidentialité ou l'intégrité des données.",
+      "rootCause": "Usage de MD5/SHA-1 pour sécurité, DES/ECB, ou paramètres TLS faibles.",
+      "impact": "Collisions, déchiffrement ou forge de données selon le contexte.",
+      "businessRisk": "Données sensibles exposées, non-conformité PCI-DSS / réglementaire.",
+      "location": "Voir fichier et ligne indiqués par le scanner.",
+      "reproduction": "",
+      "remediationSteps": [
+        "Remplacer MD5/SHA-1 par SHA-256+ ou bcrypt/Argon2 pour mots de passe.",
+        "Utiliser AES-GCM (pas ECB) avec IV aléatoire unique par message.",
+        "Pour TLS : désactiver protocoles < TLS 1.2 et suites faibles.",
+        "Commit/push et relancer l'analyse."
+      ],
+      "suggestedPatch": "// Mots de passe\nBCryptPasswordEncoder encoder = new BCryptPasswordEncoder(12);",
+      "secureCodeBefore": "MessageDigest.getInstance(\"MD5\")",
+      "secureCodeAfter": "MessageDigest.getInstance(\"SHA-256\") // ou BCrypt pour passwords",
+      "bestPractices": ["Suivre OWASP Cryptographic Storage.", "Centraliser la config crypto.", "Revues régulières des dépendances crypto."],
+      "references": [
+        {"type": "CWE", "id": "CWE-327", "url": "https://cwe.mitre.org/data/definitions/327.html"}
+      ],
+      "verificationHints": ["Relancer SAST et scan des dépendances."],
+      "verificationCommands": [],
+      "confidence": "HIGH"
+    }
+  },
+  {
+    "id": "cors-misconfig",
+    "match": {
+      "cwe": ["942", "346"],
+      "keywords": ["cors", "access-control-allow-origin", "wildcard origin", "allow-origin *"]
+    },
+    "response": {
+      "problemSummary": "La politique CORS autorise des origines trop larges (wildcard ou réflexion), facilitant des requêtes cross-origin non désirées depuis un navigateur.",
+      "rootCause": "Access-Control-Allow-Origin: * ou echo de l'Origin sans liste blanche.",
+      "impact": "Exfiltration de données sensibles si cookies/credentials sont mal configurés ; CSRF-like depuis sites malveillants.",
+      "businessRisk": "Fuite de données utilisateur via application web.",
+      "location": "Configuration serveur / filtre CORS du projet.",
+      "reproduction": "",
+      "remediationSteps": [
+        "Lister les origines front autorisées (dev/staging/prod).",
+        "Configurer allowedOrigins explicites — pas de * si credentials: true.",
+        "Vérifier allowedMethods et allowedHeaders au minimum nécessaire.",
+        "Commit/push et relancer l'analyse."
+      ],
+      "suggestedPatch": "// Spring\nconfiguration.setAllowedOrigins(List.of(\"https://app.example.com\"));",
+      "secureCodeBefore": "Access-Control-Allow-Origin: *",
+      "secureCodeAfter": "Access-Control-Allow-Origin: https://app.example.com",
+      "bestPractices": ["Origines explicites par environnement.", "Ne pas refléter Origin sans validation."],
+      "references": [
+        {"type": "CWE", "id": "CWE-942", "url": "https://cwe.mitre.org/data/definitions/942.html"}
+      ],
+      "verificationHints": ["Tester avec curl -H 'Origin: https://evil.com'."],
+      "verificationCommands": [],
+      "confidence": "HIGH"
+    }
+  },
+  {
+    "id": "path-traversal",
+    "match": {
+      "cwe": ["22", "23"],
+      "keywords": ["path traversal", "directory traversal", "../", "lfi", "local file inclusion"]
+    },
+    "response": {
+      "problemSummary": "Un chemin fichier construit à partir d'entrée utilisateur peut sortir du répertoire autorisé (../).",
+      "rootCause": "Concaténation de segments de chemin sans normalisation ni validation.",
+      "impact": "Lecture ou écriture de fichiers arbitraires sur le serveur.",
+      "businessRisk": "Fuite de configuration/secrets, compromission du serveur.",
+      "location": "Voir fichier et ligne indiqués par le scanner.",
+      "reproduction": "",
+      "remediationSteps": [
+        "Utiliser Path.normalize() et vérifier que le chemin résolu reste sous un répertoire de base.",
+        "Rejeter les entrées contenant .. ou séparateurs absolus.",
+        "Préférer des identifiants (UUID) mappés en interne plutôt que des chemins bruts.",
+        "Commit/push et relancer l'analyse."
+      ],
+      "suggestedPatch": "Path base = Paths.get(\"/var/app/files\").toAbsolutePath().normalize();\nPath resolved = base.resolve(userInput).normalize();\nif (!resolved.startsWith(base)) throw new SecurityException();",
+      "secureCodeBefore": "new File(BASE + userInput)",
+      "secureCodeAfter": "Path resolved = base.resolve(safeName).normalize();\nif (!resolved.startsWith(base)) throw ...",
+      "bestPractices": ["Liste blanche de noms de fichiers.", "Pas de concaténation directe sur BASE + input."],
+      "references": [
+        {"type": "CWE", "id": "CWE-22", "url": "https://cwe.mitre.org/data/definitions/22.html"}
+      ],
+      "verificationHints": ["Tester avec payload ../../../etc/passwd en environnement de test."],
+      "verificationCommands": [],
+      "confidence": "HIGH"
+    }
+  },
+  {
+    "id": "sca-dependency",
+    "match": {
+      "cwe": ["1035", "1104"],
+      "keywords": ["vulnerable dependency", "cve-", "outdated package", "known vulnerability", "trivy", "grype", "npm audit", "dependency"]
+    },
+    "response": {
+      "problemSummary": "Une dépendance (bibliothèque, image, paquet OS) contient une vulnérabilité connue référencée par CVE.",
+      "rootCause": "Version de composant non corrigée ou image de base obsolète.",
+      "impact": "Dépend du CVE (RCE, DoS, fuite de données, etc.) — voir la fiche NVD associée.",
+      "businessRisk": "Exploitation automatique via bots sur des CVE publics ; obligation de patch en production.",
+      "location": "Manifeste de dépendances (pom.xml, package.json, Dockerfile, lockfile) ou composant indiqué.",
+      "reproduction": "Relancer le scan SCA/conteneur après mise à jour.",
+      "remediationSteps": [
+        "Identifier le composant et la version fixe recommandée (CVE / advisory).",
+        "Mettre à jour la dépendance ou l'image de base (npm update, mvn versions, FROM image:tag).",
+        "Exécuter les tests de non-régression.",
+        "Commit/push et relancer l'analyse depuis la plateforme."
+      ],
+      "suggestedPatch": "# Exemple npm\nnpm update vulnerable-package\n# ou pin version corrigée dans package.json",
+      "secureCodeBefore": "\"lodash\": \"4.17.15\"",
+      "secureCodeAfter": "\"lodash\": \"4.17.21\"",
+      "bestPractices": ["Dependabot/Renovate en CI.", "Scanner SCA à chaque build.", "Pin des versions en prod."],
+      "references": [
+        {"type": "OWASP", "id": "SCA", "url": "https://owasp.org/www-community/Component_Analysis"}
+      ],
+      "verificationHints": ["Vérifier que le scan ne remonte plus le CVE.", "Consulter la fiche NVD pour la version minimale corrigée."],
+      "verificationCommands": ["npm audit", "mvn dependency:tree"],
+      "confidence": "HIGH"
+    }
+  },
+  {
+    "id": "ssrf",
+    "match": {
+      "cwe": ["918"],
+      "keywords": ["ssrf", "server-side request forgery", "fetch url", "open url from user"]
+    },
+    "response": {
+      "problemSummary": "Le serveur effectue des requêtes HTTP vers une URL influencée par l'utilisateur, permettant d'atteindre des ressources internes.",
+      "rootCause": "Pas de validation d'URL (schéma, hôte, IP privée) avant appel HTTP côté serveur.",
+      "impact": "Scan du réseau interne, accès metadata cloud (169.254.169.254), bypass firewall.",
+      "businessRisk": "Compromission d'infrastructure cloud, fuite de credentials IAM.",
+      "location": "Voir fichier et ligne indiqués par le scanner.",
+      "reproduction": "",
+      "remediationSteps": [
+        "Refuser les schémas non HTTP(S) et les IP privées/link-local après résolution DNS.",
+        "Utiliser une liste blanche de domaines autorisés si possible.",
+        "Désactiver les redirections automatiques ou les re-valider.",
+        "Commit/push et relancer l'analyse."
+      ],
+      "suggestedPatch": "// Valider URL avant RestTemplate/WebClient\nif (isPrivateIp(uri.getHost())) throw new IllegalArgumentException();",
+      "secureCodeBefore": "rest.getForObject(userSuppliedUrl, String.class)",
+      "secureCodeAfter": "URI safe = validateAllowedUrl(userSuppliedUrl);\nrest.getForObject(safe, String.class)",
+      "bestPractices": ["Allowlist de destinations.", "Pas de proxy ouvert.", "Segmentation réseau."],
+      "references": [
+        {"type": "CWE", "id": "CWE-918", "url": "https://cwe.mitre.org/data/definitions/918.html"}
+      ],
+      "verificationHints": ["Tester en lab avec URL vers IP interne (bloquée attendue)."],
+      "verificationCommands": [],
+      "confidence": "HIGH"
+    }
+  }
+]
