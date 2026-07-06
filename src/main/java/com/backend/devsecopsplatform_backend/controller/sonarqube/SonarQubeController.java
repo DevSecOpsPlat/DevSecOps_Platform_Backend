@@ -44,18 +44,37 @@ public class SonarQubeController {
     @GetMapping("/branches")
     public ResponseEntity<?> listBranches(@RequestParam(value = "serviceId", required = false) String serviceId) {
         try {
+            java.util.LinkedHashSet<String> branches = new java.util.LinkedHashSet<>();
+            branches.add("main");
+
+            AppService svc = null;
+            if (serviceId != null && !serviceId.isBlank()) {
+                svc = appServiceRepository.findById(UUID.fromString(serviceId)).orElse(null);
+                if (svc != null && svc.getGitBranch() != null && !svc.getGitBranch().isBlank()) {
+                    branches.add(svc.getGitBranch().trim());
+                }
+            }
+
             String pk = resolveProjectKey(null, serviceId);
-            if (pk == null || pk.isBlank()) {
-                return ResponseEntity.ok(java.util.List.of("main"));
+            if (pk != null && !pk.isBlank()) {
+                try {
+                    branches.addAll(gitLabService.listSonarProjectBranches(pk));
+                } catch (Exception e) {
+                    log.warn("Branches SonarQube API indisponibles (projectKey={}): {}", pk, e.getMessage());
+                }
             }
-            java.util.List<String> branches = gitLabService.listSonarProjectBranches(pk);
-            if (branches.isEmpty()) {
-                branches = java.util.List.of("main");
+
+            if (branches.size() <= 1) {
+                branches.add("test");
             }
-            return ResponseEntity.ok(branches);
+
+            return ResponseEntity.ok(new java.util.ArrayList<>(branches));
         } catch (Exception e) {
             log.warn("Branches SonarQube indisponibles: {}", e.getMessage());
-            return ResponseEntity.ok(java.util.List.of("main"));
+            java.util.LinkedHashSet<String> fallback = new java.util.LinkedHashSet<>();
+            fallback.add("main");
+            fallback.add("test");
+            return ResponseEntity.ok(new java.util.ArrayList<>(fallback));
         }
     }
 
@@ -127,6 +146,41 @@ public class SonarQubeController {
             log.error("❌ Impossible de récupérer le détail du hotspot {}", hotspotKey, e);
             return ResponseEntity.status(500).body(Map.of(
                     "error", "Impossible de récupérer le détail du hotspot",
+                    "message", e.getMessage()
+            ));
+        }
+    }
+
+    @GetMapping("/issues/detail")
+    public ResponseEntity<?> getIssueDetail(
+            @RequestParam("issueKey") String issueKey,
+            @RequestParam(value = "branch", required = false) String branch) {
+        try {
+            return ResponseEntity.ok(gitLabService.getIssueDetails(issueKey, branch));
+        } catch (Exception e) {
+            log.error("❌ Impossible de récupérer le détail de l'issue {}", issueKey, e);
+            return ResponseEntity.status(500).body(Map.of(
+                    "error", "Impossible de récupérer le détail de l'issue",
+                    "message", e.getMessage()
+            ));
+        }
+    }
+
+    @GetMapping("/activity")
+    public ResponseEntity<?> getActivityHistory(
+            @RequestParam("branch") String branch,
+            @RequestParam(value = "projectKey", required = false) String projectKey,
+            @RequestParam(value = "serviceId", required = false) String serviceId) {
+        try {
+            String resolvedKey = resolveProjectKey(projectKey, serviceId);
+            if (resolvedKey == null || resolvedKey.isBlank()) {
+                return ResponseEntity.badRequest().body(Map.of("error", "projectKey ou serviceId requis"));
+            }
+            return ResponseEntity.ok(gitLabService.getSonarActivityHistory(resolvedKey, branch));
+        } catch (Exception e) {
+            log.error("❌ Historique Sonar indisponible branch={}", branch, e);
+            return ResponseEntity.status(500).body(Map.of(
+                    "error", "Impossible de récupérer l'historique d'analyses",
                     "message", e.getMessage()
             ));
         }

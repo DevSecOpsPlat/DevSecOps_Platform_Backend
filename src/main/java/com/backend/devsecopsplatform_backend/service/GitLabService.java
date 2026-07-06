@@ -21,6 +21,9 @@ import java.nio.charset.StandardCharsets;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
+import org.springframework.web.util.UriComponentsBuilder;
+
+import java.net.URI;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -39,6 +42,8 @@ public class GitLabService {
     private final GitLabApi gitLabApi;
     private final ObjectMapper objectMapper;
     private final ApplicationService applicationService;
+    private final RestTemplate sonarRestTemplate;
+    private final TranslationService translationService;
 
     @Value("${gitlab.project-id}")
     private Long gitlabProjectId;
@@ -76,6 +81,9 @@ public class GitLabService {
      */
     @Value("${sonarqube.default-assignee:}")
     private String sonarDefaultAssignee;
+
+    @Value("${sonarqube.accept-language:fr}")
+    private String sonarAcceptLanguage;
 
     // ============================================
     // PIPELINE - CRÉATION ET DÉCLENCHEMENT
@@ -646,6 +654,7 @@ public class GitLabService {
             c.put("actualValue", actual);
             c.put("errorThreshold", errorThreshold);
             c.put("comparator", comparator);
+            c.put("metricLabel", frenchQualityGateMetricLabel(metricKey));
 
             if ("ERROR".equalsIgnoreCase(condStatus) && (actual != null || errorThreshold != null)) {
                 String desc = buildQualityGateConditionErrorDescription(
@@ -686,17 +695,7 @@ public class GitLabService {
      */
     private String buildQualityGateConditionErrorDescription(String metricKey, String actualValue, String errorThreshold, String comparator) {
         if (metricKey == null) metricKey = "";
-        String metricLabel = metricKey.toLowerCase().contains("coverage") ? "Couverture"
-                : metricKey.toLowerCase().contains("security_hotspots") ? "Security Hotspots à revoir"
-                : metricKey.toLowerCase().contains("duplicated") ? "Duplication"
-                : metricKey.toLowerCase().contains("reliability_rating") ? "Note de fiabilité (Reliability Rating)"
-                : metricKey.toLowerCase().contains("security_rating") ? "Note de sécurité (Security Rating)"
-                : metricKey.toLowerCase().contains("maintainability_rating")
-                        || metricKey.toLowerCase().contains("sqale_rating")
-                        ? "Note de maintenabilité (Maintainability Rating)"
-                : metricKey.toLowerCase().contains("reliability") ? "Fiabilité"
-                : metricKey.toLowerCase().contains("maintainability") ? "Maintenabilité"
-                : (metricKey.isEmpty() ? "Cette métrique" : metricKey);
+        String metricLabel = frenchQualityGateMetricLabel(metricKey);
         String actual = formatSonarRatingForMessage(metricKey, actualValue != null ? actualValue : "0");
         String required = formatSonarRatingForMessage(metricKey, errorThreshold != null ? errorThreshold : "–");
         // Comparateur: LT = inférieur à, GT = supérieur à, EQ = égal
@@ -707,9 +706,85 @@ public class GitLabService {
                 actual, opLabel, required, metricLabel);
     }
 
+    /** Libellé français pour une métrique Quality Gate Sonar (clé technique → libellé UI). */
+    private String frenchQualityGateMetricLabel(String metricKey) {
+        if (metricKey == null || metricKey.isBlank()) {
+            return "Métrique";
+        }
+        String k = metricKey.toLowerCase();
+        if (k.contains("coverage")) {
+            return k.contains("new") ? "Couverture sur le nouveau code" : "Couverture";
+        }
+        if (k.contains("security_hotspots")) {
+            return "Points sensibles revus";
+        }
+        if (k.contains("duplicated")) {
+            return "Duplication";
+        }
+        if (k.contains("reliability_rating")) {
+            return k.contains("new") ? "Note de fiabilité (nouveau code)" : "Note de fiabilité";
+        }
+        if (k.contains("security_rating")) {
+            return k.contains("new") ? "Note de sécurité (nouveau code)" : "Note de sécurité";
+        }
+        if (k.contains("maintainability_rating") || k.contains("sqale_rating")) {
+            return k.contains("new") ? "Note de maintenabilité (nouveau code)" : "Note de maintenabilité";
+        }
+        if (k.contains("vulnerabilit")) {
+            return k.contains("new") ? "Vulnérabilités (nouveau code)" : "Vulnérabilités";
+        }
+        if (k.contains("bugs") || k.equals("reliability_remediation_effort")) {
+            return k.contains("new") ? "Bugs (nouveau code)" : "Bugs";
+        }
+        if (k.contains("code_smell") || k.contains("sqale_index")) {
+            return k.contains("new") ? "Code smells (nouveau code)" : "Code smells";
+        }
+        if (k.contains("open_issues")) {
+            return "Problèmes ouverts";
+        }
+        if (k.contains("accepted_issues")) {
+            return "Problèmes acceptés";
+        }
+        return metricKey;
+    }
+
     private String sonarUrlEncode(String value) {
         if (value == null) return "";
         return URLEncoder.encode(value, StandardCharsets.UTF_8);
+    }
+
+    /** Base URL Sonar (sans slash final, avec schéma https). */
+    private String normalizeSonarHostUrl() {
+        if (sonarHostUrl == null || sonarHostUrl.isBlank()) {
+            return "https://sonarcloud.io";
+        }
+        String url = sonarHostUrl.trim();
+        if (!url.startsWith("http://") && !url.startsWith("https://")) {
+            url = "https://" + url;
+        }
+        return url.replaceAll("/+$", "");
+    }
+
+    /** Construit une URI Sonar valide (encode correct des query params, ex. metricKeys avec virgules). */
+    private URI buildSonarUri(String apiPath, MultiValueMap<String, String> queryParams) {
+        String path = apiPath.startsWith("/") ? apiPath : "/" + apiPath;
+        UriComponentsBuilder builder = UriComponentsBuilder.fromHttpUrl(normalizeSonarHostUrl()).path(path);
+        if (queryParams != null) {
+            queryParams.forEach((key, values) -> {
+                for (String value : values) {
+                    if (value != null) {
+                        builder.queryParam(key, value);
+                    }
+                }
+            });
+        }
+        return builder.build().encode().toUri();
+    }
+
+    private URI buildSonarUri(String apiPath, String queryKey, String queryValue) {
+        MultiValueMap<String, String> params = new LinkedMultiValueMap<>();
+        params.add(queryKey, queryValue);
+        return buildSonarUri(apiPath, params);
     }
 
     private static final String SONAR_MEASURE_KEYS =
@@ -731,7 +806,184 @@ public class GitLabService {
     private HttpHeaders sonarAuthHeaders() {
         HttpHeaders headers = new HttpHeaders();
         headers.set("Authorization", sonarAuthorizationHeader());
+        if (sonarAcceptLanguage != null && !sonarAcceptLanguage.isBlank()) {
+            headers.add(HttpHeaders.ACCEPT_LANGUAGE, sonarAcceptLanguage.trim());
+        }
         return headers;
+    }
+
+    /** Paramètres locale/language pour /api/rules/show (descriptions FR si disponibles). */
+    private void addSonarRuleLocaleParams(MultiValueMap<String, String> params) {
+        String lang = (sonarAcceptLanguage == null || sonarAcceptLanguage.isBlank())
+                ? "fr" : sonarAcceptLanguage.trim();
+        params.add("locale", lang);
+        params.add("language", lang);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void translateSonarRuleMapToFrench(Map<String, Object> ruleMap, String ruleKeyFallback) {
+        if (ruleMap == null) {
+            return;
+        }
+        String ruleKey = ruleMap.get("key") != null
+                ? String.valueOf(ruleMap.get("key"))
+                : (ruleKeyFallback != null ? ruleKeyFallback : "unknown");
+
+        translateRuleTextField(ruleMap, "htmlDesc", ruleKey + "_htmlDesc");
+        translateRuleTextField(ruleMap, "mdDesc", ruleKey + "_mdDesc");
+        translateRuleTextField(ruleMap, "riskDescription", ruleKey + "_riskDescription");
+        translateRuleTextField(ruleMap, "vulnerabilityDescription", ruleKey + "_vulnerabilityDescription");
+        translateRuleTextField(ruleMap, "fixRecommendations", ruleKey + "_fixRecommendations");
+        translateRuleTextField(ruleMap, "htmlNote", ruleKey + "_htmlNote");
+
+        Object sections = ruleMap.get("descriptionSections");
+        if (sections instanceof java.util.List<?> list) {
+            for (Object item : list) {
+                if (!(item instanceof Map<?, ?> section)) {
+                    continue;
+                }
+                Map<String, Object> sec = (Map<String, Object>) section;
+                String sectionKey = sec.get("key") != null ? String.valueOf(sec.get("key")) : "section";
+                String suffix = ruleKey + "_sec_" + sectionKey;
+                translateRuleTextField(sec, "htmlContent", suffix + "_htmlContent");
+                translateRuleTextField(sec, "content", suffix + "_content");
+            }
+        }
+    }
+
+    private void translateRuleTextField(Map<String, Object> map, String field, String cacheKey) {
+        Object value = map.get(field);
+        if (value instanceof String text && !text.isBlank()) {
+            map.put(field, translationService.translateToFrench(text, cacheKey));
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void translateSonarIssueMessage(Map<String, Object> result, String ruleKey) {
+        Object issueObj = result.get("issue");
+        if (!(issueObj instanceof Map<?, ?> issueMap)) {
+            return;
+        }
+        translateIssueMessageMap((Map<String, Object>) issueMap);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void translateSonarHotspotMessage(Map<String, Object> result, String ruleKey) {
+        Object hotspotObj = result.get("hotspot");
+        if (!(hotspotObj instanceof Map<?, ?> hotspotMap)) {
+            return;
+        }
+        translateHotspotMessageMap((Map<String, Object>) hotspotMap, ruleKey);
+    }
+
+    private void translateIssueMessageMap(Map<String, Object> issue) {
+        if (issue == null) {
+            return;
+        }
+        Object message = issue.get("message");
+        if (message instanceof String text && !text.isBlank()) {
+            String ruleKey = issue.get("rule") != null
+                    ? String.valueOf(issue.get("rule"))
+                    : String.valueOf(issue.getOrDefault("key", "issue"));
+            issue.put("message", translationService.translateToFrench(text, ruleKey + "_message"));
+        }
+    }
+
+    private void translateHotspotMessageMap(Map<String, Object> hotspot, String ruleKeyFallback) {
+        if (hotspot == null) {
+            return;
+        }
+        Object message = hotspot.get("message");
+        if (message instanceof String text && !text.isBlank()) {
+            String ruleKey = ruleKeyFallback != null ? ruleKeyFallback
+                    : (hotspot.get("ruleKey") != null
+                    ? String.valueOf(hotspot.get("ruleKey"))
+                    : String.valueOf(hotspot.getOrDefault("key", "hotspot")));
+            hotspot.put("message", translationService.translateToFrench(text, ruleKey + "_hotspot_message"));
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void syncTranslatedHotspotRule(Map<String, Object> result) {
+        Object rule = result.get("rule");
+        if (!(rule instanceof Map<?, ?>)) {
+            return;
+        }
+        Object hotspotObj = result.get("hotspot");
+        if (hotspotObj instanceof Map<?, ?> hotspotMap) {
+            ((Map<String, Object>) hotspotMap).put("rule", rule);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void translateSonarListsInResult(Map<String, Object> result) {
+        Object issuesObj = result.get("issues");
+        if (issuesObj instanceof com.fasterxml.jackson.databind.node.ArrayNode arr) {
+            result.put("issues", translateSonarIssuesNode(arr));
+        } else if (issuesObj instanceof List<?> list && !list.isEmpty()) {
+            List<Map<String, Object>> translated = new ArrayList<>();
+            for (Object item : list) {
+                if (item instanceof JsonNode node) {
+                    Map<String, Object> issue = objectMapper.convertValue(node, Map.class);
+                    translateIssueMessageMap(issue);
+                    translated.add(issue);
+                } else if (item instanceof Map<?, ?> issue) {
+                    Map<String, Object> issueMap = (Map<String, Object>) issue;
+                    translateIssueMessageMap(issueMap);
+                    translated.add(issueMap);
+                }
+            }
+            if (!translated.isEmpty()) {
+                result.put("issues", translated);
+            }
+        }
+
+        Object hotspotsObj = result.get("hotspots");
+        if (hotspotsObj instanceof JsonNode arr && arr.isArray()) {
+            result.put("hotspots", translateSonarHotspotsNode(arr));
+        } else if (hotspotsObj instanceof List<?> list && !list.isEmpty()) {
+            List<Map<String, Object>> translated = new ArrayList<>();
+            for (Object item : list) {
+                if (item instanceof JsonNode node) {
+                    Map<String, Object> hotspot = objectMapper.convertValue(node, Map.class);
+                    translateHotspotMessageMap(hotspot, node.path("ruleKey").asText(null));
+                    translated.add(hotspot);
+                } else if (item instanceof Map<?, ?> hotspot) {
+                    Map<String, Object> hotspotMap = (Map<String, Object>) hotspot;
+                    String ruleKey = hotspot.get("ruleKey") != null
+                            ? String.valueOf(hotspot.get("ruleKey")) : null;
+                    translateHotspotMessageMap(hotspotMap, ruleKey);
+                    translated.add(hotspotMap);
+                }
+            }
+            if (!translated.isEmpty()) {
+                result.put("hotspots", translated);
+            }
+        }
+    }
+
+    private List<Map<String, Object>> translateSonarIssuesNode(com.fasterxml.jackson.databind.node.ArrayNode allIssues) {
+        List<Map<String, Object>> translated = new ArrayList<>();
+        for (JsonNode item : allIssues) {
+            Map<String, Object> issue = objectMapper.convertValue(item, Map.class);
+            translateIssueMessageMap(issue);
+            translated.add(issue);
+        }
+        return translated;
+    }
+
+    private List<Map<String, Object>> translateSonarHotspotsNode(JsonNode hotspotsArray) {
+        List<Map<String, Object>> translated = new ArrayList<>();
+        if (!hotspotsArray.isArray()) {
+            return translated;
+        }
+        for (JsonNode item : hotspotsArray) {
+            Map<String, Object> hotspot = objectMapper.convertValue(item, Map.class);
+            String ruleKey = item.path("ruleKey").asText(null);
+            translateHotspotMessageMap(hotspot, ruleKey);
+            translated.add(hotspot);
+        }
+        return translated;
     }
 
     /** SonarCloud : Bearer ; SonarQube self-hosted : Basic token: (aligné pipeline curl -u). */
@@ -772,17 +1024,15 @@ public class GitLabService {
     public Map<String, Object> fetchSonarQualityGateStatus(String projectKey, String branch) {
         String pk = (projectKey != null && !projectKey.isBlank()) ? projectKey.trim() : sonarProjectKey;
         try {
-            StringBuilder url = new StringBuilder(String.format(
-                    "%s/api/qualitygates/project_status?projectKey=%s",
-                    sonarHostUrl,
-                    sonarUrlEncode(pk)
-            ));
+            MultiValueMap<String, String> params = new LinkedMultiValueMap<>();
+            params.add("projectKey", pk);
             if (branch != null && !branch.isBlank()) {
-                url.append("&branch=").append(sonarUrlEncode(branch.trim()));
+                params.add("branch", branch.trim());
             }
-            RestTemplate restTemplate = new RestTemplate();
+            RestTemplate restTemplate = sonarRestTemplate;
             ResponseEntity<JsonNode> response = restTemplate.exchange(
-                    url.toString(), HttpMethod.GET, sonarAuthEntity(), JsonNode.class);
+                    buildSonarUri("/api/qualitygates/project_status", params),
+                    HttpMethod.GET, sonarAuthEntity(), JsonNode.class);
             if (response.getBody() != null && response.getBody().has("projectStatus")) {
                 return normalizeQualityGateStatus(response.getBody().get("projectStatus"));
             }
@@ -815,13 +1065,26 @@ public class GitLabService {
                 Map.entry("duplicated_lines_density", "duplicated_lines_density"),
                 Map.entry("new_duplicated_lines_density", "duplicated_lines_density"),
                 Map.entry("security_hotspots", "security_hotspots"),
-                Map.entry("new_security_hotspots", "security_hotspots")
+                Map.entry("new_security_hotspots", "security_hotspots"),
+                Map.entry("security_rating", "security_rating"),
+                Map.entry("new_security_rating", "security_rating"),
+                Map.entry("reliability_rating", "reliability_rating"),
+                Map.entry("new_reliability_rating", "reliability_rating"),
+                Map.entry("sqale_rating", "sqale_rating"),
+                Map.entry("new_maintainability_rating", "sqale_rating"),
+                Map.entry("maintainability_rating", "maintainability_rating"),
+                Map.entry("software_quality_security_rating", "software_quality_security_rating"),
+                Map.entry("software_quality_reliability_rating", "software_quality_reliability_rating"),
+                Map.entry("software_quality_maintainability_rating", "software_quality_maintainability_rating")
         );
 
         Map<String, Object> metrics = getOrCreateSonarMetrics(result);
         for (Object item : conditions) {
             if (!(item instanceof Map<?, ?> cond)) continue;
             String metricKey = String.valueOf(cond.get("metricKey"));
+            if ("null".equals(metricKey) || metricKey.isBlank()) {
+                metricKey = String.valueOf(cond.get("metric"));
+            }
             Object actual = cond.get("actualValue");
             if (actual == null) actual = cond.get("actual");
             String target = aliases.get(metricKey);
@@ -833,10 +1096,14 @@ public class GitLabService {
                     || metricKey.contains("duplic") || metricKey.contains("hotspot"))) {
                 target = metricKey;
             }
+            if (target == null && metricKey.toLowerCase(Locale.ROOT).contains("rating")) {
+                target = metricKey;
+            }
             if (target != null) {
                 putSonarMetricIfAbsent(metrics, target, actual);
             }
         }
+        enrichSonarDerivedFromMeasures(result);
     }
 
     /**
@@ -913,6 +1180,115 @@ public class GitLabService {
         }
     }
 
+    /** Lit la valeur d'une mesure Sonar (value ou periods[0].value). */
+    private String extractSonarMeasureValue(JsonNode measure) {
+        if (measure == null || measure.isMissingNode()) return "";
+        String direct = measure.path("value").asText("");
+        if (direct != null && !direct.isBlank()) return direct.trim();
+        JsonNode periods = measure.path("periods");
+        if (periods.isArray() && !periods.isEmpty()) {
+            String periodVal = periods.get(0).path("value").asText("");
+            if (periodVal != null && !periodVal.isBlank()) return periodVal.trim();
+        }
+        return "";
+    }
+
+    private void putSonarMetricsFromMeasuresArray(Map<String, Object> metrics, JsonNode measures) {
+        if (measures == null || !measures.isArray()) return;
+        for (JsonNode measure : measures) {
+            String metric = measure.path("metric").asText("");
+            if (metric.isBlank()) continue;
+            String value = extractSonarMeasureValue(measure);
+            if (!value.isBlank()) {
+                metrics.put(metric, value);
+            }
+        }
+    }
+
+    private boolean hasSonarRatingMetric(Map<String, Object> metrics, String ratingKey) {
+        if (metrics == null) return false;
+        Object raw = metrics.get(ratingKey);
+        if (raw == null || String.valueOf(raw).isBlank()) return false;
+        return sonarRatingToLetter(raw) != null;
+    }
+
+    /**
+     * Dérive security/reliability/sqale ratings depuis les issues ouvertes si l'API measures ne les fournit pas.
+     */
+    @SuppressWarnings("unchecked")
+    private void deriveRatingsFromOpenIssues(Map<String, Object> result) {
+        if (result == null) return;
+        Object issuesObj = result.get("issues");
+        if (!(issuesObj instanceof List<?> issues) || issues.isEmpty()) return;
+
+        Map<String, Object> metrics = getOrCreateSonarMetrics(result);
+        if (!hasSonarRatingMetric(metrics, "security_rating")) {
+            int rating = worstOpenIssueSeverityRating(issues, "VULNERABILITY", 1);
+            putSonarNumericRating(metrics, "security_rating", rating);
+        }
+        if (!hasSonarRatingMetric(metrics, "reliability_rating")) {
+            int rating = worstOpenIssueSeverityRating(issues, "BUG", 1);
+            putSonarNumericRating(metrics, "reliability_rating", rating);
+        }
+        if (!hasSonarRatingMetric(metrics, "sqale_rating") && !hasSonarRatingMetric(metrics, "maintainability_rating")) {
+            int rating = worstOpenIssueSeverityRating(issues, "CODE_SMELL", 1);
+            if (rating <= 1 && parseIntSafe(metrics.get("code_smells")) > 0) {
+                int smells = parseIntSafe(metrics.get("code_smells"));
+                rating = smells >= 50 ? 3 : 2;
+            }
+            putSonarNumericRating(metrics, "sqale_rating", rating);
+            putSonarNumericRating(metrics, "maintainability_rating", rating);
+        }
+    }
+
+    private int worstOpenIssueSeverityRating(List<?> issues, String type, int whenNone) {
+        int worst = whenNone;
+        boolean found = false;
+        for (Object item : issues) {
+            Map<String, Object> issue = asIssueMap(item);
+            if (issue.isEmpty()) continue;
+            if (!type.equalsIgnoreCase(String.valueOf(issue.get("type")))) continue;
+            String status = String.valueOf(issue.get("status")).toUpperCase(Locale.ROOT);
+            if (!Set.of("OPEN", "CONFIRMED", "REOPENED").contains(status)) continue;
+            found = true;
+            int sev = severityToSonarRating(String.valueOf(issue.get("severity")));
+            worst = Math.max(worst, sev);
+        }
+        return found ? worst : whenNone;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> asIssueMap(Object item) {
+        if (item instanceof Map<?, ?> map) {
+            Map<String, Object> out = new LinkedHashMap<>();
+            map.forEach((k, v) -> out.put(String.valueOf(k), v));
+            return out;
+        }
+        if (item instanceof JsonNode node && node.isObject()) {
+            return objectMapper.convertValue(node, Map.class);
+        }
+        return Map.of();
+    }
+
+    private int severityToSonarRating(String severity) {
+        return switch (String.valueOf(severity).toUpperCase(Locale.ROOT)) {
+            case "BLOCKER" -> 5;
+            case "CRITICAL" -> 4;
+            case "MAJOR" -> 3;
+            case "MINOR", "INFO" -> 2;
+            default -> 2;
+        };
+    }
+
+    private void putSonarNumericRating(Map<String, Object> metrics, String key, int rating) {
+        if (rating < 1 || rating > 5) return;
+        metrics.put(key, String.valueOf(rating));
+        String letter = sonarRatingToLetter(rating);
+        if (letter != null) {
+            metrics.put(key + "_letter", letter);
+        }
+    }
+
     /**
      * Récupère les résultats SonarQube pour un projet (métriques globales, issues, hotspots, quality gate).
      */
@@ -920,33 +1296,28 @@ public class GitLabService {
         try {
             log.info("🔍 Récupération des résultats SonarQube pour le projet: {}", sonarProjectKey);
 
-            RestTemplate restTemplate = new RestTemplate();
+            RestTemplate restTemplate = sonarRestTemplate;
             HttpEntity<String> entity = sonarAuthEntity();
 
             // 1. Métriques principales
-            String measuresUrl = String.format(
-                    "%s/api/measures/component?component=%s&metricKeys=bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density,ncloc,security_hotspots,security_rating",
-                    sonarHostUrl,
-                    sonarProjectKey
-            );
-
+            MultiValueMap<String, String> measureParams = new LinkedMultiValueMap<>();
+            measureParams.add("component", sonarProjectKey);
+            measureParams.add("metricKeys",
+                    "bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density,ncloc,security_hotspots,security_rating,reliability_rating,sqale_rating");
             ResponseEntity<JsonNode> measuresResponse = restTemplate.exchange(
-                    measuresUrl,
+                    buildSonarUri("/api/measures/component", measureParams),
                     HttpMethod.GET,
                     entity,
                     JsonNode.class
             );
 
             // 2. Issues (avec facettes principales pour les filtres frontend)
-            // Facets supportés par l'API : severities, types, statuses, languages, tags, assignees, etc.
-            // On reste sur un sous-ensemble sûr pour éviter les erreurs 400 si un nom de facet change.
-            String issuesUrl = String.format(
-                    "%s/api/issues/search?componentKeys=%s&ps=500"
-                            + "&additionalFields=_all"
-                            + "&facets=severities,types,statuses,languages,tags,assignees",
-                    sonarHostUrl,
-                    sonarProjectKey
-            );
+            MultiValueMap<String, String> issueParams = new LinkedMultiValueMap<>();
+            issueParams.add("componentKeys", sonarProjectKey);
+            issueParams.add("ps", "500");
+            issueParams.add("additionalFields", "_all");
+            issueParams.add("statuses", "OPEN,CONFIRMED,REOPENED,RESOLVED,CLOSED");
+            issueParams.add("facets", "severities,types,statuses,languages,tags,assignees,resolutions");
 
             // SonarCloud: le max renvoyé par requête est 500. On pagine donc pour avoir le bon total.
             int pageIndex = 1;
@@ -954,8 +1325,10 @@ public class GitLabService {
             com.fasterxml.jackson.databind.node.ArrayNode allIssues = objectMapper.createArrayNode();
             JsonNode firstIssuesBody = null;
             while (true) {
+                MultiValueMap<String, String> pageParams = new LinkedMultiValueMap<>(issueParams);
+                pageParams.add("p", String.valueOf(pageIndex));
                 ResponseEntity<JsonNode> issuesResponsePage = restTemplate.exchange(
-                        issuesUrl + "&p=" + pageIndex,
+                        buildSonarUri("/api/issues/search", pageParams),
                         HttpMethod.GET,
                         entity,
                         JsonNode.class
@@ -978,14 +1351,11 @@ public class GitLabService {
             }
 
             // 3. Hotspots de sécurité
-            String hotspotsUrl = String.format(
-                    "%s/api/hotspots/search?projectKey=%s&ps=100",
-                    sonarHostUrl,
-                    sonarProjectKey
-            );
-
+            MultiValueMap<String, String> hotspotParams = new LinkedMultiValueMap<>();
+            hotspotParams.add("projectKey", sonarProjectKey);
+            hotspotParams.add("ps", "100");
             ResponseEntity<JsonNode> hotspotsResponse = restTemplate.exchange(
-                    hotspotsUrl,
+                    buildSonarUri("/api/hotspots/search", hotspotParams),
                     HttpMethod.GET,
                     entity,
                     JsonNode.class
@@ -999,11 +1369,7 @@ public class GitLabService {
                 JsonNode measures = component.get("measures");
 
                 Map<String, Object> metrics = new HashMap<>();
-                for (JsonNode measure : measures) {
-                    String metric = measure.get("metric").asText();
-                    String value = measure.get("value").asText();
-                    metrics.put(metric, value);
-                }
+                putSonarMetricsFromMeasuresArray(metrics, measures);
                 result.put("metrics", metrics);
             }
             // Exposer host & project pour permettre des liens directs dans le front
@@ -1029,14 +1395,13 @@ public class GitLabService {
 
             // Duplication par fichier (component tree, fichiers uniquement)
             try {
-                String dupUrl = String.format(
-                        "%s/api/measures/component_tree?component=%s&metricKeys=duplicated_lines_density&qualifiers=FIL&ps=100",
-                        sonarHostUrl,
-                        sonarProjectKey
-                );
-
+                MultiValueMap<String, String> dupParams = new LinkedMultiValueMap<>();
+                dupParams.add("component", sonarProjectKey);
+                dupParams.add("metricKeys", "duplicated_lines_density");
+                dupParams.add("qualifiers", "FIL");
+                dupParams.add("ps", "100");
                 ResponseEntity<JsonNode> dupResponse = restTemplate.exchange(
-                        dupUrl,
+                        buildSonarUri("/api/measures/component_tree", dupParams),
                         HttpMethod.GET,
                         entity,
                         JsonNode.class
@@ -1051,14 +1416,13 @@ public class GitLabService {
 
             // Couverture par fichier (pour Quality Gate Coverage)
             try {
-                String covUrl = String.format(
-                        "%s/api/measures/component_tree?component=%s&metricKeys=coverage,uncovered_lines,uncovered_conditions&qualifiers=FIL&ps=100",
-                        sonarHostUrl,
-                        sonarProjectKey
-                );
-
+                MultiValueMap<String, String> covParams = new LinkedMultiValueMap<>();
+                covParams.add("component", sonarProjectKey);
+                covParams.add("metricKeys", "coverage,uncovered_lines,uncovered_conditions");
+                covParams.add("qualifiers", "FIL");
+                covParams.add("ps", "100");
                 ResponseEntity<JsonNode> covResponse = restTemplate.exchange(
-                        covUrl,
+                        buildSonarUri("/api/measures/component_tree", covParams),
                         HttpMethod.GET,
                         entity,
                         JsonNode.class
@@ -1072,14 +1436,10 @@ public class GitLabService {
             }
 
             // Quality Gate
-            String qualityGateUrl = String.format(
-                    "%s/api/qualitygates/project_status?projectKey=%s",
-                    sonarHostUrl,
-                    sonarProjectKey
-            );
-
+            MultiValueMap<String, String> qgParams = new LinkedMultiValueMap<>();
+            qgParams.add("projectKey", sonarProjectKey);
             ResponseEntity<JsonNode> qualityGateResponse = restTemplate.exchange(
-                    qualityGateUrl,
+                    buildSonarUri("/api/qualitygates/project_status", qgParams),
                     HttpMethod.GET,
                     entity,
                     JsonNode.class
@@ -1092,7 +1452,10 @@ public class GitLabService {
 
             mergeSonarMetricsFromQualityGate(result);
             enrichSonarMetricsFromIssueFacets(result);
+            deriveRatingsFromOpenIssues(result);
+            enrichSonarDerivedFromMeasures(result);
 
+            translateSonarListsInResult(result);
             log.info("✅ Résultats SonarQube récupérés avec succès");
             return result;
 
@@ -1110,8 +1473,8 @@ public class GitLabService {
         if (issueKey == null || issueKey.isBlank() || transition == null || transition.isBlank()) {
             throw new IllegalArgumentException("issueKey et transition sont requis");
         }
-        String url = sonarHostUrl.replaceAll("/+$", "") + "/api/issues/do_transition";
-        RestTemplate restTemplate = new RestTemplate();
+        String url = normalizeSonarHostUrl() + "/api/issues/do_transition";
+        RestTemplate restTemplate = sonarRestTemplate;
         HttpHeaders headers = sonarAuthHeaders();
         headers.setContentType(org.springframework.http.MediaType.APPLICATION_FORM_URLENCODED);
         MultiValueMap<String, String> body = new LinkedMultiValueMap<>();
@@ -1134,8 +1497,8 @@ public class GitLabService {
         if (issueKey == null || issueKey.isBlank()) {
             throw new IllegalArgumentException("issueKey est requis");
         }
-        String url = sonarHostUrl.replaceAll("/+$", "") + "/api/issues/assign";
-        RestTemplate restTemplate = new RestTemplate();
+        String url = normalizeSonarHostUrl() + "/api/issues/assign";
+        RestTemplate restTemplate = sonarRestTemplate;
         HttpHeaders headers = sonarAuthHeaders();
         headers.setContentType(org.springframework.http.MediaType.APPLICATION_FORM_URLENCODED);
         MultiValueMap<String, String> body = new LinkedMultiValueMap<>();
@@ -1180,123 +1543,32 @@ public class GitLabService {
         String effectiveProjectKey = (overrideProjectKey != null && !overrideProjectKey.isBlank())
                 ? overrideProjectKey : sonarProjectKey;
 
-        Map<String, Object> result = new LinkedHashMap<>();
-        result.put("branch", branch);
-        result.put("sonar_host_url", sonarHostUrl);
-        result.put("sonar_project_key", effectiveProjectKey);
+        Map<String, Object> result = loadSonarDataForProjectBranch(effectiveProjectKey, branch);
 
-        RestTemplate restTemplate = new RestTemplate();
-        HttpEntity<String> entity = sonarAuthEntity();
-        String encodedBranch = sonarUrlEncode(branch);
-
-        // 1) Métriques component (branche)
-        try {
-            String measuresUrl = String.format(
-                    "%s/api/measures/component?component=%s&branch=%s&metricKeys=bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density,ncloc,security_hotspots,security_rating,reliability_rating,sqale_rating",
-                    sonarHostUrl,
-                    sonarUrlEncode(effectiveProjectKey),
-                    encodedBranch
-            );
-            ResponseEntity<JsonNode> measuresResponse = restTemplate.exchange(
-                    measuresUrl, HttpMethod.GET, entity, JsonNode.class);
-            if (measuresResponse.getBody() != null && measuresResponse.getBody().has("component")) {
-                JsonNode measures = measuresResponse.getBody().get("component").get("measures");
-                Map<String, Object> metrics = new LinkedHashMap<>();
-                if (measures != null && measures.isArray()) {
-                    for (JsonNode measure : measures) {
-                        metrics.put(measure.get("metric").asText(), measure.path("value").asText(""));
-                    }
-                }
-                result.put("metrics", metrics);
-            }
-        } catch (Exception e) {
-            log.warn("⚠️ Métriques Sonar indisponibles (branch={}): {}", branch, e.getMessage());
-        }
-
-        // 2) Issues (branche)
-        try {
-            String issuesUrl = String.format(
-                    "%s/api/issues/search?componentKeys=%s&branch=%s&ps=500"
-                            + "&additionalFields=_all"
-                            + "&facets=severities,types,statuses,languages,tags,assignees,resolutions",
-                    sonarHostUrl,
-                    sonarUrlEncode(effectiveProjectKey),
-                    encodedBranch
-            );
-            int pageIndex = 1;
-            int totalIssues = 0;
-            com.fasterxml.jackson.databind.node.ArrayNode allIssues = objectMapper.createArrayNode();
-            JsonNode firstIssuesBody = null;
-            while (true) {
-                ResponseEntity<JsonNode> issuesResponsePage = restTemplate.exchange(
-                        issuesUrl + "&p=" + pageIndex,
-                        HttpMethod.GET,
-                        entity,
-                        JsonNode.class
-                );
-                JsonNode issuesBodyPage = issuesResponsePage.getBody();
-                if (issuesBodyPage == null) break;
-                if (firstIssuesBody == null) firstIssuesBody = issuesBodyPage;
-                if (totalIssues == 0) totalIssues = issuesBodyPage.path("total").asInt(0);
-
-                JsonNode issuesPageArr = issuesBodyPage.path("issues");
-                if (!issuesPageArr.isArray() || issuesPageArr.isEmpty()) break;
-                for (JsonNode item : issuesPageArr) {
-                    allIssues.add(item);
-                }
-                if (allIssues.size() >= totalIssues) break;
-                pageIndex++;
-                if (pageIndex > 50) break;
-            }
-            if (firstIssuesBody != null) {
-                result.put("total_issues", totalIssues);
-                result.put("issues", allIssues);
-                result.put("issue_facets", firstIssuesBody.path("facets"));
-            }
-        } catch (Exception e) {
-            log.warn("⚠️ Issues Sonar indisponibles (branch={}): {}", branch, e.getMessage());
-        }
-
-        // 3) Hotspots
-        try {
-            String hotspotsUrl = String.format("%s/api/hotspots/search?projectKey=%s&ps=100", sonarHostUrl, effectiveProjectKey);
-            ResponseEntity<JsonNode> hotspotsResponse = restTemplate.exchange(hotspotsUrl, HttpMethod.GET, entity, JsonNode.class);
-            if (hotspotsResponse.getBody() != null) {
-                JsonNode hotspotsBody = hotspotsResponse.getBody();
-                JsonNode hotspotsArray = hotspotsBody.path("hotspots");
-                int totalFromApi = hotspotsBody.path("total").asInt(0);
-                int count = hotspotsArray.isArray() ? hotspotsArray.size() : 0;
-                result.put("total_hotspots", Math.max(totalFromApi, count));
-                result.put("hotspots", hotspotsArray);
-            }
-        } catch (Exception e) {
-            log.warn("⚠️ Hotspots Sonar indisponibles (branch={}): {}", branch, e.getMessage());
-        }
-
-        // 4) Quality Gate API (par branche)
-        Map<String, Object> qg = fetchSonarQualityGateStatus(effectiveProjectKey, branch);
-        if (!qg.isEmpty()) {
-            result.put("quality_gate", qg);
-        }
-
-        // 5) Enrichir metrics depuis QG + facettes issues
-        mergeSonarMetricsFromQualityGate(result);
-        enrichSonarMetricsFromIssueFacets(result);
-
-        // 6) Fallback global si métriques toujours vides
-        if (isSonarMetricsEmpty(result)) {
+        boolean hasOverrideKey = overrideProjectKey != null && !overrideProjectKey.isBlank();
+        if (isSonarMetricsEmpty(result) && !hasOverrideKey) {
             try {
                 Map<String, Object> global = getSonarQubeResults();
                 mergeSonarResults(result, global);
                 mergeSonarMetricsFromQualityGate(result);
                 enrichSonarMetricsFromIssueFacets(result);
+                deriveRatingsFromOpenIssues(result);
+                enrichSonarDerivedFromMeasures(result);
             } catch (Exception e) {
                 log.warn("⚠️ Fallback Sonar global échoué: {}", e.getMessage());
             }
+        } else if (isSonarMetricsEmpty(result) && hasOverrideKey) {
+            log.warn("⚠️ Sonar vide pour projectKey={} branch={} — pas de fallback sur le projet template",
+                    effectiveProjectKey, branch);
         }
+
+        result.put("branch", branch);
+        result.put("sonar_host_url", normalizeSonarHostUrl());
+        result.put("sonar_project_key", effectiveProjectKey);
 
         log.info("✅ SonarQube branch={} metrics={} qg={}",
                 branch, result.get("metrics"), result.containsKey("quality_gate"));
+        translateSonarListsInResult(result);
         return result;
     }
 
@@ -1434,14 +1706,12 @@ public class GitLabService {
 
     private List<Map<String, Object>> fetchSonarBranchEntries(String projectKey) {
         try {
-            String url = String.format(
-                    "%s/api/project_branches/list?project=%s",
-                    sonarHostUrl,
-                    sonarUrlEncode(projectKey.trim())
-            );
-            RestTemplate restTemplate = new RestTemplate();
+            MultiValueMap<String, String> params = new LinkedMultiValueMap<>();
+            params.add("project", projectKey.trim());
+            RestTemplate restTemplate = sonarRestTemplate;
             ResponseEntity<JsonNode> response = restTemplate.exchange(
-                    url, HttpMethod.GET, sonarAuthEntity(), JsonNode.class);
+                    buildSonarUri("/api/project_branches/list", params),
+                    HttpMethod.GET, sonarAuthEntity(), JsonNode.class);
             JsonNode body = response.getBody();
             if (body == null || !body.path("branches").isArray()) {
                 return List.of();
@@ -1469,28 +1739,23 @@ public class GitLabService {
         String b = branch.trim();
         log.info("🔍 SonarQube load (projectKey={}, branch={})", pk, b);
 
-        RestTemplate restTemplate = new RestTemplate();
+        RestTemplate restTemplate = sonarRestTemplate;
         HttpEntity<String> entity = sonarAuthEntity();
-        String encodedBranch = sonarUrlEncode(b);
 
         // 1) Measures (classiques + Software Quality Sonar 10+)
         try {
-            String measuresUrl = String.format(
-                    "%s/api/measures/component?component=%s&branch=%s&metricKeys=%s",
-                    sonarHostUrl,
-                    sonarUrlEncode(pk),
-                    encodedBranch,
-                    SONAR_MEASURE_KEYS
-            );
+            MultiValueMap<String, String> measureParams = new LinkedMultiValueMap<>();
+            measureParams.add("component", pk);
+            measureParams.add("branch", b);
+            measureParams.add("metricKeys", SONAR_MEASURE_KEYS);
             ResponseEntity<JsonNode> measuresResponse = restTemplate.exchange(
-                    measuresUrl, HttpMethod.GET, entity, JsonNode.class);
+                    buildSonarUri("/api/measures/component", measureParams),
+                    HttpMethod.GET, entity, JsonNode.class);
             if (measuresResponse.getBody() != null && measuresResponse.getBody().has("component")) {
                 JsonNode measures = measuresResponse.getBody().get("component").get("measures");
                 Map<String, Object> metrics = new LinkedHashMap<>();
                 if (measures != null && measures.isArray()) {
-                    for (JsonNode measure : measures) {
-                        metrics.put(measure.get("metric").asText(), measure.path("value").asText(""));
-                    }
+                    putSonarMetricsFromMeasuresArray(metrics, measures);
                 }
                 result.put("metrics", metrics);
             }
@@ -1500,21 +1765,22 @@ public class GitLabService {
 
         // 2) Issues (facettes types/severities — pas pour Software Quality bySeverity)
         try {
-            String issuesUrl = String.format(
-                    "%s/api/issues/search?componentKeys=%s&branch=%s&ps=500"
-                            + "&additionalFields=_all"
-                            + "&facets=severities,types,statuses,languages,tags,assignees,resolutions",
-                    sonarHostUrl,
-                    sonarUrlEncode(pk),
-                    encodedBranch
-            );
+            MultiValueMap<String, String> issueParams = new LinkedMultiValueMap<>();
+            issueParams.add("componentKeys", pk);
+            issueParams.add("branch", b);
+            issueParams.add("ps", "500");
+            issueParams.add("additionalFields", "_all");
+            issueParams.add("statuses", "OPEN,CONFIRMED,REOPENED,RESOLVED,CLOSED");
+            issueParams.add("facets", "severities,types,statuses,languages,tags,assignees,resolutions");
             int pageIndex = 1;
             int totalIssues = 0;
             com.fasterxml.jackson.databind.node.ArrayNode allIssues = objectMapper.createArrayNode();
             JsonNode firstIssuesBody = null;
             while (true) {
+                MultiValueMap<String, String> pageParams = new LinkedMultiValueMap<>(issueParams);
+                pageParams.add("p", String.valueOf(pageIndex));
                 ResponseEntity<JsonNode> issuesResponsePage = restTemplate.exchange(
-                        issuesUrl + "&p=" + pageIndex,
+                        buildSonarUri("/api/issues/search", pageParams),
                         HttpMethod.GET,
                         entity,
                         JsonNode.class
@@ -1543,14 +1809,13 @@ public class GitLabService {
 
         // 3) Hotspots
         try {
-            String hotspotsUrl = String.format(
-                    "%s/api/hotspots/search?projectKey=%s&branch=%s&ps=100",
-                    sonarHostUrl,
-                    sonarUrlEncode(pk),
-                    encodedBranch
-            );
+            MultiValueMap<String, String> hotspotParams = new LinkedMultiValueMap<>();
+            hotspotParams.add("projectKey", pk);
+            hotspotParams.add("branch", b);
+            hotspotParams.add("ps", "100");
             ResponseEntity<JsonNode> hotspotsResponse = restTemplate.exchange(
-                    hotspotsUrl, HttpMethod.GET, entity, JsonNode.class);
+                    buildSonarUri("/api/hotspots/search", hotspotParams),
+                    HttpMethod.GET, entity, JsonNode.class);
             if (hotspotsResponse.getBody() != null) {
                 JsonNode hotspotsBody = hotspotsResponse.getBody();
                 JsonNode hotspotsArray = hotspotsBody.path("hotspots");
@@ -1571,13 +1836,267 @@ public class GitLabService {
 
         mergeSonarMetricsFromQualityGate(result);
         enrichSonarMetricsFromIssueFacets(result);
+        deriveRatingsFromOpenIssues(result);
         enrichSonarDerivedFromMeasures(result);
 
         // Fallback Software Quality uniquement si métriques SQ absentes (Sonar < 10)
         enrichSoftwareQualityFallbackIfMissing(result, pk, b);
         enrichSonarDerivedFromMeasures(result);
+        attachSonarComponentTrees(result, pk, b);
+        translateSonarListsInResult(result);
 
         return result;
+    }
+
+    /** Couverture et duplication par fichier (branch-aware). */
+    private void attachSonarComponentTrees(Map<String, Object> result, String projectKey, String branch) {
+        if (projectKey == null || projectKey.isBlank()) return;
+        RestTemplate restTemplate = sonarRestTemplate;
+        HttpEntity<String> entity = sonarAuthEntity();
+        String pk = projectKey.trim();
+
+        try {
+            MultiValueMap<String, String> dupParams = new LinkedMultiValueMap<>();
+            dupParams.add("component", pk);
+            dupParams.add("metricKeys", "duplicated_lines_density");
+            dupParams.add("qualifiers", "FIL");
+            dupParams.add("ps", "100");
+            if (branch != null && !branch.isBlank()) {
+                dupParams.add("branch", branch.trim());
+            }
+            ResponseEntity<JsonNode> dupResponse = restTemplate.exchange(
+                    buildSonarUri("/api/measures/component_tree", dupParams),
+                    HttpMethod.GET, entity, JsonNode.class);
+            if (dupResponse.getBody() != null) {
+                result.put("duplication_components", dupResponse.getBody().path("components"));
+            }
+        } catch (Exception e) {
+            log.warn("⚠️ Duplication par fichier indisponible (projectKey={}, branch={}): {}", projectKey, branch, e.getMessage());
+        }
+
+        try {
+            MultiValueMap<String, String> covParams = new LinkedMultiValueMap<>();
+            covParams.add("component", pk);
+            covParams.add("metricKeys", "coverage,uncovered_lines,uncovered_conditions");
+            covParams.add("qualifiers", "FIL");
+            covParams.add("ps", "100");
+            if (branch != null && !branch.isBlank()) {
+                covParams.add("branch", branch.trim());
+            }
+            ResponseEntity<JsonNode> covResponse = restTemplate.exchange(
+                    buildSonarUri("/api/measures/component_tree", covParams),
+                    HttpMethod.GET, entity, JsonNode.class);
+            if (covResponse.getBody() != null) {
+                result.put("coverage_components", covResponse.getBody().path("components"));
+            }
+        } catch (Exception e) {
+            log.warn("⚠️ Couverture par fichier indisponible (projectKey={}, branch={}): {}", projectKey, branch, e.getMessage());
+        }
+    }
+
+    /**
+     * Historique d'analyses + séries temporelles (Issues, Coverage, Duplications) — onglet Activité.
+     */
+    public Map<String, Object> getSonarActivityHistory(String projectKey, String branch) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        if (projectKey == null || projectKey.isBlank()) {
+            return result;
+        }
+        String pk = projectKey.trim();
+        String b = branch != null && !branch.isBlank() ? branch.trim() : "main";
+        RestTemplate restTemplate = sonarRestTemplate;
+        HttpEntity<String> entity = sonarAuthEntity();
+
+        try {
+            MultiValueMap<String, String> historyParams = new LinkedMultiValueMap<>();
+            historyParams.add("component", pk);
+            historyParams.add("metrics", "violations,coverage,duplicated_lines_density,ncloc,duplicated_lines,bugs,vulnerabilities,code_smells");
+            historyParams.add("ps", "500");
+            historyParams.add("branch", b);
+            ResponseEntity<JsonNode> historyResponse = restTemplate.exchange(
+                    buildSonarUri("/api/measures/search_history", historyParams),
+                    HttpMethod.GET, entity, JsonNode.class);
+            if (historyResponse.getBody() != null) {
+                result.put("measure_history", objectMapper.convertValue(historyResponse.getBody().path("measures"), List.class));
+            }
+        } catch (Exception e) {
+            log.warn("⚠️ Historique métriques Sonar indisponible: {}", e.getMessage());
+        }
+
+        try {
+            MultiValueMap<String, String> analysesParams = new LinkedMultiValueMap<>();
+            analysesParams.add("project", pk);
+            analysesParams.add("ps", "50");
+            analysesParams.add("branch", b);
+            ResponseEntity<JsonNode> analysesResponse = restTemplate.exchange(
+                    buildSonarUri("/api/project_analyses/search", analysesParams),
+                    HttpMethod.GET, entity, JsonNode.class);
+            if (analysesResponse.getBody() != null) {
+                result.put("analyses", objectMapper.convertValue(analysesResponse.getBody().path("analyses"), List.class));
+            }
+        } catch (Exception e) {
+            log.warn("⚠️ Historique analyses Sonar indisponible: {}", e.getMessage());
+        }
+
+        result.put("branch", b);
+        result.put("sonar_project_key", pk);
+        return result;
+    }
+
+    /**
+     * Détail d'une issue : métadonnées, règle, extrait de code (comme Security Hotspots).
+     */
+    public Map<String, Object> getIssueDetails(String issueKey) {
+        return getIssueDetails(issueKey, null);
+    }
+
+    public Map<String, Object> getIssueDetails(String issueKey, String branch) {
+        if (issueKey == null || issueKey.isBlank()) {
+            throw new IllegalArgumentException("issueKey requis");
+        }
+        try {
+            RestTemplate restTemplate = sonarRestTemplate;
+            HttpEntity<String> entity = sonarAuthEntity();
+
+            MultiValueMap<String, String> searchParams = new LinkedMultiValueMap<>();
+            searchParams.add("issues", issueKey.trim());
+            searchParams.add("additionalFields", "_all,rules");
+            ResponseEntity<JsonNode> searchResponse = restTemplate.exchange(
+                    buildSonarUri("/api/issues/search", searchParams),
+                    HttpMethod.GET, entity, JsonNode.class);
+            JsonNode body = searchResponse.getBody();
+            if (body == null || !body.path("issues").isArray() || body.path("issues").isEmpty()) {
+                throw new RuntimeException("Issue non trouvée: " + issueKey);
+            }
+            JsonNode issue = body.path("issues").get(0);
+            String ruleKey = issue.path("rule").asText(null);
+            String resolvedBranch = (branch != null && !branch.isBlank())
+                    ? branch.trim()
+                    : issue.path("branch").asText(null);
+
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("issue", objectMapper.convertValue(issue, Map.class));
+            result.put("branch", resolvedBranch);
+
+            // Toujours préférer rules/show (sections complètes) — issues/search ne renvoie qu'un résumé
+            if (ruleKey != null && !ruleKey.isBlank()) {
+                try {
+                    MultiValueMap<String, String> ruleParams = new LinkedMultiValueMap<>();
+                    ruleParams.add("key", ruleKey);
+                    ruleParams.add("actives", "true");
+                    if (resolvedBranch != null && !resolvedBranch.isBlank()) {
+                        ruleParams.add("branch", resolvedBranch);
+                    }
+                    addSonarRuleLocaleParams(ruleParams);
+                    ResponseEntity<JsonNode> ruleResponse = restTemplate.exchange(
+                            buildSonarUri("/api/rules/show", ruleParams),
+                            HttpMethod.GET, entity, JsonNode.class);
+                    if (ruleResponse.getBody() != null) {
+                        JsonNode rootRule = ruleResponse.getBody();
+                        JsonNode rule = rootRule.has("rule") ? rootRule.get("rule") : rootRule;
+                        result.put("rule", objectMapper.convertValue(rule, Map.class));
+                    }
+                } catch (Exception e) {
+                    log.warn("Règle issue non récupérée pour {}: {}", ruleKey, e.getMessage());
+                }
+            }
+
+            if (!result.containsKey("rule") && body.path("rules").isArray() && ruleKey != null) {
+                for (JsonNode r : body.path("rules")) {
+                    if (ruleKey.equals(r.path("key").asText(null))) {
+                        result.put("rule", objectMapper.convertValue(r, Map.class));
+                        break;
+                    }
+                }
+            }
+
+            Object ruleObj = result.get("rule");
+            if (ruleObj instanceof Map<?, ?> ruleMap) {
+                translateSonarRuleMapToFrench((Map<String, Object>) ruleMap, ruleKey);
+            }
+            translateSonarIssueMessage(result, ruleKey);
+
+            String componentKey = issue.path("component").asText(null);
+            int line = issue.path("line").asInt(0);
+            if (line <= 0 && issue.has("textRange")) {
+                line = issue.path("textRange").path("startLine").asInt(0);
+            }
+            if (componentKey != null && line > 0) {
+                attachSonarSourceSnippet(result, restTemplate, entity, componentKey, line, resolvedBranch);
+            }
+
+            result.put("sonar_host_url", normalizeSonarHostUrl());
+            result.put("sonar_project_key", sonarProjectKey);
+            return result;
+        } catch (Exception e) {
+            log.error("❌ Erreur détail issue {}: {}", issueKey, e.getMessage());
+            throw new RuntimeException("Impossible de récupérer le détail de l'issue", e);
+        }
+    }
+
+    private void attachSonarSourceSnippet(
+            Map<String, Object> result,
+            RestTemplate restTemplate,
+            HttpEntity<String> entity,
+            String componentKey,
+            int line,
+            String branch
+    ) {
+        try {
+            MultiValueMap<String, String> rawParams = new LinkedMultiValueMap<>();
+            rawParams.add("key", componentKey);
+            if (branch != null && !branch.isBlank()) {
+                rawParams.add("branch", branch.trim());
+            }
+            ResponseEntity<String> rawResponse = restTemplate.exchange(
+                    buildSonarUri("/api/sources/raw", rawParams),
+                    HttpMethod.GET, entity, String.class);
+            if (rawResponse.getBody() != null && !rawResponse.getBody().isBlank()) {
+                String[] lines = rawResponse.getBody().split("\r?\n");
+                int from = Math.max(0, line - 6);
+                int to = Math.min(lines.length, line + 5);
+                List<String> snippet = new ArrayList<>();
+                for (int i = from; i < to; i++) {
+                    snippet.add(lines[i]);
+                }
+                result.put("sourceLines", snippet);
+                result.put("sourceLineFrom", from + 1);
+                result.put("highlightLine", line);
+                return;
+            }
+        } catch (Exception e) {
+            log.warn("sources/raw issue {}: {}", componentKey, e.getMessage());
+        }
+
+        try {
+            int from = Math.max(1, line - 6);
+            int to = line + 5;
+            MultiValueMap<String, String> linesParams = new LinkedMultiValueMap<>();
+            linesParams.add("key", componentKey);
+            linesParams.add("from", String.valueOf(from));
+            linesParams.add("to", String.valueOf(to));
+            if (branch != null && !branch.isBlank()) {
+                linesParams.add("branch", branch.trim());
+            }
+            ResponseEntity<JsonNode> linesResponse = restTemplate.exchange(
+                    buildSonarUri("/api/sources/lines", linesParams),
+                    HttpMethod.GET, entity, JsonNode.class);
+            JsonNode linesBody = linesResponse.getBody();
+            if (linesBody != null && linesBody.isArray() && !linesBody.isEmpty()) {
+                List<String> snippet = new ArrayList<>();
+                List<Integer> lineNumbers = new ArrayList<>();
+                for (JsonNode ln : linesBody) {
+                    lineNumbers.add(ln.path("line").asInt());
+                    snippet.add(ln.path("code").asText(""));
+                }
+                result.put("sourceLines", snippet);
+                result.put("sourceLineNumbers", lineNumbers);
+                result.put("sourceLineFrom", from);
+                result.put("highlightLine", line);
+            }
+        } catch (Exception ex) {
+            log.warn("sources/lines issue {}: {}", componentKey, ex.getMessage());
+        }
     }
 
     /**
@@ -1619,6 +2138,18 @@ public class GitLabService {
         putSonarRatingLetter(metrics, "software_quality_reliability_rating");
         putSonarRatingLetter(metrics, "software_quality_maintainability_rating");
 
+        aliasSonarRatingMetric(metrics, "software_quality_security_rating", "security_rating");
+        aliasSonarRatingMetric(metrics, "software_quality_reliability_rating", "reliability_rating");
+        aliasSonarRatingMetric(metrics, "software_quality_maintainability_rating", "maintainability_rating");
+        aliasSonarRatingMetric(metrics, "software_quality_maintainability_rating", "sqale_rating");
+
+        if (metrics.containsKey("sqale_rating") && !metrics.containsKey("maintainability_rating")) {
+            metrics.put("maintainability_rating", metrics.get("sqale_rating"));
+        }
+        if (metrics.containsKey("sqale_rating_letter") && !metrics.containsKey("maintainability_rating_letter")) {
+            metrics.put("maintainability_rating_letter", metrics.get("sqale_rating_letter"));
+        }
+
         List<Map<String, Object>> sqDimensions = buildSoftwareQualityFromMeasures(metrics);
         if (!sqDimensions.isEmpty()) {
             result.put("software_quality_dimensions", sqDimensions);
@@ -1632,6 +2163,19 @@ public class GitLabService {
         String letter = sonarRatingToLetter(raw);
         if (letter != null) {
             metrics.put(ratingKey + "_letter", letter);
+        }
+    }
+
+    /** Copie rating (+ lettre) Sonar 10+ vers clés legacy attendues par le front. */
+    private void aliasSonarRatingMetric(Map<String, Object> metrics, String sourceKey, String targetKey) {
+        if (metrics.get(sourceKey) == null) return;
+        if (metrics.get(targetKey) == null) {
+            metrics.put(targetKey, metrics.get(sourceKey));
+        }
+        String sourceLetter = sourceKey + "_letter";
+        String targetLetter = targetKey + "_letter";
+        if (metrics.get(sourceLetter) != null && metrics.get(targetLetter) == null) {
+            metrics.put(targetLetter, metrics.get(sourceLetter));
         }
     }
 
@@ -1766,16 +2310,16 @@ public class GitLabService {
 
     private int fetchSonarOpenIssueTotal(String projectKey, String branch, String softwareQuality) {
         try {
-            StringBuilder url = new StringBuilder(String.format(
-                    "%s/api/issues/search?componentKeys=%s&statuses=OPEN,CONFIRMED,REOPENED&ps=1",
-                    sonarHostUrl,
-                    sonarUrlEncode(projectKey)
-            ));
-            url.append("&branch=").append(sonarUrlEncode(branch));
-            url.append("&impactSoftwareQualities=").append(sonarUrlEncode(softwareQuality));
-            RestTemplate restTemplate = new RestTemplate();
+            MultiValueMap<String, String> params = new LinkedMultiValueMap<>();
+            params.add("componentKeys", projectKey);
+            params.add("statuses", "OPEN,CONFIRMED,REOPENED");
+            params.add("ps", "1");
+            params.add("branch", branch);
+            params.add("impactSoftwareQualities", softwareQuality);
+            RestTemplate restTemplate = sonarRestTemplate;
             ResponseEntity<JsonNode> response = restTemplate.exchange(
-                    url.toString(), HttpMethod.GET, sonarAuthEntity(), JsonNode.class);
+                    buildSonarUri("/api/issues/search", params),
+                    HttpMethod.GET, sonarAuthEntity(), JsonNode.class);
             return response.getBody() != null ? response.getBody().path("total").asInt(0) : 0;
         } catch (Exception e) {
             log.debug("Sonar SQ fallback count {} (branch={}): {}", softwareQuality, branch, e.getMessage());
@@ -1805,30 +2349,22 @@ public class GitLabService {
      */
     public Map<String, Object> getSonarFileDuplications(String componentKey) {
         try {
-            RestTemplate restTemplate = new RestTemplate();
+            RestTemplate restTemplate = sonarRestTemplate;
             HttpEntity<String> entity = sonarAuthEntity();
 
-            // Source brute
-            String srcUrl = String.format(
-                    "%s/api/sources/raw?key=%s",
-                    sonarHostUrl,
-                    componentKey
-            );
+            MultiValueMap<String, String> srcParams = new LinkedMultiValueMap<>();
+            srcParams.add("key", componentKey);
             ResponseEntity<String> srcResponse = restTemplate.exchange(
-                    srcUrl,
+                    buildSonarUri("/api/sources/raw", srcParams),
                     HttpMethod.GET,
                     entity,
                     String.class
             );
 
-            // Métadonnées de duplication (blocs)
-            String dupUrl = String.format(
-                    "%s/api/duplications/show?key=%s",
-                    sonarHostUrl,
-                    componentKey
-            );
+            MultiValueMap<String, String> dupParams = new LinkedMultiValueMap<>();
+            dupParams.add("key", componentKey);
             ResponseEntity<JsonNode> dupResponse = restTemplate.exchange(
-                    dupUrl,
+                    buildSonarUri("/api/duplications/show", dupParams),
                     HttpMethod.GET,
                     entity,
                     JsonNode.class
@@ -1853,44 +2389,45 @@ public class GitLabService {
      */
     public Map<String, Object> getHotspotDetails(String hotspotKey) {
         try {
-            RestTemplate restTemplate = new RestTemplate();
+            RestTemplate restTemplate = sonarRestTemplate;
             HttpEntity<String> entity = sonarAuthEntity();
 
-            // 1. Détail du hotspot
-            String showUrl = String.format("%s/api/hotspots/show?hotspot=%s", sonarHostUrl, hotspotKey);
+            MultiValueMap<String, String> showParams = new LinkedMultiValueMap<>();
+            showParams.add("hotspot", hotspotKey);
             ResponseEntity<JsonNode> showResponse = restTemplate.exchange(
-                    showUrl, HttpMethod.GET, entity, JsonNode.class);
+                    buildSonarUri("/api/hotspots/show", showParams),
+                    HttpMethod.GET, entity, JsonNode.class);
             if (showResponse.getBody() == null || !showResponse.getBody().has("key")) {
                 throw new RuntimeException("Hotspot non trouvé: " + hotspotKey);
             }
             JsonNode hotspot = showResponse.getBody();
             String ruleKey = hotspot.has("ruleKey") ? hotspot.get("ruleKey").asText() : null;
+            String hotspotBranch = hotspot.path("branch").asText(null);
 
-            // Logs détaillés pour vérifier ce que renvoie SonarQube
-            log.info("🔍 Hotspot récupéré (key={}): {}", hotspotKey, hotspot.toString());
-            log.info("🔍 Hotspot - ruleKey={}, component={}", ruleKey, hotspot.path("component").toString());
+            log.info("🔍 Hotspot récupéré (key={}): {}", hotspotKey, hotspot);
+            log.info("🔍 Hotspot - ruleKey={}, component={}", ruleKey, hotspot.path("component"));
 
             Map<String, Object> result = new HashMap<>();
             result.put("hotspot", objectMapper.convertValue(hotspot, Map.class));
 
-            // 2. Détails de la règle (risk, fix, description)
             if (ruleKey != null) {
                 try {
-                    // Appeler l'API des règles
-                    String ruleUrl = String.format("%s/api/rules/show?key=%s", sonarHostUrl, ruleKey);
+                    MultiValueMap<String, String> ruleParams = new LinkedMultiValueMap<>();
+                    ruleParams.add("key", ruleKey);
+                    ruleParams.add("actives", "true");
+                    if (hotspotBranch != null && !hotspotBranch.isBlank()) {
+                        ruleParams.add("branch", hotspotBranch);
+                    }
+                    addSonarRuleLocaleParams(ruleParams);
                     ResponseEntity<JsonNode> ruleResponse = restTemplate.exchange(
-                            ruleUrl, HttpMethod.GET, entity, JsonNode.class);
+                            buildSonarUri("/api/rules/show", ruleParams),
+                            HttpMethod.GET, entity, JsonNode.class);
 
                     if (ruleResponse.getBody() != null) {
                         JsonNode rootRule = ruleResponse.getBody();
                         JsonNode rule = rootRule.has("rule") ? rootRule.get("rule") : rootRule;
-
-                        // Log brut pour comparer avec l'interface SonarQube
-                        log.info("📋 Règle brute pour hotspot {} (ruleKey={}): {}", hotspotKey, ruleKey, rule.toString());
-
-                        // On renvoie la règle complète au front pour debug/affichage
-                        Map<String, Object> ruleMap = objectMapper.convertValue(rule, Map.class);
-                        result.put("rule", ruleMap);
+                        log.info("📋 Règle brute pour hotspot {} (ruleKey={}): {}", hotspotKey, ruleKey, rule);
+                        result.put("rule", objectMapper.convertValue(rule, Map.class));
                     } else {
                         log.warn("❓ Réponse vide de /api/rules/show pour ruleKey={}", ruleKey);
                     }
@@ -1899,7 +2436,20 @@ public class GitLabService {
                 }
             }
 
-            // 3. Extrait de code (où est le risque)
+            Object ruleObj = result.get("rule");
+            if (ruleObj instanceof Map<?, ?> ruleMap) {
+                translateSonarRuleMapToFrench((Map<String, Object>) ruleMap, ruleKey);
+            } else {
+                Object hotspotObj = result.get("hotspot");
+                if (hotspotObj instanceof Map<?, ?> hotspotMap && hotspotMap.get("rule") instanceof Map<?, ?> embedded) {
+                    Map<String, Object> embeddedRule = (Map<String, Object>) embedded;
+                    translateSonarRuleMapToFrench(embeddedRule, ruleKey);
+                    result.put("rule", embeddedRule);
+                }
+            }
+            syncTranslatedHotspotRule(result);
+            translateSonarHotspotMessage(result, ruleKey);
+
             String componentKey = null;
             JsonNode compNode = hotspot.get("component");
             if (compNode != null && !compNode.isMissingNode()) {
@@ -1915,28 +2465,10 @@ public class GitLabService {
             int line = hotspot.has("line") ? hotspot.path("line").asInt(0) : 0;
 
             if (componentKey != null && line > 0) {
-                try {
-                    String rawUrl = String.format("%s/api/sources/raw?key=%s", sonarHostUrl, componentKey);
-                    ResponseEntity<String> rawResponse = restTemplate.exchange(
-                            rawUrl, HttpMethod.GET, entity, String.class);
-                    if (rawResponse.getBody() != null) {
-                        String[] lines = rawResponse.getBody().split("\r?\n");
-                        int from = Math.max(0, line - 6);
-                        int to = Math.min(lines.length, line + 5);
-                        List<String> snippet = new ArrayList<>();
-                        for (int i = from; i < to; i++) {
-                            snippet.add(lines[i]);
-                        }
-                        result.put("sourceLines", snippet);
-                        result.put("sourceLineFrom", from + 1);
-                        result.put("highlightLine", line);
-                    }
-                } catch (Exception e) {
-                    log.warn("Source non récupérée pour {}: {}", componentKey, e.getMessage());
-                }
+                attachSonarSourceSnippet(result, restTemplate, entity, componentKey, line, hotspotBranch);
             }
 
-            result.put("sonar_host_url", sonarHostUrl);
+            result.put("sonar_host_url", normalizeSonarHostUrl());
             result.put("sonar_project_key", sonarProjectKey);
             log.info("✅ Détail hotspot récupéré: {}", hotspotKey);
             return result;
