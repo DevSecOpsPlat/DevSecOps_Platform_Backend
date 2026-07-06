@@ -207,16 +207,27 @@ public class PipelineController {
             Object jobs = latest.getStagesJson() != null
                     ? pipelineStageSyncService.getJobsFromStagesJson(latest)
                     : List.<Map<String, Object>>of();
+            if (jobs instanceof List<?> jobList && jobList.isEmpty()
+                    && latest.getStagesJson() != null
+                    && latest.getStagesJson().get("totalJobs") instanceof Number n
+                    && n.intValue() > 0) {
+                log.warn("⚠️ stages_json indique {} jobs mais extraction renvoie 0 (env {})",
+                        n.intValue(), envId);
+            }
             Object jobStatusCount = latest.getStagesJson() != null
                     ? pipelineStageSyncService.getJobStatusCountFromStagesJson(latest)
                     : Map.of(latest.getStatus().name(), 1L);
             if (jobStatusCount instanceof Map && ((Map<?, ?>) jobStatusCount).isEmpty()) {
                 jobStatusCount = Map.of(latest.getStatus().name(), 1L);
             }
+            Map<String, Object> stages = latest.getStagesJson();
+            Object duration = stages != null ? stages.get("duration") : null;
             return ResponseEntity.ok(PipelineScanResponse.builder()
                     .pipelineId(pipelineId)
-                    .status(latest.getStagesJson() != null ? (String) latest.getStagesJson().get("status") : latest.getStatus().name())
-                    .webUrl(latest.getStagesJson() != null ? (String) latest.getStagesJson().get("webUrl") : null)
+                    .status(stages != null ? (String) stages.get("status") : latest.getStatus().name())
+                    .webUrl(stages != null ? (String) stages.get("webUrl") : null)
+                    .ref(stages != null ? (String) stages.get("ref") : null)
+                    .durationSeconds(duration instanceof Number num ? num.longValue() : null)
                     .jobStatusCount(jobStatusCount)
                     .jobs(jobs)
                     .securityReports(Map.of())
@@ -385,12 +396,12 @@ public class PipelineController {
         try {
             JsonNode report = gitLabService.getScanResults(jobId);
             if (report == null) {
-                return ResponseEntity.notFound().build();
+                return ResponseEntity.noContent().build();
             }
             return ResponseEntity.ok(report);
         } catch (Exception e) {
             log.error("❌ Erreur récupération scan results job {}: {}", jobId, e.getMessage());
-            return ResponseEntity.notFound().build();
+            return ResponseEntity.noContent().build();
         }
     }
 

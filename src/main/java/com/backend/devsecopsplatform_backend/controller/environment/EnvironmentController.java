@@ -98,12 +98,12 @@ public class EnvironmentController {
         try {
             JsonNode report = gitLabService.getScanResults(jobId);
             if (report == null) {
-                return ResponseEntity.notFound().build();
+                return ResponseEntity.noContent().build();
             }
             return ResponseEntity.ok(report);
         } catch (Exception e) {
             log.error("❌ Erreur récupération scan results job {}: {}", jobId, e.getMessage());
-            return ResponseEntity.notFound().build();
+            return ResponseEntity.noContent().build();
         }
     }
 

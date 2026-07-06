@@ -18,7 +18,6 @@ import java.io.InputStream;
 import java.util.*;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
-import org.springframework.cache.annotation.Cacheable;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
 import org.springframework.web.util.UriComponentsBuilder;
@@ -348,13 +347,68 @@ public class GitLabService {
             String logs = gitLabApi.getJobApi()
                     .getTrace(gitlabProjectId, jobId);
 
-            log.info("📝 Logs du job {} récupérés ({} caractères)", jobId, logs.length());
-            return logs;
+            String cleaned = stripAnsiAndGitLabSections(logs);
+            log.info("📝 Logs du job {} récupérés ({} caractères)", jobId, cleaned.length());
+            return cleaned;
 
         } catch (GitLabApiException e) {
             log.error("❌ Erreur récupération logs job {}: {}", jobId, e.getMessage());
             return "Logs non disponibles: " + e.getMessage();
         }
+    }
+
+    /** Supprime les codes couleur ANSI et les marqueurs section_start/section_end GitLab CI. */
+    static String stripAnsiAndGitLabSections(String text) {
+        if (text == null || text.isBlank()) {
+            return text == null ? "" : text;
+        }
+        String out = text
+                .replace('\uFEFF', ' ')
+                // Séquences ESC/CSI complètes
+                .replaceAll("\u001B\\[[0-?]*[ -/]*[@-~]", "")
+                .replaceAll("\u001B[@-_]", "")
+                // ESC perdu en transit HTTP : [32;1m, [0m, [0K, [1G …
+                .replaceAll("\\[(?:[0-9]{1,4}(;[0-9]{1,4})*)?[mGKHfABCDEFJSTsu]", "")
+                // Marqueurs GitLab CI (inline ou début de ligne)
+                .replaceAll("section_start:[0-9]+:[^\\r\\n]*", "")
+                .replaceAll("section_end:[0-9]+:[^\\r\\n]*", "");
+
+        // GitLab trace : horodatage ISO ou HH:mm:ss + offset hex (000, 010, 000+)
+        out = out.replaceAll(
+                "(?m)^\\d{4}-\\d{2}-\\d{2}T(\\d{2}:\\d{2}:\\d{2})(?:\\.\\d+)?Z [0-9A-Fa-f]{3}\\+?\\s*",
+                "$1 ");
+        out = out.replaceAll("(?m)^(\\d{2}:\\d{2}:\\d{2})(?:\\.\\d+)? [0-9A-Fa-f]{3}\\+?\\s*", "$1 ");
+        out = out.replaceAll("(?m)^[0-9A-Fa-f]{3}\\+?\\s*", "");
+
+        // Fractions de secondes dans les horodatages / durées (20:35:10.549 → 20:35:10, 12.47s → 12s)
+        out = stripFractionalSecondsInLogs(out);
+
+        // Retours chariot GitLab (écrasement de ligne) : garder la dernière portion
+        StringBuilder sb = new StringBuilder();
+        for (String line : out.split("\n", -1)) {
+            int lastCr = line.lastIndexOf('\r');
+            String cleaned = lastCr >= 0 ? line.substring(lastCr + 1) : line;
+            if (!cleaned.isBlank()) {
+                if (sb.length() > 0) {
+                    sb.append('\n');
+                }
+                sb.append(cleaned.stripTrailing());
+            }
+        }
+        return sb.toString().replaceAll("\n{3,}", "\n\n").trim();
+    }
+
+    /** Tronque les fractions de secondes dans les logs (horodatages, durées). */
+    static String stripFractionalSecondsInLogs(String text) {
+        if (text == null || text.isBlank()) {
+            return text == null ? "" : text;
+        }
+        return text
+                .replaceAll("\\b(\\d{2}:\\d{2}:\\d{2})\\.\\d+\\b", "$1")
+                .replaceAll("\\b(\\d+)\\.\\d+(?=s\\b)", "$1")
+                .replaceAll("\\b(\\d+)\\.\\d+(?=\\s+seconds?\\b)", "$1")
+                .replaceAll("\\b(\\d+)\\.\\d{4,}\\b", "$1")
+                .replaceAll("\\d{4}-\\d{2}-\\d{2}T(\\d{2}:\\d{2}:\\d{2})\\.\\d+Z?", "$1");
     }
 
     /**
@@ -527,12 +581,17 @@ public class GitLabService {
      * @return Rapport de scan en JSON (JsonNode), ou null si aucun artefact trouvé
      */
     public JsonNode getScanResults(Long jobId) {
-        RestTemplate restTemplate = new RestTemplate();
-        HttpHeaders headers = new HttpHeaders();
-        headers.set("PRIVATE-TOKEN", gitlabToken);
-
-        // Chemins d'artefacts courants selon .gitlab-ci.yml (Trivy, SonarQube, rapports GitLab natifs)
+        // Chemins alignés sur .gitlab-ci.yml (docs/pipeline.md)
         String[] artifactPaths = {
+                "reports/trivy/trivy-fs.json",
+                "reports/container-scan/grype-image.json",
+                "reports/sast/semgrep.json",
+                "reports/sast/hadolint.json",
+                "reports/secrets/gitleaks.json",
+                "reports/license/sbom-spdx.json",
+                "reports/iac/results_json.json",
+                "final-report/summary.json",
+                // Anciennes variantes / rapports GitLab natifs
                 "report.json",
                 "trivy-report.json",
                 "trivy-dependencies-report.json",
@@ -540,7 +599,6 @@ public class GitLabService {
                 "gl-sast-report.json",
                 "sonarqube-report.json",
                 "scan-report.json",
-                // Variantes quand le projet est empaqueté dans un sous-répertoire (ex: user-repo/)
                 "user-repo/report.json",
                 "user-repo/trivy-report.json",
                 "user-repo/trivy-dependencies-report.json",
@@ -548,68 +606,117 @@ public class GitLabService {
         };
 
         for (String path : artifactPaths) {
-            try {
-                String url = String.format("%s/projects/%d/jobs/%d/artifacts/%s",
-                        gitlabApiUrl, gitlabProjectId, jobId, path);
-                ResponseEntity<byte[]> response = restTemplate.exchange(
-                        url,
-                        HttpMethod.GET,
-                        new HttpEntity<>(headers),
-                        byte[].class
-                );
-                if (response.getStatusCode() == HttpStatus.OK && response.getBody() != null && response.getBody().length > 0) {
-                    JsonNode report = objectMapper.readTree(response.getBody());
-                    log.info("✅ Scan results récupérés pour job {} (artefact direct: {})", jobId, path);
-                    return report;
-                }
-            } catch (Exception e) {
-                log.debug("Artefact direct {} non trouvé pour job {}: {}", path, jobId, e.getMessage());
+            JsonNode report = tryLoadJobArtifactJson(jobId, path);
+            if (report != null) {
+                log.info("✅ Scan results récupérés pour job {} (artefact direct: {})", jobId, path);
+                return report;
             }
         }
 
-        // Fallback générique : télécharger le ZIP de tous les artifacts et chercher un .json
+        // Fallback : ZIP d'artifacts — priorité aux JSON de scan, sinon premier .json pertinent
+        JsonNode fallbackJson = null;
         try (InputStream zipStream = gitLabApi.getJobApi().downloadArtifactsFile(gitlabProjectId, jobId);
              ZipInputStream zis = new ZipInputStream(zipStream)) {
 
             ZipEntry entry;
             while ((entry = zis.getNextEntry()) != null) {
-                String name = entry.getName();
                 if (entry.isDirectory()) {
                     continue;
                 }
-                // On cherche un JSON de scan : d'abord ceux contenant des mots-clés, sinon le premier .json
-                if (name.toLowerCase().endsWith(".json")) {
-                    boolean looksLikeScan =
-                            name.contains("trivy") ||
-                                    name.contains("sast") ||
-                                    name.contains("scan") ||
-                                    name.contains("report") ||
-                                    name.contains("sonar");
+                String name = entry.getName();
+                if (!name.toLowerCase().endsWith(".json")) {
+                    continue;
+                }
+                if (isIgnorableArtifactJson(name)) {
+                    continue;
+                }
 
-                    ByteArrayOutputStream buffer = new ByteArrayOutputStream();
-                    byte[] tmp = new byte[4096];
-                    int read;
-                    while ((read = zis.read(tmp)) != -1) {
-                        buffer.write(tmp, 0, read);
-                    }
+                ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+                byte[] tmp = new byte[4096];
+                int read;
+                while ((read = zis.read(tmp)) != -1) {
+                    buffer.write(tmp, 0, read);
+                }
 
-                    if (looksLikeScan) {
-                        JsonNode report = objectMapper.readTree(buffer.toByteArray());
-                        log.info("✅ Scan results récupérés pour job {} depuis le ZIP (fichier: {})", jobId, name);
-                        return report;
-                    } else if (log.isDebugEnabled()) {
-                        log.debug("JSON trouvé dans les artifacts mais ignoré (nom: {})", name);
-                    }
+                if (looksLikeScanArtifact(name)) {
+                    JsonNode report = objectMapper.readTree(buffer.toByteArray());
+                    log.info("✅ Scan results récupérés pour job {} depuis le ZIP (fichier: {})", jobId, name);
+                    return report;
+                }
+                if (fallbackJson == null) {
+                    fallbackJson = objectMapper.readTree(buffer.toByteArray());
                 }
             }
         } catch (GitLabApiException e) {
-            log.warn("⚠️ Impossible de télécharger le ZIP d'artifacts pour le job {}: {}", jobId, e.getMessage());
+            log.debug("ZIP d'artifacts indisponible pour le job {}: {}", jobId, e.getMessage());
         } catch (Exception e) {
             log.error("❌ Erreur lors de l'analyse du ZIP d'artifacts pour le job {}: {}", jobId, e.getMessage());
         }
 
-        log.warn("⚠️ Aucun artefact JSON de scan trouvé pour le job {}", jobId);
+        if (fallbackJson != null) {
+            log.info("✅ Scan results récupérés pour job {} depuis le ZIP (fallback JSON)", jobId);
+            return fallbackJson;
+        }
+
+        log.debug("Aucun artefact JSON de scan pour le job {}", jobId);
         return null;
+    }
+
+    private JsonNode tryLoadJobArtifactJson(Long jobId, String artifactPath) {
+        try {
+            String url = org.springframework.web.util.UriComponentsBuilder
+                    .fromHttpUrl(gitlabApiUrl)
+                    .path("/projects/{projectId}/jobs/{jobId}/artifacts/")
+                    .path(artifactPath)
+                    .buildAndExpand(gitlabProjectId, jobId)
+                    .encode()
+                    .toUriString();
+
+            RestTemplate restTemplate = new RestTemplate();
+            HttpHeaders headers = new HttpHeaders();
+            headers.set("PRIVATE-TOKEN", gitlabToken);
+            ResponseEntity<byte[]> response = restTemplate.exchange(
+                    url,
+                    HttpMethod.GET,
+                    new HttpEntity<>(headers),
+                    byte[].class
+            );
+            if (response.getStatusCode() == HttpStatus.OK && response.getBody() != null && response.getBody().length > 0) {
+                return objectMapper.readTree(response.getBody());
+            }
+        } catch (Exception e) {
+            log.debug("Artefact {} non trouvé pour job {}: {}", artifactPath, jobId, e.getMessage());
+        }
+        return null;
+    }
+
+    private boolean looksLikeScanArtifact(String name) {
+        String lower = name.toLowerCase();
+        return lower.contains("trivy")
+                || lower.contains("grype")
+                || lower.contains("semgrep")
+                || lower.contains("hadolint")
+                || lower.contains("gitleaks")
+                || lower.contains("checkov")
+                || lower.contains("sast")
+                || lower.contains("scan")
+                || lower.contains("report")
+                || lower.contains("sonar")
+                || lower.contains("sbom")
+                || lower.contains("spdx")
+                || lower.contains("secrets")
+                || lower.contains("iac");
+    }
+
+    /** Fichiers JSON de config/dépendances à ignorer dans le ZIP. */
+    private boolean isIgnorableArtifactJson(String name) {
+        String lower = name.toLowerCase();
+        return lower.endsWith("package.json")
+                || lower.endsWith("package-lock.json")
+                || lower.endsWith("composer.json")
+                || lower.endsWith("tsconfig.json")
+                || lower.endsWith("angular.json")
+                || lower.contains("/node_modules/");
     }
 
     // ============================================
@@ -2613,13 +2720,20 @@ public class GitLabService {
     }
 
     /**
-     * Récupère le résumé d'un pipeline (pour affichage)
-     *
-     * @param pipelineId ID du pipeline
-     * @return Map avec les informations essentielles
+     * Récupère le résumé d'un pipeline depuis GitLab (sans cache).
      */
-    @Cacheable(value = "pipelineSummaries", key = "#pipelineId", unless = "#result == null")
+    public Map<String, Object> fetchPipelineSummaryLive(Long pipelineId) {
+        return fetchPipelineSummaryFromGitLab(pipelineId);
+    }
+
+    /**
+     * Récupère le résumé d'un pipeline (pour affichage).
+     */
     public Map<String, Object> getPipelineSummary(Long pipelineId) {
+        return fetchPipelineSummaryFromGitLab(pipelineId);
+    }
+
+    private Map<String, Object> fetchPipelineSummaryFromGitLab(Long pipelineId) {
         try {
             // Version avec timeout et exécution parallèle
             CompletableFuture<Pipeline> pipelineFuture = CompletableFuture.supplyAsync(() -> {
