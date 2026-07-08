@@ -86,6 +86,9 @@ public class AppDeploymentService {
     @Value("${deployment.ingress.domain:local}")
     private String ingressDomain;
 
+    @Value("${deployment.ingress.path-based:true}")
+    private boolean pathBasedRouting;
+
     /** Secret partagé validé par le callback (même valeur que le job GitLab). */
     @Value("${pipeline.secret:}")
     private String pipelineSecret;
@@ -148,6 +151,7 @@ public class AppDeploymentService {
                 .pullSecretName(pullSecretName)
                 .ingressEnabled(ingressEnabled)
                 .ingressDomain(ingressDomain)
+                .pathBasedRouting(pathBasedRouting)
                 .imageTag(imageTag)
                 .build();
 
@@ -264,6 +268,7 @@ public class AppDeploymentService {
                 .pullSecretName(pullSecretName)
                 .ingressEnabled(ingressEnabled)
                 .ingressDomain(ingressDomain)
+                .pathBasedRouting(pathBasedRouting)
                 .imageTag(imageTag)
                 .build();
 
@@ -398,6 +403,7 @@ public class AppDeploymentService {
                 .pullSecretName(pullSecretName)
                 .ingressEnabled(ingressEnabled)
                 .ingressDomain(ingressDomain)
+                .pathBasedRouting(pathBasedRouting)
                 .imageTag(imageTag)
                 .resolvedServiceImage(request.getImage().trim())
                 .build();
@@ -588,12 +594,48 @@ public class AppDeploymentService {
             String id = deployment.getId().toString().toLowerCase();
             return scheme + "://app-" + id + "." + nipMasterIp.trim() + ".nip.io:" + nipNodePort;
         }
+        if (!shadow.getServices().isEmpty() && ingressEnabled && pathBasedRouting) {
+            return "http://app-" + deployment.getNamespace() + "." + ingressDomain;
+        }
         if (!shadow.getServices().isEmpty() && ingressEnabled) {
             AppService svc = shadow.getServices().get(0);
             String k8sName = AppNaming.k8sName(svc.getName());
             return "http://" + k8sName + "-" + deployment.getNamespace() + "." + ingressDomain;
         }
         return null;
+    }
+
+    private String ingressServiceUrl(String namespace, AppService svc, ManagedApplication app) {
+        if (!ingressEnabled || !isExternallyExposedService(svc)) {
+            return null;
+        }
+        if (pathBasedRouting) {
+            String base = "http://app-" + namespace + "." + ingressDomain;
+            AppService primary = findPrimaryExposed(app);
+            if (primary != null && java.util.Objects.equals(svc.getId(), primary.getId())) {
+                return base;
+            }
+            return base + "/" + AppNaming.k8sName(svc.getName());
+        }
+        return "http://" + AppNaming.k8sName(svc.getName()) + "-" + namespace + "." + ingressDomain;
+    }
+
+    private AppService findPrimaryExposed(ManagedApplication app) {
+        List<AppService> exposed = app.getServices().stream()
+                .filter(this::isExternallyExposedService)
+                .toList();
+        if (exposed.isEmpty()) {
+            return null;
+        }
+        return exposed.stream()
+                .filter(s -> s.getRole() == com.backend.devsecopsplatform_backend.entity.appmgmt.AppServiceRole.FRONTEND)
+                .findFirst()
+                .orElse(exposed.get(0));
+    }
+
+    private boolean isExternallyExposedService(AppService svc) {
+        return svc.getExposedPort() != null
+                && svc.getRole() != com.backend.devsecopsplatform_backend.entity.appmgmt.AppServiceRole.WORKER;
     }
 
     private UUID parseUuid(String raw) {
@@ -703,8 +745,7 @@ public class AppDeploymentService {
             svcState.put("status", "NotReady");
             svcState.put("wave", waveOf(waves, svc));
             svcState.put("internalHost", k8sName + "." + namespace + ".svc.cluster.local");
-            boolean exposed = svc.getRole() != com.backend.devsecopsplatform_backend.entity.appmgmt.AppServiceRole.WORKER;
-            svcState.put("externalUrl", exposed ? ("http://" + k8sName + "-" + namespace + "." + ingressDomain) : null);
+            svcState.put("externalUrl", ingressServiceUrl(namespace, svc, app));
             services.put(svc.getName(), svcState);
         }
         state.put("namespace", namespace);

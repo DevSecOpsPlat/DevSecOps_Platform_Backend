@@ -57,7 +57,8 @@ public class AppK8sManifestService {
         String registryPassword;
         String pullSecretName;     // ex. gitlab-registry
         boolean ingressEnabled;
-        String ingressDomain;      // ex. local → <svc>-<ns>.local
+        String ingressDomain;      // ex. 192.168.130.138.nip.io → app-<ns>.<domain>
+        boolean pathBasedRouting; // true = un hôte /app + chemins /api ; false = hôte par service
         String imageTag;
         /** Image complète fournie par le pipeline CI (remplace le template CI_REGISTRY_IMAGE). */
         String resolvedServiceImage;
@@ -110,16 +111,25 @@ public class AppK8sManifestService {
                 docs.add(secret);
             }
             docs.add(serviceDeployment(app, svc, namespace, name, opts));
-            // ClusterIP seulement si un port d'écoute est défini (FRONTEND/BACKEND).
-            // WORKER sans port : pas de Service — aucun Ingress non plus.
             if (svc.getExposedPort() != null) {
                 docs.add(serviceClusterIp(svc, namespace, name));
             }
-            if (isExternallyExposed(svc) && svc.getExposedPort() != null) {
-                if (opts.isIngressEnabled()) {
-                    docs.add(serviceIngress(svc, namespace, name, opts));
-                } else {
-                    docs.add(serviceNodePort(svc, namespace, name));
+        }
+        // Exposition externe : un seul Ingress à chemins, ou l'ancien comportement par service.
+        if (opts.isIngressEnabled() && opts.isPathBasedRouting()) {
+            Map<String, Object> ingress = applicationIngress(app, namespace, opts);
+            if (ingress != null) {
+                docs.add(ingress);
+            }
+        } else {
+            for (AppService svc : app.getServices()) {
+                if (isExternallyExposed(svc) && svc.getExposedPort() != null) {
+                    String name = AppNaming.k8sName(svc.getName());
+                    if (opts.isIngressEnabled()) {
+                        docs.add(serviceIngress(svc, namespace, name, opts));
+                    } else {
+                        docs.add(serviceNodePort(svc, namespace, name));
+                    }
                 }
             }
         }
@@ -494,6 +504,72 @@ public class AppK8sManifestService {
         Map<String, Object> m = base("networking.k8s.io/v1", "Ingress");
         Map<String, Object> metadata = meta(name, namespace);
         metadata.put("annotations", Map.of("nginx.ingress.kubernetes.io/rewrite-target", "/"));
+        m.put("metadata", metadata);
+        m.put("spec", spec);
+        return m;
+    }
+
+    /**
+     * Un seul Ingress pour toute l'application. Le service primaire (FRONTEND, ou à défaut
+     * le premier exposé) est monté sur {@code /}. Les autres services exposés reçoivent
+     * un préfixe {@code /<nom>} — même origine, pas de CORS.
+     */
+    private Map<String, Object> applicationIngress(ManagedApplication app, String namespace, ManifestOptions opts) {
+        List<AppService> exposed = app.getServices().stream()
+                .filter(this::isExternallyExposed)
+                .filter(s -> s.getExposedPort() != null)
+                .toList();
+        if (exposed.isEmpty()) {
+            return null;
+        }
+
+        AppService primary = exposed.stream()
+                .filter(s -> s.getRole() == AppServiceRole.FRONTEND)
+                .findFirst()
+                .orElse(exposed.get(0));
+
+        String host = "app-" + namespace + "." + opts.getIngressDomain();
+        List<Map<String, Object>> paths = new ArrayList<>();
+        boolean needsRewrite = false;
+
+        for (AppService svc : exposed) {
+            String name = AppNaming.k8sName(svc.getName());
+            boolean isPrimary = java.util.Objects.equals(svc.getId(), primary.getId());
+
+            Map<String, Object> port = new LinkedHashMap<>();
+            port.put("number", svc.getExposedPort());
+            Map<String, Object> backendService = new LinkedHashMap<>();
+            backendService.put("name", name);
+            backendService.put("port", port);
+            Map<String, Object> backend = new LinkedHashMap<>();
+            backend.put("service", backendService);
+
+            Map<String, Object> path = new LinkedHashMap<>();
+            path.put("path", isPrimary ? "/" : "/" + name + "(/|$)(.*)");
+            path.put("pathType", isPrimary ? "Prefix" : "ImplementationSpecific");
+            path.put("backend", backend);
+            paths.add(path);
+            if (!isPrimary) {
+                needsRewrite = true;
+            }
+        }
+
+        Map<String, Object> http = new LinkedHashMap<>();
+        http.put("paths", paths);
+        Map<String, Object> rule = new LinkedHashMap<>();
+        rule.put("host", host);
+        rule.put("http", http);
+
+        Map<String, Object> spec = new LinkedHashMap<>();
+        spec.put("rules", List.of(rule));
+
+        Map<String, Object> m = base("networking.k8s.io/v1", "Ingress");
+        Map<String, Object> metadata = meta("app-ingress", namespace);
+        if (needsRewrite) {
+            metadata.put("annotations", Map.of(
+                    "nginx.ingress.kubernetes.io/rewrite-target", "/$2",
+                    "nginx.ingress.kubernetes.io/use-regex", "true"));
+        }
         m.put("metadata", metadata);
         m.put("spec", spec);
         return m;
