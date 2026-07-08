@@ -12,6 +12,9 @@ public enum EnvironmentStatus {
     RUNNING,
 
 
+    DEGRADED,
+
+
     FAILED,
 
     DESTROYED,
@@ -20,7 +23,7 @@ public enum EnvironmentStatus {
     EXPIRED;
 
     public boolean isActive() {
-        return this == RUNNING;
+        return this == RUNNING || this == DEGRADED;
     }
 
     public boolean isInProgress() {
@@ -29,6 +32,10 @@ public enum EnvironmentStatus {
 
     public boolean isTerminated() {
         return this == FAILED || this == DESTROYED || this == EXPIRED;
+    }
+
+    public boolean isAlive() {
+        return this == PENDING || this == BUILDING || this == RUNNING || this == DEGRADED;
     }
 
     public boolean canBeDestroyed() {
@@ -41,6 +48,7 @@ public enum EnvironmentStatus {
             case PENDING -> "En attente de création";
             case BUILDING -> "Construction en cours";
             case RUNNING -> "Actif et accessible";
+            case DEGRADED -> "Dégradé — pods non prêts";
             case FAILED -> "Échec du déploiement";
             case DESTROYED -> "Environnement détruit";
             case EXPIRED -> "Temps de vie écoulé";
@@ -51,6 +59,7 @@ public enum EnvironmentStatus {
             case PENDING -> "#FFA500";    // Orange
             case BUILDING -> "#2196F3";   // Bleu
             case RUNNING -> "#4CAF50";    // Vert
+            case DEGRADED -> "#FF9800";   // Orange
             case FAILED -> "#F44336";     // Rouge
             case DESTROYED -> "#9E9E9E";  // Gris
             case EXPIRED -> "#FF9800";    // Orange foncé
@@ -62,6 +71,7 @@ public enum EnvironmentStatus {
             case PENDING -> "⏳";
             case BUILDING -> "🔨";
             case RUNNING -> "✅";
+            case DEGRADED -> "⚠️";
             case FAILED -> "❌";
             case DESTROYED -> "🗑️";
             case EXPIRED -> "⏰";

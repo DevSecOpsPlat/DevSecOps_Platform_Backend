@@ -101,4 +101,94 @@ public class K8sManifestApplyService {
             return false;
         }
     }
+
+    public boolean areAllDeploymentsReady(String namespace) {
+        if (namespace == null || namespace.isBlank()) {
+            return false;
+        }
+        if (apiUrl == null || apiUrl.isBlank() || token == null || token.isBlank()) {
+            return false;
+        }
+        try {
+            List<String> command = new ArrayList<>();
+            command.add("kubectl");
+            command.add("get");
+            command.add("deployments");
+            command.add("-n");
+            command.add(namespace);
+            command.add("-o");
+            command.add("jsonpath={range .items[*]}{.spec.replicas}{\":\"}{.status.readyReplicas}{\" \"}{end}");
+            command.add("--server");
+            command.add(apiUrl.trim());
+            command.add("--token");
+            command.add(token.trim());
+            if (insecureSkipTlsVerify) {
+                command.add("--insecure-skip-tls-verify=true");
+            }
+            Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
+            boolean finished = process.waitFor(15, TimeUnit.SECONDS);
+            if (!finished || process.exitValue() != 0) {
+                return false;
+            }
+            String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+            if (output.isBlank()) {
+                return false;
+            }
+            for (String pair : output.split("\\s+")) {
+                String[] parts = pair.split(":");
+                if (parts.length != 2) {
+                    return false;
+                }
+                String want = parts[0];
+                String have = "null".equals(parts[1]) ? "0" : parts[1];
+                if (!want.equals(have)) {
+                    return false;
+                }
+            }
+            return true;
+        } catch (Exception e) {
+            log.debug("deployments ready check {}: {}", namespace, e.getMessage());
+            return false;
+        }
+    }
+
+    public void deleteNamespace(String namespace) throws IOException, InterruptedException {
+        if (namespace == null || namespace.isBlank()) {
+            return;
+        }
+        if (apiUrl == null || apiUrl.isBlank()) {
+            throw new IllegalStateException("K8S_API_URL non configuré sur le backend");
+        }
+        if (token == null || token.isBlank()) {
+            throw new IllegalStateException("K8S_TOKEN non configuré sur le backend");
+        }
+
+        List<String> command = new ArrayList<>();
+        command.add("kubectl");
+        command.add("delete");
+        command.add("namespace");
+        command.add(namespace);
+        command.add("--ignore-not-found=true");
+        command.add("--wait=false");
+        command.add("--server");
+        command.add(apiUrl.trim());
+        command.add("--token");
+        command.add(token.trim());
+        if (insecureSkipTlsVerify) {
+            command.add("--insecure-skip-tls-verify=true");
+        }
+
+        Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
+        String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        boolean finished = process.waitFor(2, TimeUnit.MINUTES);
+        if (!finished) {
+            process.destroyForcibly();
+            throw new IOException("kubectl delete namespace timeout");
+        }
+        if (process.exitValue() != 0) {
+            log.error("kubectl delete namespace échec (exit {}): {}", process.exitValue(), output);
+            throw new IOException("kubectl delete namespace échoué: " + output);
+        }
+        log.info("kubectl delete namespace {} OK", namespace);
+    }
 }

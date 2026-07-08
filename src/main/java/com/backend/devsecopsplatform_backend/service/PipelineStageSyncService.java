@@ -2,8 +2,8 @@ package com.backend.devsecopsplatform_backend.service;
 
 import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
 import com.backend.devsecopsplatform_backend.entity.PipelineStatus;
-import com.backend.devsecopsplatform_backend.entity.EnvironmentStatus;
 import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
+import com.backend.devsecopsplatform_backend.service.environment.EnvironmentLifecycleService;
 import com.backend.devsecopsplatform_backend.service.qualitygate.QualityGateService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -36,6 +36,7 @@ public class PipelineStageSyncService {
     private final GitLabService gitLabService;
     private final PipelineExecutionRepository pipelineExecutionRepository;
     private final QualityGateService qualityGateService;
+    private final EnvironmentLifecycleService environmentLifecycleService;
     private final ObjectMapper objectMapper;
 
     /**
@@ -178,13 +179,11 @@ public class PipelineStageSyncService {
                     execution.setFinishedAt(LocalDateTime.now());
                 }
 
-                // Quand le pipeline est terminé avec succès, considérer l’environnement comme RUNNING
-                // (l’URL est résolue via nip.io ou callback).
-                if (newStatus == PipelineStatus.SUCCESS && execution.getEnvironment() != null) {
-                    var env = execution.getEnvironment();
-                    if (env.getStatus() == EnvironmentStatus.PENDING || env.getStatus() == EnvironmentStatus.BUILDING) {
-                        env.setStatus(EnvironmentStatus.RUNNING);
-                    }
+                // Pipeline CI : seule transition env = FAILED si encore PENDING/BUILDING
+                if (execution.getEnvironment() != null
+                        && (newStatus == PipelineStatus.FAILED || newStatus == PipelineStatus.CANCELED)) {
+                    String reason = buildPipelineFailureReason(summary);
+                    environmentLifecycleService.onPipelineFailed(execution.getEnvironment().getId(), reason);
                 }
             }
 
@@ -223,5 +222,27 @@ public class PipelineStageSyncService {
             }
         }
         return null;
+    }
+
+    @SuppressWarnings("unchecked")
+    private String buildPipelineFailureReason(Map<String, Object> summary) {
+        Object jobsObj = summary.get("jobs");
+        if (jobsObj instanceof List<?> jobs) {
+            for (Object item : jobs) {
+                if (!(item instanceof Map<?, ?> job)) {
+                    continue;
+                }
+                String status = String.valueOf(job.get("status")).toLowerCase();
+                if ("failed".equals(status) || "canceled".equals(status)) {
+                    Object stage = job.get("stage");
+                    if (stage == null || String.valueOf(stage).isBlank()) {
+                        stage = job.get("name");
+                    }
+                    return "Déploiement échoué au stage " + stage;
+                }
+            }
+        }
+        String pipelineStatus = summary.get("status") != null ? String.valueOf(summary.get("status")) : "failed";
+        return "Pipeline en échec (" + pipelineStatus + ")";
     }
 }

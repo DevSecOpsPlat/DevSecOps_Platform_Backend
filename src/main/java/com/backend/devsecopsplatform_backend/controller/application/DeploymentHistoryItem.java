@@ -32,8 +32,11 @@ public class DeploymentHistoryItem {
 
     private String triggeredByUsername;
 
-    /** URL publique de l’app déployée (Ingress / NodePort), renseignée par le pipeline via callback. */
+    /** URL publique de l’app déployée (uniquement si RUNNING). */
     private String deploymentUrl;
+
+    private String statusReason;
+    private LocalDateTime terminatedAt;
 
     private Integer ttlHours;
     private LocalDateTime expiresAt;

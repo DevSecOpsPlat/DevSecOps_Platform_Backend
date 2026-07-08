@@ -17,6 +17,8 @@ public class EnvironmentSummaryResponse {
     private Integer ttlHours;
     private String status;
     private String previewUrl;
+    private String statusReason;
+    private LocalDateTime terminatedAt;
     private LocalDateTime createdAt;
     private LocalDateTime expiresAt;
     private Long latestPipelineId;

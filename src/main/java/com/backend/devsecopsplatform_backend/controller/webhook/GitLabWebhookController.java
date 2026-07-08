@@ -4,6 +4,7 @@ import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
 import com.backend.devsecopsplatform_backend.entity.PipelineStatus;
 import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
 import com.backend.devsecopsplatform_backend.service.PipelineStageSyncService;
+import com.backend.devsecopsplatform_backend.service.environment.EnvironmentLifecycleService;
 import com.backend.devsecopsplatform_backend.service.finding.FindingIngestionService;
 import com.backend.devsecopsplatform_backend.service.qualitygate.QualityGateService;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -29,6 +30,7 @@ public class GitLabWebhookController {
 
     private final PipelineExecutionRepository pipelineExecutionRepository;
     private final PipelineStageSyncService pipelineStageSyncService;
+    private final EnvironmentLifecycleService environmentLifecycleService;
     private final FindingIngestionService findingIngestionService;
     private final QualityGateService qualityGateService;
     private final ObjectMapper objectMapper;
@@ -127,7 +129,13 @@ public class GitLabWebhookController {
             // 4. Quand le pipeline est terminé, synchroniser les stages en BDD (stages_json)
             if (newStatus == PipelineStatus.SUCCESS || newStatus == PipelineStatus.FAILED
                     || newStatus == PipelineStatus.CANCELED || newStatus == PipelineStatus.SKIPPED) {
-                pipelineStageSyncService.syncStagesForPipeline(pipelineId);
+                boolean synced = pipelineStageSyncService.syncStagesForPipeline(pipelineId);
+                if (!synced && execution.getEnvironment() != null
+                        && (newStatus == PipelineStatus.FAILED || newStatus == PipelineStatus.CANCELED)) {
+                    environmentLifecycleService.onPipelineFailed(
+                            execution.getEnvironment().getId(),
+                            "Pipeline en échec (" + newStatus + ")");
+                }
 
                 // 5. Ingestion findings (asynchrone) depuis aggregate-report artifacts
                 // Important: le webhook doit rester rapide, on ne bloque pas la réponse.

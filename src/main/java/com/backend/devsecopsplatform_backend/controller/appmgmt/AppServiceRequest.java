@@ -1,9 +1,11 @@
 package com.backend.devsecopsplatform_backend.controller.appmgmt;
 
 import com.backend.devsecopsplatform_backend.entity.appmgmt.AppServiceRole;
+import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Pattern;
 import lombok.Data;
 
 import java.util.ArrayList;
@@ -21,6 +23,7 @@ public class AppServiceRequest {
     private AppServiceRole role;
 
     @NotBlank(message = "L'URL du repository Git est obligatoire")
+    @Pattern(regexp = "(?i)^https://.+", message = "URL de dépôt HTTPS requise")
     private String gitRepositoryUrl;
 
     /**
@@ -35,8 +38,12 @@ public class AppServiceRequest {
 
     private String buildContext = ".";
 
-    @NotNull(message = "Le port exposé est obligatoire")
-    @Min(1)
+    /**
+     * Obligatoire pour FRONTEND/BACKEND (≥ 1024). Null / ignoré pour WORKER.
+     * La validation métier par rôle est dans {@code ApplicationManagementService}.
+     */
+    @Min(value = 1024, message = "Port ≥ 1024 (conteneur non-root)")
+    @Max(65535)
     private Integer exposedPort;
 
     private UUID dependsOnServiceId;
@@ -46,6 +53,7 @@ public class AppServiceRequest {
     private String dbUrlEnvVar = "DATABASE_URL";
 
     @Min(1)
+    @Max(5)
     private Integer replicas = 1;
 
     private String healthCheckPath;

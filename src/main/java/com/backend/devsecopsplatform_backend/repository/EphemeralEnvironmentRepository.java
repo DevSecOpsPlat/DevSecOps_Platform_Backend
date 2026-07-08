@@ -32,6 +32,8 @@ public interface EphemeralEnvironmentRepository extends JpaRepository<EphemeralE
 
     List<EphemeralEnvironment> findByStatusNotInAndExpiresAtBefore(Collection<EnvironmentStatus> excludedStatuses,
                                                                    LocalDateTime before);
+
+    List<EphemeralEnvironment> findByStatusIn(Collection<EnvironmentStatus> statuses);
     List<EphemeralEnvironment> findByService_Id(UUID serviceId);
 
     List<EphemeralEnvironment> findByService_IdAndGitBranchOrderByCreatedAtDesc(

@@ -17,6 +17,7 @@ import com.backend.devsecopsplatform_backend.repository.AppDeploymentRepository;
 import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
 import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
 import com.backend.devsecopsplatform_backend.service.EncryptionService;
+import com.backend.devsecopsplatform_backend.service.environment.EnvironmentLifecycleService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -65,6 +66,7 @@ public class AppDeploymentService {
     private final EncryptionService encryptionService;
     private final ObjectMapper objectMapper;
     private final K8sManifestApplyService k8sManifestApplyService;
+    private final EnvironmentLifecycleService environmentLifecycleService;
 
     @Value("${deployment.registry.server:registry.gitlab.com}")
     private String registryServer;
@@ -241,8 +243,12 @@ public class AppDeploymentService {
         deployment.setNamespace("pending");
         deployment = deploymentRepository.save(deployment);
 
-        String namespace = AppNaming.namespace(realApp.getSlug() + "-" + AppNaming.k8sName(target.getName()),
-                deployment.getId());
+        String appSlug = AppNaming.k8sName(realApp.getSlug());
+        String serviceSlug = AppNaming.k8sName(target.getName());
+        if (serviceSlug.startsWith(appSlug + "-")) {
+            serviceSlug = serviceSlug.substring((appSlug + "-").length());
+        }
+        String namespace = AppNaming.namespace(appSlug + "-" + serviceSlug, deployment.getId());
         deployment.setNamespace(namespace);
 
         for (AppDatabase db : depDbs) {
@@ -396,6 +402,11 @@ public class AppDeploymentService {
                 .resolvedServiceImage(request.getImage().trim())
                 .build();
 
+        UUID environmentId = parseUuid(request.getEnvironmentId());
+        if (environmentId != null) {
+            environmentLifecycleService.onBuilding(environmentId);
+        }
+
         try {
             String databasesYaml = manifestService.generateDatabaseBundle(shadow, namespace, opts);
             String servicesYaml = manifestService.generateServiceBundle(shadow, namespace, opts);
@@ -404,6 +415,10 @@ public class AppDeploymentService {
         } catch (Exception e) {
             deployment.setStatus(AppDeploymentStatus.FAILED);
             deploymentRepository.save(deployment);
+            if (environmentId != null) {
+                environmentLifecycleService.onPipelineFailed(
+                        environmentId, "Échec apply Kubernetes: " + e.getMessage());
+            }
             throw new AppValidationException("Échec apply Kubernetes: " + e.getMessage());
         }
 
@@ -412,17 +427,16 @@ public class AppDeploymentService {
         markServicesDeploying(deployment);
         deploymentRepository.save(deployment);
 
-        UUID environmentId = parseUuid(request.getEnvironmentId());
         if (environmentId != null) {
+            String appUrl = resolvePublicUrl(deployment, shadow);
             environmentRepository.findById(environmentId).ifPresent(env -> {
                 env.setNamespace(namespace);
-                env.setStatus(EnvironmentStatus.RUNNING);
-                String appUrl = resolvePublicUrl(deployment, shadow);
                 if (appUrl != null) {
                     env.setUrl(appUrl);
                 }
                 environmentRepository.save(env);
             });
+            environmentLifecycleService.onReady(environmentId, appUrl);
         }
 
         log.info("CI deploy appliqué — deployment={} namespace={} image={}",
@@ -450,6 +464,9 @@ public class AppDeploymentService {
         if (ready) {
             deployment.setStatus(AppDeploymentStatus.RUNNING);
             markServicesReady(deployment);
+            String appUrl = resolvePublicUrl(deployment, shadow);
+            environmentRepository.findById(deploymentId).ifPresent(env ->
+                    environmentLifecycleService.onReady(env.getId(), appUrl != null ? appUrl : env.getUrl()));
         }
 
         String appUrl = resolvePublicUrl(deployment, shadow);
@@ -624,22 +641,15 @@ public class AppDeploymentService {
     // =====================================================================
 
     /**
-     * §3.3 — ordre borné :
+     * §3.3 — ordre :
      * <ol>
-     *   <li>vague 0 : bases (appliquées et Ready en premier via {@code kubectl wait -l tier=database}) ;</li>
-     *   <li>vague 1 : services avec dépendance ({@code depends_on_*}) ;</li>
-     *   <li>vague 2 : services sans dépendance.</li>
+     *   <li>vague 0 : bases (kubectl wait -l tier=database) ;</li>
+     *   <li>vagues services : tri topologique — sans dépendances service d'abord,
+     *       puis ceux qui en dépendent (profondeur croissante).</li>
      * </ol>
      */
     private Map<Integer, List<AppService>> computeWaves(ManagedApplication app) {
-        Map<Integer, List<AppService>> waves = new LinkedHashMap<>();
-        waves.put(1, new ArrayList<>());
-        waves.put(2, new ArrayList<>());
-        for (AppService svc : app.getServices()) {
-            boolean hasDep = svc.getDependsOnDatabaseId() != null || svc.getDependsOnServiceId() != null;
-            waves.get(hasDep ? 1 : 2).add(svc);
-        }
-        return waves;
+        return ServiceTopology.computeWaves(app);
     }
 
     private int waveOf(Map<Integer, List<AppService>> waves, AppService svc) {
@@ -731,11 +741,15 @@ public class AppDeploymentService {
         String dockerfilePath = (service.getDockerfilePath() == null || service.getDockerfilePath().isBlank())
                 ? "./Dockerfile"
                 : service.getDockerfilePath().trim();
+        String buildContext = (service.getBuildContext() == null || service.getBuildContext().isBlank())
+                ? "."
+                : service.getBuildContext().trim();
         String token = resolveDecryptedToken(service);
 
         variables.put("GIT_REPO_URL", repoUrl.trim());
         variables.put("GIT_BRANCH", resolvedBranch);
         variables.put("DOCKERFILE_PATH", dockerfilePath);
+        variables.put("BUILD_CONTEXT", buildContext);
         variables.put("GITHUB_TOKEN", token != null ? token : "");
     }
 

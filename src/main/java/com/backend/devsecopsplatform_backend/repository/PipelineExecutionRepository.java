@@ -12,6 +12,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -22,6 +23,8 @@ public interface PipelineExecutionRepository extends JpaRepository<PipelineExecu
     List<PipelineExecution> findByEnvironmentOrderByCreatedAtDesc(EphemeralEnvironment environment);
 
     Optional<PipelineExecution> findByGitlabPipelineId(Long gitlabPipelineId);
+
+    List<PipelineExecution> findByStatusIn(Collection<PipelineStatus> statuses);
 
     @Query("""
             SELECT pe FROM PipelineExecution pe

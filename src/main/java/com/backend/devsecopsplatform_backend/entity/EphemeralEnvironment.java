@@ -80,6 +80,20 @@ public class EphemeralEnvironment {
     @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd'T'HH:mm:ss")
     private LocalDateTime destroyedAt;
 
+    /** Pourquoi l'environnement est dans cet état (affiché sous le badge). */
+    @Column(name = "status_reason", length = 255)
+    private String statusReason;
+
+    /** Horodatage du passage dans un état non vivant (FAILED, EXPIRED, DESTROYED). */
+    @Column(name = "terminated_at")
+    @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd'T'HH:mm:ss")
+    private LocalDateTime terminatedAt;
+
+    /** Première mise en ligne ; null = n'a jamais servi une requête. */
+    @Column(name = "ready_at")
+    @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd'T'HH:mm:ss")
+    private LocalDateTime readyAt;
+
 
     @OneToOne(mappedBy = "environment", cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.LAZY)
     @JsonManagedReference("env-pipeline")

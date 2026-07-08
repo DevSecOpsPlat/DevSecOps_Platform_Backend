@@ -52,6 +52,7 @@ variables:
   NAMESPACE:          ""
   IMAGE_TAG:          ""
   DOCKERFILE_PATH:    "./Dockerfile"
+  BUILD_CONTEXT:      "."
   DEFECTDOJO_URL:     ""
   DEFECTDOJO_TOKEN:   ""
   SONAR_HOST_URL:     ""
@@ -472,7 +473,7 @@ checkov-iac:
   - SCAN_TAG="${ENVIRONMENT_ID:-$CI_PIPELINE_ID}"
   - '[ -n "$SCAN_TAG" ] || SCAN_TAG="latest"'
   - IMAGE_NAME="${DOCKER_USERNAME}/envirotest-app:${SCAN_TAG}"
-  - docker build -f ${DOCKERFILE_PATH} -t ${IMAGE_NAME} .
+  - docker build -f ${DOCKERFILE_PATH} -t ${IMAGE_NAME} "${BUILD_CONTEXT:-.}"
   - docker save -o ../image.tar ${IMAGE_NAME}
   - cd ..
   - echo "IMAGE_NAME=${IMAGE_NAME}" > image_name.env
@@ -1193,7 +1194,7 @@ deploy:build-docker:
   script:
     - *deploy-docker-wait
     - cd user-repo
-    - docker build -f ${DOCKERFILE_PATH} -t ${IMAGE_NAME} .
+    - docker build -f ${DOCKERFILE_PATH} -t ${IMAGE_NAME} "${BUILD_CONTEXT:-.}"
     - docker save -o ../image.tar ${IMAGE_NAME}
     - cd ..
     - echo "Image built ${IMAGE_NAME}"
@@ -1216,7 +1217,7 @@ deploy:build-docker-host:
   script:
     - *deploy-docker-wait
     - cd user-repo
-    - docker build -f ${DOCKERFILE_PATH} -t ${IMAGE_NAME} .
+    - docker build -f ${DOCKERFILE_PATH} -t ${IMAGE_NAME} "${BUILD_CONTEXT:-.}"
     - docker save -o ../image.tar ${IMAGE_NAME}
     - cd ..
     - echo "Image built ${IMAGE_NAME}"

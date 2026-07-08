@@ -36,6 +36,7 @@ public class EnvironmentService {
     private final PipelineExecutionRepository pipelineExecutionRepository;
     private final PipelineStageSyncService pipelineStageSyncService;
     private final CloudResourceRepository cloudResourceRepository;
+    private final EnvironmentLifecycleService environmentLifecycleService;
 
     @Value("${deployment.preview.nip.enabled:false}")
     private boolean nipPreviewEnabled;
@@ -251,13 +252,9 @@ public class EnvironmentService {
 
     @Transactional
     public void publishDeploymentPublicUrl(UUID environmentId, String publicUrl) {
-        EphemeralEnvironment env = environmentRepository.findById(environmentId)
+        environmentRepository.findById(environmentId)
                 .orElseThrow(() -> new RuntimeException("Environnement introuvable: " + environmentId));
-        env.setUrl(publicUrl);
-        if (env.getStatus() == EnvironmentStatus.PENDING || env.getStatus() == EnvironmentStatus.BUILDING) {
-            env.setStatus(EnvironmentStatus.RUNNING);
-        }
-        environmentRepository.save(env);
+        environmentLifecycleService.onReady(environmentId, publicUrl);
         log.info("🌐 URL déploiement enregistrée pour env {} : {}", environmentId, publicUrl);
     }
 
@@ -280,7 +277,9 @@ public class EnvironmentService {
                     .gitBranch(e.getGitBranch())
                     .ttlHours(e.getTtlHours())
                     .status(e.getStatus().name())
-                    .previewUrl(resolveDeploymentPublicUrl(e))
+                    .previewUrl(EnvironmentLifecycleService.publicUrlOrNull(e))
+                    .statusReason(e.getStatusReason())
+                    .terminatedAt(e.getTerminatedAt())
                     .createdAt(e.getCreatedAt())
                     .expiresAt(e.getExpiresAt())
                     .latestPipelineId(pipeline != null ? pipeline.getGitlabPipelineId() : null)
@@ -305,7 +304,9 @@ public class EnvironmentService {
                     .gitBranch(e.getGitBranch())
                     .ttlHours(e.getTtlHours())
                     .status(e.getStatus().name())
-                    .previewUrl(resolveDeploymentPublicUrl(e))
+                    .previewUrl(EnvironmentLifecycleService.publicUrlOrNull(e))
+                    .statusReason(e.getStatusReason())
+                    .terminatedAt(e.getTerminatedAt())
                     .createdAt(e.getCreatedAt())
                     .expiresAt(e.getExpiresAt())
                     .latestPipelineId(pipeline != null ? pipeline.getGitlabPipelineId() : null)
@@ -455,7 +456,9 @@ public class EnvironmentService {
                 .gitBranch(e.getGitBranch())
                 .ttlHours(e.getTtlHours())
                 .status(e.getStatus().name())
-                .previewUrl(resolveDeploymentPublicUrl(e))
+                .previewUrl(EnvironmentLifecycleService.publicUrlOrNull(e))
+                .statusReason(e.getStatusReason())
+                .terminatedAt(e.getTerminatedAt())
                 .createdAt(e.getCreatedAt())
                 .expiresAt(e.getExpiresAt())
                 .latestPipelineId(pipeline != null ? pipeline.getGitlabPipelineId() : null)
