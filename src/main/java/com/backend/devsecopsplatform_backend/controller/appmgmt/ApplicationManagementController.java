@@ -130,8 +130,10 @@ public class ApplicationManagementController {
     // ---------- Déploiements ----------
 
     @PostMapping("/{id}/deploy")
-    public ResponseEntity<?> deploy(@PathVariable UUID id) {
-        return handle(() -> ResponseEntity.ok(service.deploy(id)));
+    public ResponseEntity<?> deploy(
+            @PathVariable UUID id,
+            @RequestBody(required = false) ManagedDeployRequest request) {
+        return handle(() -> ResponseEntity.ok(service.deploy(id, request)));
     }
 
     @GetMapping("/{id}/deployments")

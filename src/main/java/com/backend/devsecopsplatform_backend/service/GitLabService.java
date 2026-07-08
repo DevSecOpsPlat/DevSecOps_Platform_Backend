@@ -84,6 +84,12 @@ public class GitLabService {
     @Value("${sonarqube.accept-language:fr}")
     private String sonarAcceptLanguage;
 
+    @Value("${deployment.callback.base-url:}")
+    private String callbackBaseUrl;
+
+    @Value("${pipeline.secret:}")
+    private String pipelineSecret;
+
     // ============================================
     // PIPELINE - CRÉATION ET DÉCLENCHEMENT
     // ============================================
@@ -145,11 +151,62 @@ public class GitLabService {
             addVar(variablesList, "GIT_BRANCH", gitBranch);
             addVar(variablesList, "GITHUB_TOKEN", githubToken != null ? githubToken : "");
             addVar(variablesList, "ENVIRONMENT_ID", envId);
+            addVar(variablesList, "APPLICATION_ID", applicationId.toString());
             addVar(variablesList, "DOCKERFILE_PATH", dockerPath);
             addVar(variablesList, "TTL_HOURS", String.valueOf(ttl));
             addVar(variablesList, "K8S_NAMESPACE", ns);
-            addVar(variablesList, "SKIP_DEPLOYMENT", "true");
+            addVar(variablesList, "ACTION", "deploy");
+            addBackendUrlIfConfigured(variablesList);
+            addVar(variablesList, "PIPELINE_SECRET", pipelineSecret != null ? pipelineSecret : "");
 
+            return postPipeline(variablesList);
+        } catch (Exception e) {
+            if (e instanceof RuntimeException && e.getCause() != null) {
+                log.error("❌ Erreur déclenchement pipeline: {} - Cause: {}", e.getMessage(), e.getCause().getMessage());
+            } else {
+                log.error("❌ Erreur déclenchement pipeline: {}", e.getMessage());
+            }
+            throw new RuntimeException("Impossible de lancer le pipeline: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Déclenche un scan de sécurité sans créer d'environnement éphémère.
+     * Les jobs scan s'exécutent via {@code default.rules} (ACTION != deploy).
+     */
+    public Pipeline triggerScanPipeline(
+            String gitRepoUrl,
+            String branch,
+            UUID applicationId,
+            String dockerfilePath
+    ) {
+        try {
+            String githubToken = applicationService.getDecryptedGithubToken(applicationId);
+            String gitBranch = branch != null && !branch.isBlank() ? branch : "main";
+            String dockerPath = dockerfilePath != null && !dockerfilePath.isBlank() ? dockerfilePath : "./Dockerfile";
+
+            log.info("🔎 [Scan] Pipeline GitLab — GIT_REPO_URL={}, GIT_BRANCH={}, APPLICATION_ID={}",
+                    gitRepoUrl, gitBranch, applicationId);
+
+            List<Map<String, String>> variablesList = new ArrayList<>();
+            addVar(variablesList, "GIT_REPO_URL", gitRepoUrl);
+            addVar(variablesList, "GIT_BRANCH", gitBranch);
+            addVar(variablesList, "GITHUB_TOKEN", githubToken != null ? githubToken : "");
+            addVar(variablesList, "APPLICATION_ID", applicationId.toString());
+            addVar(variablesList, "DOCKERFILE_PATH", dockerPath);
+            addBackendUrlIfConfigured(variablesList);
+            addVar(variablesList, "PIPELINE_SECRET", pipelineSecret != null ? pipelineSecret : "");
+
+            return postPipeline(variablesList);
+        } catch (Exception e) {
+            log.error("❌ Erreur déclenchement scan: {}", e.getMessage());
+            throw new RuntimeException("Impossible de lancer le scan: " + e.getMessage(), e);
+        }
+    }
+
+    private Pipeline postPipeline(List<Map<String, String>> variablesList) {
+        try {
+            String ref = defaultBranch;
             Map<String, Object> body = new HashMap<>();
             body.put("ref", ref);
             body.put("variables", variablesList);
@@ -174,13 +231,7 @@ public class GitLabService {
             Pipeline pipeline = mapToPipeline(res);
             log.info("✅ Pipeline lancé - ID: {} - URL: {}", pipeline.getId(), pipeline.getWebUrl());
             return pipeline;
-
         } catch (Exception e) {
-            if (e instanceof RuntimeException && e.getCause() != null) {
-                log.error("❌ Erreur déclenchement pipeline: {} - Cause: {}", e.getMessage(), e.getCause().getMessage());
-            } else {
-                log.error("❌ Erreur déclenchement pipeline: {}", e.getMessage());
-            }
             throw new RuntimeException("Impossible de lancer le pipeline: " + e.getMessage(), e);
         }
     }
@@ -190,6 +241,29 @@ public class GitLabService {
         entry.put("key", key);
         entry.put("value", value != null ? value : "");
         list.add(entry);
+    }
+
+    /**
+     * N'envoie BACKEND_URL au pipeline que si une URL publique est configurée côté backend.
+     * Sinon la variable CI/CD GitLab (BACKEND_URL) est utilisée telle quelle.
+     */
+    private void addBackendUrlIfConfigured(List<Map<String, String>> variablesList) {
+        if (!isPublicCallbackBaseUrl(callbackBaseUrl)) {
+            log.debug("BACKEND_URL non envoyé au pipeline — utilisation de la variable CI/CD GitLab si définie");
+            return;
+        }
+        addVar(variablesList, "BACKEND_URL", callbackBaseUrl.trim());
+    }
+
+    private static boolean isPublicCallbackBaseUrl(String url) {
+        if (url == null || url.isBlank()) {
+            return false;
+        }
+        String normalized = url.trim().toLowerCase();
+        return !normalized.contains("host.docker.internal")
+                && !normalized.contains("localhost")
+                && !normalized.startsWith("http://127.")
+                && !normalized.startsWith("https://127.");
     }
 
     @SuppressWarnings("unchecked")

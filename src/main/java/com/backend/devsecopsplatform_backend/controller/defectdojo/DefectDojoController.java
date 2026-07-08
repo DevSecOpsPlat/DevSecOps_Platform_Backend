@@ -35,10 +35,14 @@ public class DefectDojoController {
     @GetMapping("/dashboard2")
     public ResponseEntity<DefectDojoDashboard2Response> dashboard2(
             @RequestParam UUID applicationId,
-            @RequestParam(required = false) String branch
+            @RequestParam(required = false) String branch,
+            @RequestParam(required = false) UUID environmentId,
+            @RequestParam(required = false) Long pipelineId,
+            @RequestParam(defaultValue = "true") boolean scanOnly
     ) {
         try {
-            return ResponseEntity.ok(defectDojoService.getDashboard2(applicationId, branch));
+            return ResponseEntity.ok(defectDojoService.getDashboard2(
+                    applicationId, branch, environmentId, pipelineId, scanOnly));
         } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest().build();
         } catch (Exception e) {

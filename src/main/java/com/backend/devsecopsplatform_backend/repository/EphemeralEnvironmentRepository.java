@@ -27,7 +27,7 @@ public interface EphemeralEnvironmentRepository extends JpaRepository<EphemeralE
 
     Optional<EphemeralEnvironment> findByIdAndRequestedBy(UUID id, User user);
 
-    @Query("SELECT e FROM EphemeralEnvironment e WHERE e.requestedBy = :user ORDER BY e.createdAt DESC")
+    @Query("SELECT e FROM EphemeralEnvironment e WHERE e.requestedBy = :user AND e.environmentName NOT LIKE 'scan-%' ORDER BY e.createdAt DESC")
     List<EphemeralEnvironment> findMyEnvironments(@Param("user") User user);
 
     List<EphemeralEnvironment> findByStatusNotInAndExpiresAtBefore(Collection<EnvironmentStatus> excludedStatuses,
@@ -43,6 +43,7 @@ public interface EphemeralEnvironmentRepository extends JpaRepository<EphemeralE
             select distinct e from EphemeralEnvironment e
             left join fetch e.pipelineExecution
             where e.service.id = :applicationId
+              and e.environmentName not like 'scan-%'
               and (:branch is null or e.gitBranch = :branch)
             order by e.createdAt desc
             """)
@@ -56,6 +57,7 @@ public interface EphemeralEnvironmentRepository extends JpaRepository<EphemeralE
             left join fetch e.pipelineExecution p
             where e.requestedBy = :user
               and a.id = :appId
+              and e.environmentName not like 'scan-%'
             order by e.createdAt desc
             """)
     List<EphemeralEnvironment> findByRequestedByAndServiceIdWithServiceAndPipelineOrderByCreatedAtDesc(

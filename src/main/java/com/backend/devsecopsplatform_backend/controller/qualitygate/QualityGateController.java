@@ -46,15 +46,18 @@ public class QualityGateController {
             @RequestParam UUID applicationId,
             @RequestParam(required = false) String branch,
             @RequestParam(required = false) UUID environmentId,
+            @RequestParam(required = false) Long pipelineId,
             @RequestParam(required = false) UUID snapshotId,
             @RequestParam(required = false, defaultValue = "false") boolean refresh
     ) {
         try {
             if (environmentId != null) {
                 syncStagesForEnvironment(applicationId, environmentId);
+            } else if (pipelineId != null && pipelineId > 0) {
+                syncStagesForPipeline(pipelineId);
             }
             return ResponseEntity.ok(qualityGateService.getForApplication(
-                    applicationId, branch, environmentId, refresh, snapshotId));
+                    applicationId, branch, environmentId, pipelineId, refresh, snapshotId));
         } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest().body(Map.of("message", e.getMessage()));
         } catch (Exception e) {
@@ -198,9 +201,18 @@ public class QualityGateController {
     @GetMapping("/environments")
     public ResponseEntity<List<QualityGateEnvironmentOptionDto>> environments(
             @RequestParam UUID applicationId,
+            @RequestParam(required = false) String branch,
+            @RequestParam(required = false, defaultValue = "false") boolean scanOnly
+    ) {
+        return ResponseEntity.ok(qualityGateService.listEnvironments(applicationId, branch, scanOnly));
+    }
+
+    @GetMapping("/pipelines")
+    public ResponseEntity<List<QualityGateEnvironmentOptionDto>> scanPipelines(
+            @RequestParam UUID applicationId,
             @RequestParam(required = false) String branch
     ) {
-        return ResponseEntity.ok(qualityGateService.listEnvironments(applicationId, branch));
+        return ResponseEntity.ok(qualityGateService.listScanPipelines(applicationId, branch));
     }
 
     private void syncStagesForEnvironment(UUID applicationId, UUID environmentId) {
@@ -214,5 +226,13 @@ public class QualityGateController {
                                 exec.getGitlabPipelineId(), e.getMessage());
                     }
                 });
+    }
+
+    private void syncStagesForPipeline(Long pipelineId) {
+        try {
+            pipelineStageSyncService.syncStagesForPipeline(pipelineId);
+        } catch (Exception e) {
+            log.warn("Sync stages GitLab échouée (pipeline #{}): {}", pipelineId, e.getMessage());
+        }
     }
 }

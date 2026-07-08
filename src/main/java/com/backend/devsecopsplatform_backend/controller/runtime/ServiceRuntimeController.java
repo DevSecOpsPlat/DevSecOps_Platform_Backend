@@ -12,7 +12,9 @@ import com.backend.devsecopsplatform_backend.repository.ManagedApplicationReposi
 import com.backend.devsecopsplatform_backend.repository.UserRepository;
 import com.backend.devsecopsplatform_backend.service.EncryptionService;
 import com.backend.devsecopsplatform_backend.service.appmgmt.AppDeploymentService;
+import com.backend.devsecopsplatform_backend.controller.appmgmt.ManagedDeployRequest;
 import com.backend.devsecopsplatform_backend.service.appmgmt.AppValidationException;
+import com.backend.devsecopsplatform_backend.service.appmgmt.ManagedDeployOptions;
 import com.backend.devsecopsplatform_backend.service.environment.EnvironmentService;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
@@ -53,11 +55,10 @@ public class ServiceRuntimeController {
     private final EncryptionService encryptionService;
 
     /**
-     * Corps optionnel d'un scan : durée de session (default 4h) et branche (défaut = branche du service, sinon "main").
+     * Corps optionnel d'un scan : branche (défaut = branche du service, sinon "main").
      */
     @Data
     public static class ScanRunRequest {
-        private Integer sessionDurationHours;
         private String branch;
     }
 
@@ -150,17 +151,15 @@ public class ServiceRuntimeController {
         String branch = body != null && body.getBranch() != null && !body.getBranch().isBlank()
                 ? body.getBranch().trim()
                 : (svc.getGitBranch() != null && !svc.getGitBranch().isBlank() ? svc.getGitBranch() : "main");
-        int ttl = body != null && body.getSessionDurationHours() != null ? body.getSessionDurationHours() : 4;
 
         DeployRequest req = new DeployRequest();
         req.setGitRepositoryUrl(repoUrl);
         req.setBranch(branch);
-        req.setSessionDurationHours(ttl);
         req.setGithubToken(token);
         req.setDockerfilePath(svc.getDockerfilePath() != null ? svc.getDockerfilePath() : "./Dockerfile");
 
         log.info("🔎 Scan service {} (repo={}, branch={})", svc.getId(), repoUrl, branch);
-        DeployResponse response = environmentService.deploy(req);
+        DeployResponse response = environmentService.scan(req, svc);
         return ResponseEntity.ok(response);
     }
 
@@ -171,12 +170,16 @@ public class ServiceRuntimeController {
     @PostMapping("/api/managed-applications/{appId}/services/{svcId}/deploy")
     public ResponseEntity<AppDeploymentResponse> deployServiceInProject(
             @PathVariable UUID appId,
-            @PathVariable UUID svcId) {
+            @PathVariable UUID svcId,
+            @RequestBody(required = false) ManagedDeployRequest body) {
         User currentUser = getCurrentUser();
         ManagedApplication app = managedApplicationRepository.findByIdAndCreatedBy(appId, currentUser)
                 .orElseThrow(() -> new AppValidationException("Projet introuvable ou accès refusé."));
 
-        AppDeployment deployment = appDeploymentService.deploySingleService(app, svcId);
+        ManagedDeployOptions options = ManagedDeployOptions.from(body);
+        AppDeployment deployment = appDeploymentService.deploySingleService(app, svcId, options);
+        log.info("🚀 Déploiement service {} — branche={}, ttlHours={}",
+                svcId, options.resolveBranch(null), options.ttlHours());
         return ResponseEntity.ok(mapDeployment(deployment));
     }
 

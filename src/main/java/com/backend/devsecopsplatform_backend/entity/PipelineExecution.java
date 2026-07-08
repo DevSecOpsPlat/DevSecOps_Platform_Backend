@@ -23,6 +23,7 @@ import java.util.UUID;
 @Entity
 @Table(name = "pipeline_executions", indexes = {
         @Index(name = "idx_pipeline_env", columnList = "environment_id"),
+        @Index(name = "idx_pipeline_app", columnList = "app_service_id"),
         @Index(name = "idx_pipeline_gitlab", columnList = "gitlab_pipeline_id"),
         @Index(name = "idx_pipeline_status", columnList = "status")
 })
@@ -36,10 +37,21 @@ public class PipelineExecution {
     @Column(name = "id", updatable = false, nullable = false)
     private UUID id;
 
-    @OneToOne(fetch = FetchType.LAZY, optional = false)
-    @JoinColumn(name = "environment_id", nullable = false, unique = true)
+    @OneToOne(fetch = FetchType.LAZY, optional = true)
+    @JoinColumn(name = "environment_id", nullable = true, unique = true)
     @JsonBackReference("env-pipeline")
     private EphemeralEnvironment environment;
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(name = "app_service_id", nullable = false)
+    private AppService appService;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "execution_kind", nullable = false, length = 30)
+    private PipelineExecutionKind executionKind = PipelineExecutionKind.SCAN;
+
+    @Column(name = "git_branch", nullable = false, length = 255)
+    private String gitBranch = "main";
 
     @Column(name = "gitlab_pipeline_id")
     private Long gitlabPipelineId;

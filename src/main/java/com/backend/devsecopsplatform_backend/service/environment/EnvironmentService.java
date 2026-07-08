@@ -173,6 +173,9 @@ public class EnvironmentService {
         // 5. Enregistrer l'exécution du pipeline (relation OneToOne)
         PipelineExecution execution = new PipelineExecution();
         execution.setGitlabPipelineId(pipeline.getId());
+        execution.setAppService(app);
+        execution.setExecutionKind(PipelineExecutionKind.DEPLOY);
+        execution.setGitBranch(request.getBranch() != null && !request.getBranch().isBlank() ? request.getBranch() : "main");
         execution.setStatus(com.backend.devsecopsplatform_backend.entity.PipelineStatus
                 .fromGitLabStatus(pipeline.getStatus() != null ? pipeline.getStatus().toString() : "running"));
         execution.setStartedAt(LocalDateTime.now());
@@ -200,6 +203,52 @@ public class EnvironmentService {
     /**
      * Enregistre l’URL publique après déploiement (callback GitLab / job pipeline).
      */
+    @Transactional
+    public DeployResponse scan(DeployRequest request, AppService application) {
+        getCurrentUser();
+
+        if (request.getGithubToken() != null && !request.getGithubToken().isBlank()) {
+            boolean valid = gitHubValidationService.validateRepository(
+                    request.getGitRepositoryUrl(),
+                    request.getGithubToken()
+            );
+            if (!valid) {
+                throw new RuntimeException("Repository GitHub invalide ou token incorrect");
+            }
+        }
+
+        String dockerfilePath = request.getDockerfilePath() != null && !request.getDockerfilePath().isBlank()
+                ? request.getDockerfilePath() : "./Dockerfile";
+
+        Pipeline pipeline = gitLabService.triggerScanPipeline(
+                request.getGitRepositoryUrl(),
+                request.getBranch(),
+                application.getId(),
+                dockerfilePath
+        );
+
+        PipelineExecution execution = new PipelineExecution();
+        execution.setGitlabPipelineId(pipeline.getId());
+        execution.setAppService(application);
+        execution.setExecutionKind(PipelineExecutionKind.SCAN);
+        execution.setGitBranch(request.getBranch() != null && !request.getBranch().isBlank() ? request.getBranch() : "main");
+        execution.setStatus(com.backend.devsecopsplatform_backend.entity.PipelineStatus
+                .fromGitLabStatus(pipeline.getStatus() != null ? pipeline.getStatus().toString() : "running"));
+        execution.setStartedAt(LocalDateTime.now());
+        pipelineExecutionRepository.save(execution);
+
+        log.info("✅ Scan lancé — app: {} pipeline: {} (sans environnement éphémère)",
+                application.getId(), pipeline.getId());
+
+        return DeployResponse.builder()
+                .applicationId(application.getId())
+                .gitlabPipelineId(pipeline.getId())
+                .pipelineStatus(pipeline.getStatus() != null ? pipeline.getStatus().toString() : "running")
+                .pipelineWebUrl(pipeline.getWebUrl())
+                .message("Scan de sécurité déclenché. Tag DefectDojo : pipeline-" + pipeline.getId())
+                .build();
+    }
+
     @Transactional
     public void publishDeploymentPublicUrl(UUID environmentId, String publicUrl) {
         EphemeralEnvironment env = environmentRepository.findById(environmentId)

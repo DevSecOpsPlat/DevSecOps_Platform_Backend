@@ -207,13 +207,10 @@ public class FindingIngestionService {
         }
 
         // SonarCloud/SonarQube (issues/hotspots/QG) vers Findings
-        // projectKey du pipeline : EnviroTest_{ENVIRONMENT_ID} (UUID)
+        // Compatible scan sans environnement: clé basée repo+branche.
         try {
-            String envId = execution.getEnvironment() != null && execution.getEnvironment().getId() != null
-                    ? execution.getEnvironment().getId().toString()
-                    : null;
-            String projectKey = envId != null ? "EnviroTest_" + envId : null;
-            String branch = execution.getEnvironment() != null ? execution.getEnvironment().getGitBranch() : null;
+            String projectKey = deriveSonarProjectKey(execution);
+            String branch = execution.getGitBranch();
             int sonarCreated = ingestSonar(execution, projectKey, branch);
             createdFindings += sonarCreated;
         } catch (Exception e) {
@@ -224,7 +221,7 @@ public class FindingIngestionService {
         // on le marque FIXED au niveau de l’application (même branche).
         // Important: on ne peut pas comparer par envId car chaque test crée un env différent.
         try {
-            if (createdOccurrences > 0 && execution.getEnvironment() != null && execution.getEnvironment().getService() != null) {
+            if (createdOccurrences > 0 && execution.getAppService() != null) {
                 List<String> currentFingerprints = findingOccurrenceRepository.findDistinctFingerprintsByPipeline(pipelineId);
                 autoFixedFindings = autoFixFindingsForApplicationBranch(execution, currentFingerprints);
             }
@@ -376,13 +373,13 @@ public class FindingIngestionService {
 
     private int autoFixFindingsForApplicationBranch(PipelineExecution execution, List<String> currentFingerprints) {
         if (currentFingerprints == null || currentFingerprints.isEmpty()) return 0;
-        var env = execution.getEnvironment();
-        var app = env.getService();
-        if (env.getGitBranch() == null || env.getGitBranch().isBlank()) return 0;
+        var app = execution.getAppService();
+        var branch = execution.getGitBranch();
+        if (app == null || branch == null || branch.isBlank()) return 0;
 
         List<Finding> toFix = findingRepository.findOpenFindingsForAppBranchNotInFingerprints(
                 app.getId(),
-                env.getGitBranch(),
+                branch,
                 FindingStatus.OPEN,
                 currentFingerprints
         );
@@ -396,9 +393,24 @@ public class FindingIngestionService {
         }
         if (fixed > 0) {
             log.info("[FINDINGS][AUTO-FIX] appId={} branch={} fixed={} (pipelineId={})",
-                    app.getId(), env.getGitBranch(), fixed, execution.getGitlabPipelineId());
+                    app.getId(), branch, fixed, execution.getGitlabPipelineId());
         }
         return fixed;
+    }
+
+    private String deriveSonarProjectKey(PipelineExecution execution) {
+        if (execution == null || execution.getAppService() == null) {
+            return null;
+        }
+        String repoUrl = execution.getAppService().getGitRepositoryUrl();
+        if (repoUrl == null || repoUrl.isBlank()) {
+            return null;
+        }
+        return repoUrl
+                .replaceFirst("^https?://", "")
+                .replaceFirst("\\.git$", "")
+                .replace("/", "_")
+                .replaceAll("[^a-zA-Z0-9_]", "_");
     }
 
     private static byte[] readZipEntryBytes(ZipInputStream zis) throws Exception {

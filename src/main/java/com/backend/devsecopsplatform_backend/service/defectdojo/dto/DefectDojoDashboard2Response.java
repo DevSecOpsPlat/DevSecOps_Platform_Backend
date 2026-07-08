@@ -14,11 +14,14 @@ public class DefectDojoDashboard2Response {
     private boolean configured;
     private String message;
 
-    /** global | branch | environment */
+    /** global | branch | environment | pipeline */
     private String scope;
 
-    /** Tag DefectDojo {@code env-<uuid>} quand le filtre environnement est actif. */
+    /** Tag DefectDojo {@code env-<uuid>} (legacy) quand le filtre environnement est actif. */
     private String environmentTag;
+
+    /** Tag DefectDojo {@code pipeline-<gitlabId>} pour filtrer par exécution CI. */
+    private String pipelineTag;
 
     private String applicationName;
     private String productName;

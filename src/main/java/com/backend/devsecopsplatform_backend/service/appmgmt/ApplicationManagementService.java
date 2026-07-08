@@ -321,8 +321,13 @@ public class ApplicationManagementService {
 
     @Transactional
     public AppDeploymentResponse deploy(UUID appId) {
+        return deploy(appId, null);
+    }
+
+    @Transactional
+    public AppDeploymentResponse deploy(UUID appId, ManagedDeployRequest request) {
         ManagedApplication app = loadOwnedApp(appId);
-        AppDeployment deployment = deploymentService.deploy(app);
+        AppDeployment deployment = deploymentService.deploy(app, ManagedDeployOptions.from(request));
         return mapDeployment(deployment, app);
     }
 

@@ -1,5 +1,7 @@
 package com.backend.devsecopsplatform_backend.service.qualitygate.dto;
 
+import com.fasterxml.jackson.annotation.JsonAlias;
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -10,9 +12,26 @@ import java.util.UUID;
 @Data
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class SecurityGateIngestRequest {
+
+    @JsonProperty("application_id")
+    @JsonAlias("applicationId")
+    private String applicationIdRaw;
+
     @JsonProperty("environment_id")
-    private UUID environmentId;
+    @JsonAlias("environmentId")
+    private String environmentIdRaw;
+
+    @JsonProperty("pipeline_id")
+    @JsonAlias({"pipelineId", "gitlab_pipeline_id"})
     private String pipelineId;
+
+    /** {@code scan} ou {@code deploy} (job CI security-validation). */
+    private String kind;
+
+    @JsonProperty("deployment_id")
+    @JsonAlias("deploymentId")
+    private String deploymentIdRaw;
+
     private String recommendation;
     private Integer critical;
     private Integer high;
@@ -62,4 +81,34 @@ public class SecurityGateIngestRequest {
     private JsonNode summary;
     @JsonProperty("quality_gate")
     private JsonNode qualityGate;
+
+    @JsonIgnore
+    public UUID getApplicationId() {
+        return parseUuid(applicationIdRaw);
+    }
+
+    @JsonIgnore
+    public UUID getEnvironmentId() {
+        return parseUuid(environmentIdRaw);
+    }
+
+    @JsonIgnore
+    public UUID getDeploymentId() {
+        return parseUuid(deploymentIdRaw);
+    }
+
+    public boolean isDeployKind() {
+        return kind != null && kind.equalsIgnoreCase("deploy");
+    }
+
+    private static UUID parseUuid(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        try {
+            return UUID.fromString(raw.trim());
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+    }
 }

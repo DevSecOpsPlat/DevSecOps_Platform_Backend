@@ -58,6 +58,8 @@ public class AppK8sManifestService {
         boolean ingressEnabled;
         String ingressDomain;      // ex. local → <svc>-<ns>.local
         String imageTag;
+        /** Image complète fournie par le pipeline CI (remplace le template CI_REGISTRY_IMAGE). */
+        String resolvedServiceImage;
     }
 
     /**
@@ -334,7 +336,10 @@ public class AppK8sManifestService {
 
         Map<String, Object> container = new LinkedHashMap<>();
         container.put("name", name);
-        container.put("image", serviceImage(svc, opts.getImageTag()));
+        String image = opts.getResolvedServiceImage() != null && !opts.getResolvedServiceImage().isBlank()
+                ? opts.getResolvedServiceImage().trim()
+                : serviceImage(svc, opts.getImageTag());
+        container.put("image", image);
         container.put("imagePullPolicy", "Always");
         container.put("ports", List.of(containerPort(port)));
         if (!env.isEmpty()) {

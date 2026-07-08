@@ -3,9 +3,12 @@ package com.backend.devsecopsplatform_backend.service.qualitygate;
 import com.backend.devsecopsplatform_backend.entity.AppService;
 import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
 import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
+import com.backend.devsecopsplatform_backend.entity.PipelineExecutionKind;
 import com.backend.devsecopsplatform_backend.entity.PipelineStatus;
 import com.backend.devsecopsplatform_backend.entity.QualityGateSnapshot;
 import com.backend.devsecopsplatform_backend.entity.User;
+import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDeployment;
+import com.backend.devsecopsplatform_backend.repository.AppDeploymentRepository;
 import com.backend.devsecopsplatform_backend.repository.AppServiceRepository;
 import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
 import com.backend.devsecopsplatform_backend.repository.FindingOccurrenceRepository;
@@ -35,6 +38,7 @@ import org.springframework.security.authentication.UsernamePasswordAuthenticatio
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.event.TransactionPhase;
 import org.springframework.transaction.event.TransactionalEventListener;
@@ -79,6 +83,7 @@ public class QualityGateService {
     public static final String SNAPSHOT_SOURCE_MANUAL = "MANUAL";
 
     private final PipelineExecutionRepository pipelineExecutionRepository;
+    private final AppDeploymentRepository appDeploymentRepository;
     private final FindingOccurrenceRepository findingOccurrenceRepository;
     private final EphemeralEnvironmentRepository environmentRepository;
     private final AppServiceRepository applicationRepository;
@@ -92,17 +97,10 @@ public class QualityGateService {
 
     @Transactional
     public void ingestFromPipeline(SecurityGateIngestRequest request) {
-        if (request.getEnvironmentId() == null) {
-            throw new IllegalArgumentException("environment_id requis");
-        }
-        EphemeralEnvironment env = environmentRepository.findById(request.getEnvironmentId())
-                .orElseThrow(() -> new IllegalArgumentException("Environnement introuvable"));
-
-        PipelineExecution execution = pipelineExecutionRepository
-                .findFirstByEnvironmentOrderByCreatedAtDesc(env)
-                .orElse(null);
+        PipelineExecution execution = resolveExecutionForIngest(request);
         if (execution == null) {
-            log.warn("Aucune exécution pipeline pour env {}", request.getEnvironmentId());
+            log.warn("Aucune exécution pipeline pour ingest (app={}, env={}, pipeline={})",
+                    request.getApplicationId(), request.getEnvironmentId(), request.getPipelineId());
             return;
         }
 
@@ -173,8 +171,237 @@ public class QualityGateService {
 
         execution.setQualityGateJson(gate);
         pipelineExecutionRepository.save(execution);
-        log.info("Quality gate enregistré pour env {} pipeline {} (summary={})",
-                request.getEnvironmentId(), request.getPipelineId(), !summaryPayload.isEmpty());
+        log.info("Quality gate enregistré pour exec {} pipeline {} (app={}, env={}, summary={})",
+                execution.getId(), request.getPipelineId(), request.getApplicationId(),
+                request.getEnvironmentId(), !summaryPayload.isEmpty());
+    }
+
+    /**
+     * Garantit une ligne {@code pipeline_executions} pour un scan CI (transaction isolée).
+     * Appelé avant l'ingest quality gate pour que la ligne survive même si l'ingest échoue.
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public PipelineExecution ensureScanPipelineExecution(
+            UUID applicationId,
+            long gitlabPipelineId,
+            SecurityGateIngestRequest request
+    ) {
+        if (applicationId == null) {
+            return pipelineExecutionRepository.findByGitlabPipelineId(gitlabPipelineId).orElse(null);
+        }
+        Optional<PipelineExecution> existing = pipelineExecutionRepository
+                .findByGitlabPipelineIdAndApplicationId(gitlabPipelineId, applicationId);
+        if (existing.isPresent()) {
+            return existing.get();
+        }
+        return createScanExecutionIfMissing(applicationId, gitlabPipelineId, request);
+    }
+
+    /**
+     * Garantit une ligne {@code pipeline_executions} pour un déploiement CI (transaction isolée).
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public PipelineExecution ensureDeployPipelineExecution(
+            UUID applicationId,
+            long gitlabPipelineId,
+            SecurityGateIngestRequest request
+    ) {
+        if (applicationId != null) {
+            Optional<PipelineExecution> existing = pipelineExecutionRepository
+                    .findByGitlabPipelineIdAndApplicationId(gitlabPipelineId, applicationId);
+            if (existing.isPresent()) {
+                return existing.get();
+            }
+        }
+        Optional<PipelineExecution> byPipeline = pipelineExecutionRepository.findByGitlabPipelineId(gitlabPipelineId);
+        if (byPipeline.isPresent()) {
+            return byPipeline.get();
+        }
+        UUID deploymentId = request.getDeploymentId();
+        if (deploymentId == null && request.getEnvironmentId() != null
+                && environmentRepository.findById(request.getEnvironmentId()).isEmpty()) {
+            deploymentId = request.getEnvironmentId();
+        }
+        if (deploymentId != null) {
+            PipelineExecution fromDeployment = resolveExecutionFromDeployment(deploymentId, gitlabPipelineId, request);
+            if (fromDeployment != null) {
+                return fromDeployment;
+            }
+        }
+        if (applicationId != null) {
+            return createDeployExecutionIfMissing(applicationId, gitlabPipelineId, request);
+        }
+        return null;
+    }
+
+    /**
+     * Snapshot dashboard (Sonar + DefectDojo) après ingest CI — transaction isolée.
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void captureSnapshotAfterCiIngest(Long gitlabPipelineId, UUID applicationId) {
+        if (gitlabPipelineId == null || gitlabPipelineId <= 0) {
+            return;
+        }
+        Optional<PipelineExecution> execution = applicationId != null
+                ? pipelineExecutionRepository.findByGitlabPipelineIdAndApplicationId(gitlabPipelineId, applicationId)
+                : pipelineExecutionRepository.findByGitlabPipelineId(gitlabPipelineId);
+        execution.ifPresentOrElse(
+                pe -> captureSnapshotAfterPipeline(pe, SNAPSHOT_SOURCE_CI_INGEST, true),
+                () -> log.warn("Snapshot CI ignoré : pipeline GitLab #{} introuvable en base", gitlabPipelineId));
+    }
+
+    private PipelineExecution resolveExecutionForIngest(SecurityGateIngestRequest request) {
+        String pipelineIdStr = request.getPipelineId();
+        if ((pipelineIdStr == null || pipelineIdStr.isBlank())
+                && request.getSummary() != null && !request.getSummary().isNull()) {
+            var pidNode = request.getSummary().get("pipeline_id");
+            if (pidNode != null && !pidNode.isNull()) {
+                pipelineIdStr = pidNode.asText();
+            }
+        }
+        if (pipelineIdStr != null && !pipelineIdStr.isBlank()) {
+            try {
+                long gitlabId = Long.parseLong(pipelineIdStr.trim());
+                if (request.getApplicationId() != null) {
+                    Optional<PipelineExecution> byApp = pipelineExecutionRepository
+                            .findByGitlabPipelineIdAndApplicationId(gitlabId, request.getApplicationId());
+                    if (byApp.isPresent()) {
+                        return byApp.get();
+                    }
+                }
+                Optional<PipelineExecution> byPipeline = pipelineExecutionRepository.findByGitlabPipelineId(gitlabId);
+                if (byPipeline.isPresent()) {
+                    return byPipeline.get();
+                }
+                if (request.getApplicationId() != null) {
+                    PipelineExecution created = request.isDeployKind()
+                            ? createDeployExecutionIfMissing(request.getApplicationId(), gitlabId, request)
+                            : createScanExecutionIfMissing(request.getApplicationId(), gitlabId, request);
+                    if (created != null) {
+                        return created;
+                    }
+                }
+                if (request.getDeploymentId() != null) {
+                    PipelineExecution fromDeployment = resolveExecutionFromDeployment(
+                            request.getDeploymentId(), gitlabId, request);
+                    if (fromDeployment != null) {
+                        return fromDeployment;
+                    }
+                }
+                throw new IllegalArgumentException(
+                        "Pipeline GitLab #" + gitlabId + " introuvable en base"
+                                + (request.getApplicationId() != null
+                                ? " pour l'application " + request.getApplicationId() : ""));
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException("pipeline_id invalide");
+            }
+        }
+        if (request.getEnvironmentId() != null) {
+            Optional<EphemeralEnvironment> envOpt = environmentRepository.findById(request.getEnvironmentId());
+            if (envOpt.isPresent()) {
+                return pipelineExecutionRepository
+                        .findFirstByEnvironmentOrderByCreatedAtDesc(envOpt.get())
+                        .orElse(null);
+            }
+            PipelineExecution fromDeployment = resolveExecutionFromDeployment(
+                    request.getEnvironmentId(), null, request);
+            if (fromDeployment != null) {
+                return fromDeployment;
+            }
+            throw new IllegalArgumentException("Environnement ou déploiement introuvable");
+        }
+        if (request.getApplicationId() != null) {
+            throw new IllegalArgumentException("pipeline_id requis pour un scan sans environnement");
+        }
+        throw new IllegalArgumentException("application_id + pipeline_id ou environment_id requis");
+    }
+
+    /**
+     * Crée une ligne pipeline_executions si le scan a été lancé sans passer par le webhook
+     * (job CI security-validation = source de vérité, pas le webhook GitLab).
+     */
+    private PipelineExecution createScanExecutionIfMissing(
+            UUID applicationId,
+            long gitlabPipelineId,
+            SecurityGateIngestRequest request
+    ) {
+        return applicationRepository.findById(applicationId).map(app -> {
+            String branch = resolveBranchFromRequest(request);
+            PipelineExecution execution = new PipelineExecution();
+            execution.setAppService(app);
+            execution.setGitlabPipelineId(gitlabPipelineId);
+            execution.setExecutionKind(PipelineExecutionKind.SCAN);
+            execution.setGitBranch(branch);
+            execution.setStatus(PipelineStatus.SUCCESS);
+            execution.setStartedAt(java.time.LocalDateTime.now());
+            execution.setFinishedAt(java.time.LocalDateTime.now());
+            PipelineExecution saved = pipelineExecutionRepository.save(execution);
+            log.info("PipelineExecution créé depuis security-gate (sans webhook) app={} gitlab=#{}",
+                    applicationId, gitlabPipelineId);
+            return saved;
+        }).orElseGet(() -> {
+            log.warn("PipelineExecution non créé : application {} introuvable en base", applicationId);
+            return null;
+        });
+    }
+
+    private PipelineExecution resolveExecutionFromDeployment(
+            UUID deploymentId,
+            Long gitlabPipelineId,
+            SecurityGateIngestRequest request
+    ) {
+        return appDeploymentRepository.findById(deploymentId).map(deployment -> {
+            long pipelineRef = gitlabPipelineId != null && gitlabPipelineId > 0
+                    ? gitlabPipelineId
+                    : (deployment.getGitlabPipelineId() != null ? deployment.getGitlabPipelineId() : 0L);
+            if (pipelineRef > 0) {
+                Optional<PipelineExecution> existing = pipelineExecutionRepository.findByGitlabPipelineId(pipelineRef);
+                if (existing.isPresent()) {
+                    return existing.get();
+                }
+            }
+            AppService service = deployment.getApplication().getServices().stream().findFirst().orElse(null);
+            if (service != null && pipelineRef > 0) {
+                return createDeployExecutionIfMissing(service.getId(), pipelineRef, request);
+            }
+            log.warn("Déploiement {} sans service ou pipeline GitLab pour pipeline_executions", deploymentId);
+            return null;
+        }).orElse(null);
+    }
+
+    private PipelineExecution createDeployExecutionIfMissing(
+            UUID applicationId,
+            long gitlabPipelineId,
+            SecurityGateIngestRequest request
+    ) {
+        return applicationRepository.findById(applicationId).map(app -> {
+            String branch = resolveBranchFromRequest(request);
+            PipelineExecution execution = new PipelineExecution();
+            execution.setAppService(app);
+            execution.setGitlabPipelineId(gitlabPipelineId);
+            execution.setExecutionKind(PipelineExecutionKind.DEPLOY);
+            execution.setGitBranch(branch);
+            execution.setStatus(PipelineStatus.SUCCESS);
+            execution.setStartedAt(java.time.LocalDateTime.now());
+            execution.setFinishedAt(java.time.LocalDateTime.now());
+            PipelineExecution saved = pipelineExecutionRepository.save(execution);
+            log.info("PipelineExecution DEPLOY créé depuis security-gate app={} gitlab=#{}",
+                    applicationId, gitlabPipelineId);
+            return saved;
+        }).orElseGet(() -> {
+            log.warn("PipelineExecution DEPLOY non créé : application {} introuvable", applicationId);
+            return null;
+        });
+    }
+
+    private String resolveBranchFromRequest(SecurityGateIngestRequest request) {
+        if (request.getSummary() != null && request.getSummary().hasNonNull("git_branch")) {
+            String fromSummary = request.getSummary().get("git_branch").asText(null);
+            if (fromSummary != null && !fromSummary.isBlank()) {
+                return fromSummary.trim();
+            }
+        }
+        return "main";
     }
 
     @Transactional
@@ -230,26 +457,30 @@ public class QualityGateService {
      */
     @Transactional
     public QualityGateResultDto captureSnapshotFromPipeline(UUID environmentId) {
-        PipelineExecution execution = pipelineExecutionRepository
-                .findByEnvironmentIdWithDetails(environmentId)
-                .orElseThrow(() -> new IllegalArgumentException("Pipeline introuvable"));
-        AppService app = execution.getEnvironment().getService();
+        PipelineExecution execution = environmentId != null
+                ? pipelineExecutionRepository.findByEnvironmentIdWithDetails(environmentId)
+                        .orElseThrow(() -> new IllegalArgumentException("Pipeline introuvable"))
+                : null;
+        if (execution == null) {
+            throw new IllegalArgumentException("environment_id requis");
+        }
+        AppService app = execution.getEnvironment() != null
+                ? execution.getEnvironment().getService()
+                : execution.getAppService();
         if (app == null) {
             throw new IllegalArgumentException("Application manquante");
         }
 
+        String branch = execution.getEnvironment() != null
+                ? execution.getEnvironment().getGitBranch()
+                : execution.getGitBranch();
         String username = resolveSnapshotUsername(app, execution);
         try {
             if (username != null) {
                 SecurityContextHolder.getContext().setAuthentication(
                         new UsernamePasswordAuthenticationToken(username, null, List.of()));
             }
-            buildAndPersistSnapshot(
-                    app,
-                    execution.getEnvironment().getGitBranch(),
-                    execution,
-                    true,
-                    SNAPSHOT_SOURCE_PIPELINE_SYNC);
+            buildAndPersistSnapshot(app, branch, execution, true, SNAPSHOT_SOURCE_PIPELINE_SYNC);
 
             QualityGateSnapshot saved = qualityGateSnapshotRepository
                     .findByPipelineExecutionId(execution.getId())
@@ -342,6 +573,22 @@ public class QualityGateService {
                 log.warn("Backfill snapshot échoué pour exec {}: {}", pe.getId(), e.getMessage());
             }
         }
+        List<PipelineExecution> scanExecutions = pipelineExecutionRepository
+                .findByApplicationIdAndBranchOrderByCreatedAtDesc(applicationId, null, PageRequest.of(0, 100));
+        for (PipelineExecution pe : scanExecutions) {
+            if (pe.getEnvironment() != null || pe.getStatus() == null || !pe.getStatus().isFinished()) {
+                continue;
+            }
+            if (qualityGateSnapshotRepository.findByPipelineExecutionId(pe.getId()).isPresent()) {
+                continue;
+            }
+            try {
+                captureSnapshotAfterPipeline(pe, SNAPSHOT_SOURCE_MANUAL, false);
+                created++;
+            } catch (Exception e) {
+                log.warn("Backfill snapshot scan échoué pour exec {}: {}", pe.getId(), e.getMessage());
+            }
+        }
         return created;
     }
 
@@ -353,21 +600,19 @@ public class QualityGateService {
             return;
         }
         PipelineExecution loaded = pipelineExecutionRepository
-                .findByIdWithEnvironmentAndService(execution.getId())
+                .findByIdWithDetailsForSnapshot(execution.getId())
                 .orElse(execution);
-        if (loaded.getEnvironment() == null || loaded.getEnvironment().getService() == null) {
-            log.debug("Snapshot QG ignoré : environnement ou application manquant pour exec {}", loaded.getId());
+        AppService app = loaded.getAppService();
+        if (app == null) {
+            log.debug("Snapshot QG ignoré : application manquante pour exec {}", loaded.getId());
             return;
         }
+        String branch = loaded.getGitBranch() != null ? loaded.getGitBranch() : "main";
         try {
-            buildAndPersistSnapshot(
-                    loaded.getEnvironment().getService(),
-                    loaded.getEnvironment().getGitBranch(),
-                    loaded,
-                    false,
-                    source);
+            buildAndPersistSnapshot(app, branch, loaded, false, source);
             log.info("Snapshot QG enregistré (table={}, force={}) pipeline exec {} env {}",
-                    source, forceUpdate, loaded.getId(), loaded.getEnvironment().getId());
+                    source, forceUpdate, loaded.getId(),
+                    loaded.getEnvironment() != null ? loaded.getEnvironment().getId() : null);
         } catch (Exception e) {
             log.warn("Snapshot QG pipeline non enregistré pour exec {}: {}", loaded.getId(), e.getMessage());
         }
@@ -375,12 +620,12 @@ public class QualityGateService {
 
     @Transactional(readOnly = true)
     public QualityGateResultDto getForApplication(UUID applicationId, String branch) {
-        return getForApplication(applicationId, branch, null);
+        return getForApplication(applicationId, branch, null, null, false, null);
     }
 
     @Transactional(readOnly = true)
     public QualityGateResultDto getForApplication(UUID applicationId, String branch, UUID environmentId) {
-        return getForApplication(applicationId, branch, environmentId, false);
+        return getForApplication(applicationId, branch, environmentId, null, false, null);
     }
 
     @Transactional(readOnly = true)
@@ -390,7 +635,7 @@ public class QualityGateService {
             UUID environmentId,
             boolean refresh
     ) {
-        return getForApplication(applicationId, branch, environmentId, refresh, null);
+        return getForApplication(applicationId, branch, environmentId, null, refresh, null);
     }
 
     @Transactional(readOnly = true)
@@ -398,6 +643,7 @@ public class QualityGateService {
             UUID applicationId,
             String branch,
             UUID environmentId,
+            Long pipelineId,
             boolean refresh,
             UUID snapshotId
     ) {
@@ -412,7 +658,23 @@ public class QualityGateService {
         String effectiveBranch = normalizeBranch(branch);
         PipelineExecution execution;
 
-        if (environmentId != null) {
+        if (pipelineId != null && pipelineId > 0) {
+            execution = pipelineExecutionRepository
+                    .findByGitlabPipelineIdAndApplicationId(pipelineId, applicationId)
+                    .orElseThrow(() -> new IllegalArgumentException("Pipeline introuvable pour cette application"));
+            effectiveBranch = execution.getGitBranch() != null ? execution.getGitBranch() : effectiveBranch;
+            if (!refresh) {
+                QualityGateResultDto stored = loadSnapshotForPipelineExecution(execution);
+                if (stored != null) {
+                    UUID envId = execution.getEnvironment() != null ? execution.getEnvironment().getId() : null;
+                    finalizeDefectDojoPresentation(stored, app, effectiveBranch, envId, execution);
+                    return stored;
+                }
+                return buildMissingSnapshotResult(app, effectiveBranch,
+                        execution.getEnvironment() != null ? execution.getEnvironment().getId() : null,
+                        execution);
+            }
+        } else if (environmentId != null) {
             environmentRepository.findByIdAndService_Id(environmentId, applicationId)
                     .orElseThrow(() -> new IllegalArgumentException("Environnement introuvable pour cette application"));
             execution = pipelineExecutionRepository
@@ -445,15 +707,26 @@ public class QualityGateService {
         }
 
         // refresh=true uniquement : reconstruction live (DefectDojo + SonarQube), sans écriture BDD
-        if (environmentId != null) {
+        if (pipelineId != null && pipelineId > 0) {
+            execution = pipelineExecutionRepository
+                    .findByGitlabPipelineIdAndApplicationId(pipelineId, applicationId)
+                    .orElse(execution);
+        } else if (environmentId != null) {
             execution = pipelineExecutionRepository
                     .findByEnvironmentIdAndApplicationId(environmentId, applicationId)
                     .orElse(execution);
         }
         UUID effectiveEnvironmentId = environmentId;
+        if (effectiveEnvironmentId == null && execution != null && execution.getEnvironment() != null) {
+            effectiveEnvironmentId = execution.getEnvironment().getId();
+        }
+        Long effectivePipelineId = pipelineId != null && pipelineId > 0
+                ? pipelineId
+                : (execution != null ? execution.getGitlabPipelineId() : null);
         DefectDojoDashboard2Response dd = null;
         try {
-            dd = defectDojoService.getDashboard2(applicationId, effectiveBranch, effectiveEnvironmentId);
+            dd = defectDojoService.getDashboard2(
+                    applicationId, effectiveBranch, effectiveEnvironmentId, effectivePipelineId, false);
         } catch (Exception e) {
             log.warn("DefectDojo indisponible pour quality gate: {}", e.getMessage());
         }
@@ -548,11 +821,13 @@ public class QualityGateService {
         if (dto == null) {
             throw new IllegalArgumentException("Snapshot illisible");
         }
-        PipelineExecution execution = row.getEnvironmentId() != null
-                ? pipelineExecutionRepository
-                        .findByEnvironmentIdAndApplicationId(row.getEnvironmentId(), applicationId)
-                        .orElse(null)
-                : null;
+        PipelineExecution execution = row.getPipelineExecutionId() != null
+                ? pipelineExecutionRepository.findById(row.getPipelineExecutionId()).orElse(null)
+                : (row.getEnvironmentId() != null
+                        ? pipelineExecutionRepository
+                                .findByEnvironmentIdAndApplicationId(row.getEnvironmentId(), applicationId)
+                                .orElse(null)
+                        : null);
         if (execution != null) {
             enrichWithPipelineRuntimeState(dto, execution);
         }
@@ -562,15 +837,22 @@ public class QualityGateService {
 
     @Transactional(readOnly = true)
     public List<QualityGateEnvironmentOptionDto> listEnvironments(UUID applicationId, String branch) {
+        return listEnvironments(applicationId, branch, false);
+    }
+
+    @Transactional(readOnly = true)
+    public List<QualityGateEnvironmentOptionDto> listEnvironments(UUID applicationId, String branch, boolean scanOnly) {
         User user = currentUser();
         applicationRepository.findByIdAndCreatedBy(applicationId, user)
                 .orElseThrow(() -> new IllegalArgumentException("Application introuvable ou accès refusé"));
 
         String effectiveBranch = normalizeBranch(branch);
+        List<QualityGateEnvironmentOptionDto> options = new ArrayList<>();
+
+        if (!scanOnly) {
         List<EphemeralEnvironment> envs = environmentRepository.findByServiceWithPipeline(
                 applicationId, effectiveBranch);
 
-        List<QualityGateEnvironmentOptionDto> options = new ArrayList<>();
         for (EphemeralEnvironment env : envs) {
             PipelineExecution pe = env.getPipelineExecution();
             Map<String, Object> gate = pe != null ? pe.getQualityGateJson() : null;
@@ -604,7 +886,57 @@ public class QualityGateService {
                     .hasSnapshot(hasSnapshot)
                     .build());
         }
+        }
+
+        List<PipelineExecution> scanExecutions = scanOnly
+                ? pipelineExecutionRepository.findByApplicationIdAndBranchAndExecutionKindOrderByCreatedAtDesc(
+                        applicationId, effectiveBranch, PipelineExecutionKind.SCAN, PageRequest.of(0, 50))
+                : pipelineExecutionRepository.findByApplicationIdAndBranchOrderByCreatedAtDesc(
+                        applicationId, effectiveBranch, PageRequest.of(0, 50));
+        for (PipelineExecution pe : scanExecutions) {
+            if (!scanOnly && pe.getEnvironment() != null) {
+                continue;
+            }
+            Map<String, Object> gate = pe.getQualityGateJson();
+            Optional<QualityGateSnapshot> tableSnap = qualityGateSnapshotRepository
+                    .findByPipelineExecutionId(pe.getId());
+            if (tableSnap.isEmpty() && pe.getGitlabPipelineId() != null) {
+                tableSnap = qualityGateSnapshotRepository.findByGitlabPipelineId(pe.getGitlabPipelineId());
+            }
+            Instant evaluatedAt = tableSnap.map(QualityGateSnapshot::getEvaluatedAt).orElse(null);
+            if (evaluatedAt == null) {
+                evaluatedAt = parseInstant(gate != null ? gate.get("evaluatedAt") : null);
+            }
+            Instant snapshotSavedAt = tableSnap.map(QualityGateSnapshot::getCreatedAt).orElse(null);
+            if (snapshotSavedAt == null) {
+                snapshotSavedAt = parseInstant(gate != null ? gate.get("snapshotSavedAt") : null);
+            }
+            boolean hasSnapshot = tableSnap.isPresent()
+                    || (gate != null && gate.get("displaySnapshot") != null);
+            String pipelineLabel = pe.getGitlabPipelineId() != null
+                    ? String.valueOf(pe.getGitlabPipelineId()) : "—";
+            options.add(QualityGateEnvironmentOptionDto.builder()
+                    .environmentId(null)
+                    .environmentName("Scan #" + pipelineLabel)
+                    .branch(pe.getGitBranch())
+                    .status(pe.getStatus() != null ? pe.getStatus().name() : null)
+                    .pipelineId(pipelineLabel)
+                    .pipelineStatus(pe.getStatus() != null ? pe.getStatus().name() : null)
+                    .evaluatedAt(evaluatedAt)
+                    .snapshotSavedAt(snapshotSavedAt)
+                    .snapshotId(tableSnap.map(QualityGateSnapshot::getId).orElse(null))
+                    .snapshotSource(tableSnap.map(QualityGateSnapshot::getSource).orElse(null))
+                    .verdict(tableSnap.map(s -> extractVerdictFromPayload(s.getPayload())).orElse(null))
+                    .hasSnapshot(hasSnapshot)
+                    .build());
+        }
         return options;
+    }
+
+    /** Pipelines scan uniquement (pas d'environnement éphémère) — du plus récent au plus ancien. */
+    @Transactional(readOnly = true)
+    public List<QualityGateEnvironmentOptionDto> listScanPipelines(UUID applicationId, String branch) {
+        return listEnvironments(applicationId, branch, true);
     }
 
     private void buildAndPersistSnapshot(
@@ -614,15 +946,50 @@ public class QualityGateService {
             boolean appendHistory,
             String source
     ) {
-        if (execution == null || execution.getEnvironment() == null) {
-            throw new IllegalStateException("Pipeline execution ou environnement manquant pour snapshot");
+        if (execution == null) {
+            throw new IllegalStateException("Pipeline execution manquant pour snapshot");
         }
-        UUID environmentId = execution.getEnvironment().getId();
-        DefectDojoDashboard2Response dd = fetchDefectDojoForSnapshot(app, execution, branch, environmentId);
-        Map<String, Object> sonar = fetchSonarForQualityGate(app, branch, execution);
-        QualityGateResultDto result = buildResult(app, branch, execution, dd, sonar, environmentId);
+        AppService resolvedApp = app != null ? app : execution.getAppService();
+        if (resolvedApp == null) {
+            throw new IllegalStateException("Application manquante pour snapshot");
+        }
+        String resolvedBranch = branch != null && !branch.isBlank()
+                ? branch
+                : (execution.getGitBranch() != null ? execution.getGitBranch() : "main");
+        UUID environmentId = execution.getEnvironment() != null
+                ? execution.getEnvironment().getId()
+                : null;
+        DefectDojoDashboard2Response dd = fetchDefectDojoForSnapshot(
+                resolvedApp, execution, resolvedBranch, environmentId);
+        Map<String, Object> sonar = fetchSonarForQualityGate(resolvedApp, resolvedBranch, execution);
+        QualityGateResultDto result = buildResult(
+                resolvedApp, resolvedBranch, execution, dd, sonar, environmentId);
         persistDisplaySnapshot(execution, result, appendHistory);
-        saveSnapshotTable(app.getId(), execution.getEnvironment().getId(), execution, branch, source, result);
+        saveSnapshotTable(resolvedApp.getId(), environmentId, execution, resolvedBranch, source, result);
+    }
+
+    private QualityGateResultDto loadSnapshotForPipelineExecution(PipelineExecution execution) {
+        if (execution == null || execution.getId() == null) {
+            return null;
+        }
+        Optional<QualityGateSnapshot> fromTable = qualityGateSnapshotRepository
+                .findByPipelineExecutionId(execution.getId());
+        if (fromTable.isEmpty() && execution.getGitlabPipelineId() != null) {
+            fromTable = qualityGateSnapshotRepository.findByGitlabPipelineId(execution.getGitlabPipelineId());
+        }
+        if (fromTable.isPresent()) {
+            QualityGateResultDto dto = fromSnapshotEntity(fromTable.get());
+            enrichWithPipelineRuntimeState(dto, execution);
+            return dto;
+        }
+        QualityGateResultDto fromJson = loadStoredDisplaySnapshot(execution);
+        if (fromJson != null) {
+            fromJson.setFromSnapshot(true);
+            fromJson.setSnapshotRecordSource("PIPELINE_JSON");
+            enrichWithPipelineRuntimeState(fromJson, execution);
+            return fromJson;
+        }
+        return null;
     }
 
     private QualityGateResultDto loadSnapshotForEnvironment(UUID environmentId, PipelineExecution execution) {
@@ -1353,7 +1720,8 @@ public class QualityGateService {
     ) {
         return runWithSnapshotAuth(app, execution, () -> {
             try {
-                return defectDojoService.getDashboard2(app.getId(), branch, environmentId);
+                Long pipelineId = execution != null ? execution.getGitlabPipelineId() : null;
+                return defectDojoService.getDashboard2(app.getId(), branch, environmentId, pipelineId, false);
             } catch (Exception e) {
                 log.warn("DefectDojo indisponible pour snapshot (env {}): {}", environmentId, e.getMessage());
                 return null;
@@ -1407,7 +1775,7 @@ public class QualityGateService {
 
     @Transactional(readOnly = true)
     public String generateAiInsight(UUID applicationId, String branch, UUID environmentId) {
-        QualityGateResultDto result = getForApplication(applicationId, branch, environmentId, false, null);
+        QualityGateResultDto result = getForApplication(applicationId, branch, environmentId, null, false, null);
         try {
             String json = objectMapper.writeValueAsString(buildAiInsightContext(result));
             return aiAnalysisService.generateQualityGateInsight(json);
@@ -1855,7 +2223,8 @@ public class QualityGateService {
     ) {
         DefectDojoDashboard2Response dd = null;
         try {
-            dd = defectDojoService.getDashboard2(app.getId(), branch, environmentId);
+            Long pipelineId = execution != null ? execution.getGitlabPipelineId() : null;
+            dd = defectDojoService.getDashboard2(app.getId(), branch, environmentId, pipelineId, false);
         } catch (Exception e) {
             log.debug("DefectDojo live indisponible — fallback snapshot: {}", e.getMessage());
             return;
@@ -2178,7 +2547,9 @@ public class QualityGateService {
                 ? String.valueOf(execution.getGitlabPipelineId()) : null;
         String pipelineStatus = execution != null && execution.getStatus() != null
                 ? execution.getStatus().name() : null;
-        String tag = DefectDojoService.environmentTag(environmentId);
+        String tag = execution != null && execution.getGitlabPipelineId() != null
+                ? DefectDojoService.pipelineTag(execution.getGitlabPipelineId())
+                : DefectDojoService.environmentTag(environmentId);
         boolean running = execution != null && execution.getStatus() != null && !execution.getStatus().isFinished();
         int jobCount = countJobsInStagesJson(execution);
         String summary;

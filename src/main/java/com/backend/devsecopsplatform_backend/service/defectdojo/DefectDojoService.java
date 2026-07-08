@@ -138,9 +138,9 @@ public class DefectDojoService {
 
         int engagementId = engagement.path("id").asInt();
         String trimmedTags = tags != null ? tags.trim() : null;
-        boolean envTag = isEnvironmentTag(trimmedTags);
+        boolean testScopedTag = isTestScopedTag(trimmedTags);
 
-        Map<String, Integer> bySeverity = envTag
+        Map<String, Integer> bySeverity = testScopedTag
                 ? parallelCountBySeverityForTaggedTests(engagementId, trimmedTags)
                 : countBySeverityParallel(engagementId, tags);
         Map<String, Integer> byStatus = countByStatus(engagementId, tags);
@@ -277,24 +277,54 @@ public class DefectDojoService {
     }
 
     private static boolean isEnvironmentTag(String tags) {
-        return tags != null && !tags.isBlank() && tags.trim().startsWith("env-");
+        return isTestScopedTag(tags);
     }
+
+    private static boolean isTestScopedTag(String tags) {
+        if (tags == null || tags.isBlank()) {
+            return false;
+        }
+        String t = tags.trim();
+        return t.startsWith("env-") || t.startsWith("pipeline-") || SCAN_KIND_TAG.equals(t) || DEPLOY_KIND_TAG.equals(t);
+    }
+
+    public static final String SCAN_KIND_TAG = "scan";
+    public static final String DEPLOY_KIND_TAG = "deploy";
 
     /**
      * Dashboard sécurité v2 : vue globale (produit) par défaut, ou filtrée par branche/engagement.
      * Ne dépend pas d'un pipeline en cours — données DefectDojo immédiates (0 si absent).
      */
     public DefectDojoDashboard2Response getDashboard2(UUID applicationId, String branch) {
-        return getDashboard2(applicationId, branch, null);
+        return getDashboard2(applicationId, branch, null, null, true);
     }
 
     /**
      * Dashboard v2 filtré par branche et optionnellement par environnement éphémère
-     * (tag DefectDojo {@code env-<uuid>} — aligné import CI {@code tags=env-${ENVIRONMENT_ID}}).
+     * (tag {@code env-<uuid>}, legacy) ou par pipeline GitLab ({@code pipeline-<id>}).
      */
     public DefectDojoDashboard2Response getDashboard2(UUID applicationId, String branch, UUID environmentId) {
+        return getDashboard2(applicationId, branch, environmentId, null, true);
+    }
+
+    public DefectDojoDashboard2Response getDashboard2(
+            UUID applicationId,
+            String branch,
+            UUID environmentId,
+            Long pipelineId
+    ) {
+        return getDashboard2(applicationId, branch, environmentId, pipelineId, true);
+    }
+
+    public DefectDojoDashboard2Response getDashboard2(
+            UUID applicationId,
+            String branch,
+            UUID environmentId,
+            Long pipelineId,
+            boolean scanOnly
+    ) {
         User user = currentUser();
-        String envTag = environmentId != null ? environmentTag(environmentId) : null;
+        String filterTag = resolveDashboardFilterTag(environmentId, pipelineId, scanOnly);
         AppService app = applicationRepository.findByIdAndCreatedBy(applicationId, user)
                 .orElseThrow(() -> new IllegalArgumentException("Application introuvable ou accès refusé"));
 
@@ -381,11 +411,11 @@ public class DefectDojoService {
         int closed = 0;
 
         Map<String, Integer> byStatus;
-        if (envTag != null) {
-            bySeverity = parallelCountBySeverityForTaggedTests(engagementId, envTag);
-            byTool = aggregateToolsFromEngagementWithTag(engagementId, envTag);
+        if (filterTag != null) {
+            bySeverity = parallelCountBySeverityForTaggedTests(engagementId, filterTag);
+            byTool = aggregateToolsFromEngagementWithTag(engagementId, filterTag);
             open = bySeverity.values().stream().mapToInt(Integer::intValue).sum();
-            openSample = fetchOpenFindingsSampleForTaggedTests(productId, engagementId, envTag, 200);
+            openSample = fetchOpenFindingsSampleForTaggedTests(productId, engagementId, filterTag, 200);
             if (byTool.isEmpty() && !openSample.isEmpty()) {
                 byTool = aggregateToolsFromFindings(openSample);
             }
@@ -406,8 +436,9 @@ public class DefectDojoService {
 
         return DefectDojoDashboard2Response.builder()
                 .configured(true)
-                .scope(envTag != null ? "environment" : "branch")
-                .environmentTag(envTag)
+                .scope(resolveDashboard2Scope(filterTag, pipelineId, environmentId))
+                .environmentTag(environmentId != null ? environmentTag(environmentId) : null)
+                .pipelineTag(pipelineId != null ? pipelineTag(pipelineId) : null)
                 .applicationName(app.getName())
                 .productName(productName)
                 .productId(productId)
@@ -822,6 +853,39 @@ public class DefectDojoService {
 
     public static String environmentTag(UUID environmentId) {
         return "env-" + environmentId;
+    }
+
+    public static String pipelineTag(Long pipelineId) {
+        return pipelineId != null ? "pipeline-" + pipelineId : null;
+    }
+
+    private static String resolveDashboard2Scope(String filterTag, Long pipelineId, UUID environmentId) {
+        if (filterTag == null) {
+            return "branch";
+        }
+        if (pipelineId != null) {
+            return "pipeline";
+        }
+        if (environmentId != null) {
+            return "environment";
+        }
+        if (SCAN_KIND_TAG.equals(filterTag)) {
+            return "scan";
+        }
+        return "branch";
+    }
+
+    private static String resolveDashboardFilterTag(UUID environmentId, Long pipelineId, boolean scanOnly) {
+        if (pipelineId != null) {
+            return pipelineTag(pipelineId);
+        }
+        if (environmentId != null) {
+            return environmentTag(environmentId);
+        }
+        if (scanOnly) {
+            return SCAN_KIND_TAG;
+        }
+        return null;
     }
 
     public List<String> listBranches(UUID applicationId) {
@@ -1552,8 +1616,9 @@ public class DefectDojoService {
             return;
         }
         String trimmed = tags.trim();
-        // Import CI : le tag env-<uuid> est posé sur le Test DefectDojo, pas sur chaque Finding.
-        if (trimmed.startsWith("env-")) {
+        // Import CI : tags env-*, pipeline-*, scan, deploy sont posés sur le Test DefectDojo.
+        if (trimmed.startsWith("env-") || trimmed.startsWith("pipeline-")
+                || SCAN_KIND_TAG.equals(trimmed) || DEPLOY_KIND_TAG.equals(trimmed)) {
             params.put("test__tags", trimmed);
         } else {
             params.put("tags", trimmed);

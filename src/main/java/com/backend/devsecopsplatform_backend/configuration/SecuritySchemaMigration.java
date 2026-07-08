@@ -213,7 +213,21 @@ public class SecuritySchemaMigration {
                 CREATE INDEX IF NOT EXISTS idx_qg_snap_app_branch_created
                     ON quality_gate_snapshots (application_id, branch, created_at DESC)
                 """);
-        log.info("Table quality_gate_snapshots vérifiée.");
+        jdbcTemplate.execute("""
+                DO $$
+                BEGIN
+                  IF EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'quality_gate_snapshots'
+                  ) THEN
+                    ALTER TABLE quality_gate_snapshots
+                        ALTER COLUMN environment_id DROP NOT NULL;
+                    ALTER TABLE quality_gate_snapshots
+                        ADD COLUMN IF NOT EXISTS ncloc INTEGER;
+                  END IF;
+                END $$
+                """);
+        log.info("Table quality_gate_snapshots vérifiée (environment_id nullable pour scans).");
     }
 
     private void backfillLegacyUsers() {
