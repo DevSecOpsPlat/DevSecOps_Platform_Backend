@@ -1,8 +1,10 @@
 package com.backend.devsecopsplatform_backend.service;
 
-import com.backend.devsecopsplatform_backend.entity.Application;
+import com.backend.devsecopsplatform_backend.entity.AppService;
 import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
+import com.backend.devsecopsplatform_backend.repository.AppServiceRepository;
 import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
+import com.backend.devsecopsplatform_backend.service.ai.CodeContextExtractor;
 import com.backend.devsecopsplatform_backend.service.application.ApplicationService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -41,13 +43,23 @@ public class SourceSnippetFetcherService {
 
     public record CodeSnippetFetch(String content, String source) {}
 
-    private static final int CONTEXT_LINES = 55;
-    private static final int MAX_CHARS = 48_000;
-    private static final int MAX_LINES_WHEN_NO_HINT = 220;
+    private static final int MAX_CHARS = 24_000;
+    private static final int MAX_LINES_WHEN_NO_HINT = 160;
 
     private static final Pattern GITHUB_SSH = Pattern.compile("git@github\\.com:([^/]+)/([^/]+?)(?:\\.git)?\\s*$", Pattern.CASE_INSENSITIVE);
 
+    private static final List<String> DOCKERFILE_CANDIDATE_PATHS = List.of(
+            "Dockerfile",
+            "docker/Dockerfile",
+            "dockerfile",
+            ".docker/Dockerfile",
+            "Dockerfile.prod",
+            "deploy/Dockerfile",
+            "build/Dockerfile"
+    );
+
     private final EphemeralEnvironmentRepository ephemeralEnvironmentRepository;
+    private final AppServiceRepository appServiceRepository;
     private final ApplicationService applicationService;
     private final GitLabApi gitLabApi;
     private final ObjectMapper objectMapper;
@@ -59,25 +71,62 @@ public class SourceSnippetFetcherService {
      * @return extrait avec numéros de ligne + source (GITHUB / GITLAB), ou empty si impossible
      */
     public Optional<CodeSnippetFetch> tryFetchSnippet(UUID environmentId, String filePath, Integer lineStart, Integer lineEnd) {
-        if (filePath == null || filePath.isBlank()) {
+        Optional<EphemeralEnvironment> envOpt = ephemeralEnvironmentRepository.findByIdWithService(environmentId);
+        if (envOpt.isEmpty()) {
+            return Optional.empty();
+        }
+        EphemeralEnvironment env = envOpt.get();
+        AppService app = env.getService();
+        if (app == null) {
+            return Optional.empty();
+        }
+        String branch = env.getGitBranch() != null ? env.getGitBranch().trim() : "main";
+        return tryFetchSnippetForRepository(app, branch, filePath, lineStart, lineEnd);
+    }
+
+    public Optional<CodeSnippetFetch> tryFetchSnippetForApplication(
+            UUID applicationId,
+            String branch,
+            String filePath,
+            Integer lineStart,
+            Integer lineEnd
+    ) {
+        return appServiceRepository.findById(applicationId)
+                .flatMap(app -> tryFetchSnippetForRepository(app, branch, filePath, lineStart, lineEnd));
+    }
+
+    public Optional<CodeSnippetFetch> tryFetchDockerfileFallback(AppService app, String branch) {
+        if (app == null) {
+            return Optional.empty();
+        }
+        String ref = (branch != null && !branch.isBlank()) ? branch.trim() : "main";
+        for (String candidate : DOCKERFILE_CANDIDATE_PATHS) {
+            Optional<CodeSnippetFetch> hit = tryFetchSnippetForRepository(app, ref, candidate, null, null);
+            if (hit.isPresent()) {
+                String header = "# Dockerfile du dépôt : " + candidate + " (branche " + ref + ")\n"
+                        + "# Finding conteneur — corriger l'image de base / les paquets OS ici.\n\n";
+                return Optional.of(new CodeSnippetFetch(header + hit.get().content(), "DOCKERFILE"));
+            }
+        }
+        return Optional.empty();
+    }
+
+    public Optional<CodeSnippetFetch> tryFetchSnippetForRepository(
+            AppService app,
+            String branch,
+            String filePath,
+            Integer lineStart,
+            Integer lineEnd
+    ) {
+        if (app == null || filePath == null || filePath.isBlank()) {
             return Optional.empty();
         }
         String normalized = normalizeRepoRelativePath(filePath);
         if (normalized.isBlank()) {
             return Optional.empty();
         }
-
-        Optional<EphemeralEnvironment> envOpt = ephemeralEnvironmentRepository.findByIdWithApplication(environmentId);
-        if (envOpt.isEmpty()) {
-            return Optional.empty();
-        }
-        EphemeralEnvironment env = envOpt.get();
-        Application app = env.getApplication();
-        if (app == null) {
-            return Optional.empty();
-        }
         String repoUrl = app.getGitRepositoryUrl();
-        String branch = env.getGitBranch() != null ? env.getGitBranch().trim() : "main";
+        String ref = (branch != null && !branch.isBlank()) ? branch.trim() : "main";
 
         try {
             if (isGitHubUrl(repoUrl)) {
@@ -88,7 +137,7 @@ public class SourceSnippetFetcherService {
                 }
                 String[] parts = gh.get();
                 String token = safeToken(() -> applicationService.getDecryptedGithubToken(app.getId()));
-                return fetchGithubFile(parts[0], parts[1], normalized, branch, lineStart, lineEnd, token)
+                return fetchGithubFile(parts[0], parts[1], normalized, ref, lineStart, lineEnd, token)
                         .map(s -> new CodeSnippetFetch(s, "GITHUB"));
             }
             if (isSameGitLabHostAsConfig(repoUrl)) {
@@ -96,15 +145,33 @@ public class SourceSnippetFetcherService {
                 if (projectPath.isEmpty()) {
                     return Optional.empty();
                 }
-                return fetchGitLabFile(projectPath.get(), normalized, branch, lineStart, lineEnd)
+                return fetchGitLabFile(projectPath.get(), normalized, ref, lineStart, lineEnd)
                         .map(s -> new CodeSnippetFetch(s, "GITLAB"));
             }
             log.debug("Hôte dépôt non supporté pour fetch snippet: {}", repoUrl);
             return Optional.empty();
         } catch (Exception e) {
-            log.warn("Fetch snippet échoué (env={}, path={}): {}", environmentId, normalized, e.getMessage());
+            log.warn("Fetch snippet échoué (app={}, branch={}, path={}): {}",
+                    app.getId(), ref, normalized, e.getMessage());
             return Optional.empty();
         }
+    }
+
+    /** Chemin DefectDojo typique d'un artefact dans l'image (pas dans le dépôt Git). */
+    public static boolean isContainerFilesystemPath(String filePath) {
+        if (filePath == null || filePath.isBlank()) {
+            return false;
+        }
+        String p = filePath.trim().replace('\\', '/');
+        if (!p.startsWith("/")) {
+            return false;
+        }
+        return p.startsWith("/lib/")
+                || p.startsWith("/usr/")
+                || p.startsWith("/var/")
+                || p.startsWith("/etc/")
+                || p.contains("/apk/")
+                || p.contains("dpkg");
     }
 
     private static String safeToken(java.util.concurrent.Callable<String> supplier) {
@@ -250,21 +317,17 @@ public class SourceSnippetFetcherService {
     }
 
     static String windowAroundLines(String full, Integer lineStart, Integer lineEnd) {
-        String[] lines = full.split("\r\n|\n|\r", -1);
-        int start = 0;
-        int end = lines.length;
         if (lineStart != null && lineStart > 0) {
-            int idx0 = lineStart - 1;
-            start = Math.max(0, idx0 - CONTEXT_LINES);
             int hi = (lineEnd != null && lineEnd > 0) ? lineEnd : lineStart;
-            end = Math.min(lines.length, hi + CONTEXT_LINES);
-        } else {
-            if (lines.length > MAX_LINES_WHEN_NO_HINT) {
-                end = MAX_LINES_WHEN_NO_HINT;
-            }
+            return CodeContextExtractor.extractSnippet(full, hi, MAX_CHARS);
+        }
+        String[] lines = full.split("\r\n|\n|\r", -1);
+        int end = lines.length;
+        if (lines.length > MAX_LINES_WHEN_NO_HINT) {
+            end = MAX_LINES_WHEN_NO_HINT;
         }
         StringBuilder sb = new StringBuilder();
-        for (int i = start; i < end; i++) {
+        for (int i = 0; i < end; i++) {
             sb.append(String.format("%5d| %s%n", i + 1, lines[i]));
         }
         String out = sb.toString();

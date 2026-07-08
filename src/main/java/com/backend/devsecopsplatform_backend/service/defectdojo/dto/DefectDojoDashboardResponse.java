@@ -33,12 +33,6 @@ public class DefectDojoDashboardResponse {
     private int totalMitigated;
     private int totalFindings;
 
-    /** Findings récents pour le tableau. */
-    private List<DefectDojoFindingItem> recentFindings;
-
-    /** Scans (tests) importés dans l'engagement. */
-    private List<DefectDojoTestItem> tests;
-
     /** Branches / engagements disponibles pour ce produit. */
     private List<DefectDojoEngagementSummary> availableEngagements;
 

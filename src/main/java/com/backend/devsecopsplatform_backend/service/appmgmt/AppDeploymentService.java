@@ -1,12 +1,23 @@
 package com.backend.devsecopsplatform_backend.service.appmgmt;
 
+import com.backend.devsecopsplatform_backend.controller.environment.CiDeployRequest;
+import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
+import com.backend.devsecopsplatform_backend.entity.EnvironmentStatus;
+import com.backend.devsecopsplatform_backend.entity.User;
+import com.backend.devsecopsplatform_backend.entity.AppService;
+import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
+import com.backend.devsecopsplatform_backend.entity.PipelineExecutionKind;
+import com.backend.devsecopsplatform_backend.entity.PipelineStatus;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDatabase;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDeployment;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDeploymentStatus;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.AppService;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.ManagedApplication;
 import com.backend.devsecopsplatform_backend.repository.AppDatabaseRepository;
 import com.backend.devsecopsplatform_backend.repository.AppDeploymentRepository;
+import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
+import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
+import com.backend.devsecopsplatform_backend.service.EncryptionService;
+import com.backend.devsecopsplatform_backend.service.environment.EnvironmentLifecycleService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -16,6 +27,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.LinkedHashMap;
@@ -44,12 +56,17 @@ import java.util.UUID;
 public class AppDeploymentService {
 
     private final AppDeploymentRepository deploymentRepository;
+    private final EphemeralEnvironmentRepository environmentRepository;
+    private final PipelineExecutionRepository pipelineExecutionRepository;
     private final AppDatabaseRepository databaseRepository;
     private final AppDeploymentValidationService validationService;
     private final AppConnectionUrlService connectionUrlService;
     private final AppK8sManifestService manifestService;
     private final AppDeploymentGitLabService gitLabService;
+    private final EncryptionService encryptionService;
     private final ObjectMapper objectMapper;
+    private final K8sManifestApplyService k8sManifestApplyService;
+    private final EnvironmentLifecycleService environmentLifecycleService;
 
     @Value("${deployment.registry.server:registry.gitlab.com}")
     private String registryServer;
@@ -69,13 +86,28 @@ public class AppDeploymentService {
     @Value("${deployment.ingress.domain:local}")
     private String ingressDomain;
 
+    @Value("${deployment.ingress.path-based:true}")
+    private boolean pathBasedRouting;
+
     /** Secret partagé validé par le callback (même valeur que le job GitLab). */
     @Value("${pipeline.secret:}")
     private String pipelineSecret;
 
     /** URL du backend joignable depuis le cluster (pour l'appel du callback par le pipeline). */
-    @Value("${deployment.callback.base-url:http://host.docker.internal:8089/projet}")
+    @Value("${deployment.callback.base-url:}")
     private String callbackBaseUrl;
+
+    @Value("${deployment.preview.nip.enabled:false}")
+    private boolean nipPreviewEnabled;
+
+    @Value("${deployment.preview.nip.scheme:https}")
+    private String nipScheme;
+
+    @Value("${deployment.preview.nip.master-ip:}")
+    private String nipMasterIp;
+
+    @Value("${deployment.preview.nip.node-port:30374}")
+    private int nipNodePort;
 
     // =====================================================================
     // Déclenchement
@@ -87,6 +119,12 @@ public class AppDeploymentService {
      */
     @Transactional
     public AppDeployment deploy(ManagedApplication app) {
+        return deploy(app, ManagedDeployOptions.defaults(null));
+    }
+
+    @Transactional
+    public AppDeployment deploy(ManagedApplication app, ManagedDeployOptions options) {
+        ManagedDeployOptions resolved = options != null ? options : ManagedDeployOptions.defaults(null);
         List<String> warnings = validationService.validate(app);
         warnings.forEach(w -> log.info("⚠️ [deploy {}] {}", app.getId(), w));
 
@@ -113,6 +151,7 @@ public class AppDeploymentService {
                 .pullSecretName(pullSecretName)
                 .ingressEnabled(ingressEnabled)
                 .ingressDomain(ingressDomain)
+                .pathBasedRouting(pathBasedRouting)
                 .imageTag(imageTag)
                 .build();
 
@@ -130,19 +169,145 @@ public class AppDeploymentService {
         variables.put("APP_ID", app.getId().toString());
         variables.put("APP_SLUG", app.getSlug());
         variables.put("DEPLOYMENT_ID", deployment.getId().toString());
+        AppService gitService = app.getServices().stream().findFirst()
+                .orElseThrow(() -> new AppValidationException("Aucun service dans le projet."));
+        String deployBranch = resolved.resolveBranch(gitService.getGitBranch());
+        addGitPipelineVariables(variables, gitService, deployBranch);
+        variables.put("APPLICATION_ID", gitService.getId().toString());
         variables.put("NAMESPACE", namespace);
-        variables.put("BACKEND_URL", callbackBaseUrl);
+        putBackendUrlIfConfigured(variables);
         variables.put("PIPELINE_SECRET", pipelineSecret != null ? pipelineSecret : "");
         variables.put("IMAGE_TAG", imageTag);
         variables.put("PULL_SECRET_NAME", pullSecretName);
         variables.put("K8S_DATABASES_B64", databasesB64);
         variables.put("K8S_SERVICES_B64", servicesB64);
         variables.put("SERVICES_JSON", servicesJson);
+        variables.put("TTL_HOURS", String.valueOf(resolved.ttlHours()));
+
+        EphemeralEnvironment env = createEphemeralEnvironmentForDeploy(
+                gitService, app.getCreatedBy(), deployBranch, namespace, resolved.ttlHours());
+        variables.put("ENVIRONMENT_ID", env.getId().toString());
 
         Long pipelineId = gitLabService.triggerPipeline(variables);
         deployment.setGitlabPipelineId(pipelineId);
         deployment.setStatus(pipelineId != null ? AppDeploymentStatus.DEPLOYING : AppDeploymentStatus.FAILED);
         deployment.setDeployedAt(Instant.now());
+        linkDeployPipelineExecution(gitService, env, pipelineId, deployBranch);
+
+        return deploymentRepository.save(deployment);
+    }
+
+    /**
+     * Déploiement ciblé d'un seul service (avec sa base de données dépendante, si déclarée).
+     * Le déploiement est rattaché au vrai projet pour la FK ; les manifests / vagues / état
+     * initial sont générés à partir d'une vue filtrée (shadow) en mémoire, sans muter la
+     * collection JPA {@link ManagedApplication#getServices()}.
+     */
+    @Transactional
+    public AppDeployment deploySingleService(ManagedApplication realApp, UUID targetServiceId) {
+        return deploySingleService(realApp, targetServiceId, ManagedDeployOptions.defaults(null));
+    }
+
+    @Transactional
+    public AppDeployment deploySingleService(
+            ManagedApplication realApp,
+            UUID targetServiceId,
+            ManagedDeployOptions options
+    ) {
+        ManagedDeployOptions resolved = options != null ? options : ManagedDeployOptions.defaults(null);
+        AppService target = realApp.getServices().stream()
+                .filter(s -> targetServiceId.equals(s.getId()))
+                .findFirst()
+                .orElseThrow(() -> new AppValidationException("Service introuvable dans ce projet."));
+
+        List<AppDatabase> depDbs = new ArrayList<>();
+        if (target.getDependsOnDatabaseId() != null) {
+            realApp.getDatabases().stream()
+                    .filter(d -> target.getDependsOnDatabaseId().equals(d.getId()))
+                    .findFirst()
+                    .ifPresent(depDbs::add);
+        }
+
+        // Vue en mémoire (n'est jamais save() → aucun cascade JPA).
+        ManagedApplication shadow = new ManagedApplication();
+        shadow.setId(realApp.getId());
+        shadow.setName(realApp.getName());
+        shadow.setSlug(realApp.getSlug());
+        shadow.setDescription(realApp.getDescription());
+        shadow.setCreatedBy(realApp.getCreatedBy());
+        shadow.setServices(List.of(target));
+        shadow.setDatabases(depDbs);
+
+        List<String> warnings = validationService.validate(shadow);
+        warnings.forEach(w -> log.info("⚠️ [deploy-svc {}] {}", target.getId(), w));
+
+        AppDeployment deployment = new AppDeployment();
+        deployment.setApplication(realApp);
+        deployment.setStatus(AppDeploymentStatus.PENDING);
+        deployment.setNamespace("pending");
+        deployment = deploymentRepository.save(deployment);
+
+        String appSlug = AppNaming.k8sName(realApp.getSlug());
+        String serviceSlug = AppNaming.k8sName(target.getName());
+        if (serviceSlug.startsWith(appSlug + "-")) {
+            serviceSlug = serviceSlug.substring((appSlug + "-").length());
+        }
+        String namespace = AppNaming.namespace(appSlug + "-" + serviceSlug, deployment.getId());
+        deployment.setNamespace(namespace);
+
+        for (AppDatabase db : depDbs) {
+            db.setGeneratedConnectionUrl(connectionUrlService.buildConnectionUrl(db, namespace));
+            databaseRepository.save(db);
+        }
+
+        String imageTag = AppNaming.shortId(deployment.getId());
+        AppK8sManifestService.ManifestOptions opts = AppK8sManifestService.ManifestOptions.builder()
+                .registryServer(registryServer)
+                .registryUsername(registryUsername)
+                .registryPassword(registryPassword)
+                .pullSecretName(pullSecretName)
+                .ingressEnabled(ingressEnabled)
+                .ingressDomain(ingressDomain)
+                .pathBasedRouting(pathBasedRouting)
+                .imageTag(imageTag)
+                .build();
+
+        String databasesB64 = b64(manifestService.generateDatabaseBundle(shadow, namespace, opts));
+        String servicesB64 = b64(manifestService.generateServiceBundle(shadow, namespace, opts));
+
+        Map<Integer, List<AppService>> waves = computeWaves(shadow);
+        String servicesJson = buildServicesJson(shadow, waves, imageTag);
+
+        deployment.setServicesState(buildInitialState(shadow, namespace, waves));
+
+        Map<String, String> variables = new LinkedHashMap<>();
+        variables.put("ACTION", "deploy");
+        variables.put("APP_ID", realApp.getId().toString());
+        variables.put("APP_SLUG", realApp.getSlug());
+        variables.put("SERVICE_ID", target.getId().toString());
+        variables.put("DEPLOYMENT_ID", deployment.getId().toString());
+        String deployBranch = resolved.resolveBranch(target.getGitBranch());
+        addGitPipelineVariables(variables, target, deployBranch);
+        variables.put("APPLICATION_ID", target.getId().toString());
+        variables.put("NAMESPACE", namespace);
+        putBackendUrlIfConfigured(variables);
+        variables.put("PIPELINE_SECRET", pipelineSecret != null ? pipelineSecret : "");
+        variables.put("IMAGE_TAG", imageTag);
+        variables.put("PULL_SECRET_NAME", pullSecretName);
+        variables.put("K8S_DATABASES_B64", databasesB64);
+        variables.put("K8S_SERVICES_B64", servicesB64);
+        variables.put("SERVICES_JSON", servicesJson);
+        variables.put("TTL_HOURS", String.valueOf(resolved.ttlHours()));
+
+        EphemeralEnvironment env = createEphemeralEnvironmentForDeploy(
+                target, realApp.getCreatedBy(), deployBranch, namespace, resolved.ttlHours());
+        variables.put("ENVIRONMENT_ID", env.getId().toString());
+
+        Long pipelineId = gitLabService.triggerPipeline(variables);
+        deployment.setGitlabPipelineId(pipelineId);
+        deployment.setStatus(pipelineId != null ? AppDeploymentStatus.DEPLOYING : AppDeploymentStatus.FAILED);
+        deployment.setDeployedAt(Instant.now());
+        linkDeployPipelineExecution(target, env, pipelineId, deployBranch);
 
         return deploymentRepository.save(deployment);
     }
@@ -157,7 +322,7 @@ public class AppDeploymentService {
         variables.put("ACTION", "teardown");
         variables.put("DEPLOYMENT_ID", deployment.getId().toString());
         variables.put("NAMESPACE", deployment.getNamespace());
-        variables.put("BACKEND_URL", callbackBaseUrl);
+        putBackendUrlIfConfigured(variables);
         variables.put("PIPELINE_SECRET", pipelineSecret != null ? pipelineSecret : "");
         gitLabService.triggerPipeline(variables);
 
@@ -198,6 +363,292 @@ public class AppDeploymentService {
         return deploymentRepository.save(deployment);
     }
 
+    /**
+     * Appelé par le job CI {@code deploy:trigger-backend} (header {@code X-Pipeline-Secret}, pas de JWT).
+     */
+    @Transactional
+    public Map<String, Object> applyFromCiPipeline(CiDeployRequest request) {
+        if (request.getImage() == null || request.getImage().isBlank()) {
+            throw new AppValidationException("image requis");
+        }
+        if (request.getNamespace() == null || request.getNamespace().isBlank()) {
+            throw new AppValidationException("namespace requis");
+        }
+        UUID deploymentId = parseUuid(request.getDeploymentId());
+        if (deploymentId == null) {
+            deploymentId = parseUuid(request.getEnvironmentId());
+        }
+        if (deploymentId == null) {
+            throw new AppValidationException("deploymentId ou environmentId requis");
+        }
+        final UUID resolvedDeploymentId = deploymentId;
+
+        AppDeployment deployment = deploymentRepository.findById(resolvedDeploymentId)
+                .orElseThrow(() -> new AppValidationException("Déploiement introuvable: " + resolvedDeploymentId));
+
+        ManagedApplication realApp = deployment.getApplication();
+        if (realApp == null) {
+            throw new AppValidationException("Application managée introuvable pour le déploiement");
+        }
+
+        String namespace = request.getNamespace().trim();
+        deployment.setNamespace(namespace);
+
+        ManagedApplication shadow = buildShadowForDeployment(deployment, realApp);
+        String imageTag = AppNaming.shortId(deployment.getId());
+        AppK8sManifestService.ManifestOptions opts = AppK8sManifestService.ManifestOptions.builder()
+                .registryServer(registryServer)
+                .registryUsername(registryUsername)
+                .registryPassword(registryPassword)
+                .pullSecretName(pullSecretName)
+                .ingressEnabled(ingressEnabled)
+                .ingressDomain(ingressDomain)
+                .pathBasedRouting(pathBasedRouting)
+                .imageTag(imageTag)
+                .resolvedServiceImage(request.getImage().trim())
+                .build();
+
+        UUID environmentId = parseUuid(request.getEnvironmentId());
+        if (environmentId != null) {
+            environmentLifecycleService.onBuilding(environmentId);
+        }
+
+        try {
+            String databasesYaml = manifestService.generateDatabaseBundle(shadow, namespace, opts);
+            String servicesYaml = manifestService.generateServiceBundle(shadow, namespace, opts);
+            String allYaml = databasesYaml + "\n---\n" + servicesYaml;
+            k8sManifestApplyService.applyManifests(allYaml);
+        } catch (Exception e) {
+            deployment.setStatus(AppDeploymentStatus.FAILED);
+            deploymentRepository.save(deployment);
+            if (environmentId != null) {
+                environmentLifecycleService.onPipelineFailed(
+                        environmentId, "Échec apply Kubernetes: " + e.getMessage());
+            }
+            throw new AppValidationException("Échec apply Kubernetes: " + e.getMessage());
+        }
+
+        deployment.setStatus(AppDeploymentStatus.RUNNING);
+        deployment.setDeployedAt(Instant.now());
+        markServicesDeploying(deployment);
+        deploymentRepository.save(deployment);
+
+        if (environmentId != null) {
+            String appUrl = resolvePublicUrl(deployment, shadow);
+            environmentRepository.findById(environmentId).ifPresent(env -> {
+                env.setNamespace(namespace);
+                if (appUrl != null) {
+                    env.setUrl(appUrl);
+                }
+                environmentRepository.save(env);
+            });
+            environmentLifecycleService.onReady(environmentId, appUrl);
+        }
+
+        log.info("CI deploy appliqué — deployment={} namespace={} image={}",
+                deploymentId, namespace, request.getImage());
+        return Map.of(
+                "status", "accepted",
+                "deploymentId", deploymentId.toString(),
+                "namespace", namespace
+        );
+    }
+
+    @Transactional
+    public Map<String, Object> getCiDeployStatus(UUID deploymentId) {
+        AppDeployment deployment = deploymentRepository.findById(deploymentId)
+                .orElseThrow(() -> new AppValidationException("Déploiement introuvable"));
+
+        ManagedApplication realApp = deployment.getApplication();
+        ManagedApplication shadow = buildShadowForDeployment(deployment, realApp);
+        boolean ready = false;
+        if (!shadow.getServices().isEmpty()) {
+            AppService svc = shadow.getServices().get(0);
+            String k8sName = AppNaming.k8sName(svc.getName());
+            ready = k8sManifestApplyService.isDeploymentReady(deployment.getNamespace(), k8sName);
+        }
+        if (ready) {
+            deployment.setStatus(AppDeploymentStatus.RUNNING);
+            markServicesReady(deployment);
+            String appUrl = resolvePublicUrl(deployment, shadow);
+            environmentRepository.findById(deploymentId).ifPresent(env ->
+                    environmentLifecycleService.onReady(env.getId(), appUrl != null ? appUrl : env.getUrl()));
+        }
+
+        String appUrl = resolvePublicUrl(deployment, shadow);
+        String state = deployment.getStatus() == AppDeploymentStatus.FAILED
+                ? "FAILED"
+                : (ready ? "SUCCESS" : "RUNNING");
+
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("status", state);
+        out.put("ready", ready);
+        if (appUrl != null) {
+            out.put("appUrl", appUrl);
+        }
+        out.put("namespace", deployment.getNamespace());
+        out.put("message", ready ? "Application prête" : "Déploiement en cours");
+        return out;
+    }
+
+    private ManagedApplication buildShadowForDeployment(AppDeployment deployment, ManagedApplication realApp) {
+        Map<String, Object> state = deployment.getServicesState();
+        List<AppService> targetServices = new ArrayList<>();
+        if (state != null && state.get("services") instanceof Map<?, ?> servicesMap) {
+            for (Object key : servicesMap.keySet()) {
+                String name = String.valueOf(key);
+                realApp.getServices().stream()
+                        .filter(s -> name.equals(s.getName()))
+                        .findFirst()
+                        .ifPresent(targetServices::add);
+            }
+        }
+        if (targetServices.isEmpty() && realApp.getServices().size() == 1) {
+            targetServices.add(realApp.getServices().get(0));
+        }
+        if (targetServices.isEmpty()) {
+            throw new AppValidationException("Aucun service à déployer pour ce déploiement");
+        }
+
+        List<AppDatabase> depDbs = new ArrayList<>();
+        for (AppService svc : targetServices) {
+            if (svc.getDependsOnDatabaseId() != null) {
+                realApp.getDatabases().stream()
+                        .filter(d -> svc.getDependsOnDatabaseId().equals(d.getId()))
+                        .findFirst()
+                        .ifPresent(db -> {
+                            if (depDbs.stream().noneMatch(x -> x.getId().equals(db.getId()))) {
+                                depDbs.add(db);
+                            }
+                        });
+            }
+        }
+
+        ManagedApplication shadow = new ManagedApplication();
+        shadow.setId(realApp.getId());
+        shadow.setName(realApp.getName());
+        shadow.setSlug(realApp.getSlug());
+        shadow.setServices(targetServices);
+        shadow.setDatabases(depDbs);
+        return shadow;
+    }
+
+    @SuppressWarnings("unchecked")
+    private void markServicesDeploying(AppDeployment deployment) {
+        Map<String, Object> state = deployment.getServicesState();
+        if (state == null) {
+            return;
+        }
+        Object servicesObj = state.get("services");
+        if (servicesObj instanceof Map<?, ?> services) {
+            for (Map.Entry<?, ?> e : services.entrySet()) {
+                if (e.getValue() instanceof Map) {
+                    ((Map<String, Object>) e.getValue()).put("status", "Deploying");
+                }
+            }
+        }
+        deployment.setServicesState(state);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void markServicesReady(AppDeployment deployment) {
+        Map<String, Object> state = deployment.getServicesState();
+        if (state == null) {
+            return;
+        }
+        Object servicesObj = state.get("services");
+        if (servicesObj instanceof Map<?, ?> services) {
+            for (Map.Entry<?, ?> e : services.entrySet()) {
+                if (e.getValue() instanceof Map) {
+                    Map<String, Object> svcState = (Map<String, Object>) e.getValue();
+                    svcState.put("status", "Ready");
+                    if (svcState.get("externalUrl") == null) {
+                        ManagedApplication shadow = buildShadowForDeployment(
+                                deployment, deployment.getApplication());
+                        String resolved = resolvePublicUrl(deployment, shadow);
+                        if (resolved != null) {
+                            svcState.put("externalUrl", resolved);
+                        }
+                    }
+                }
+            }
+        }
+        deployment.setServicesState(state);
+        deploymentRepository.save(deployment);
+    }
+
+    private String resolvePublicUrl(AppDeployment deployment, ManagedApplication shadow) {
+        Map<String, Object> state = deployment.getServicesState();
+        if (state != null && state.get("services") instanceof Map<?, ?> services) {
+            for (Object v : services.values()) {
+                if (v instanceof Map<?, ?> svcState) {
+                    Object ext = svcState.get("externalUrl");
+                    if (ext != null && !String.valueOf(ext).isBlank()) {
+                        return String.valueOf(ext);
+                    }
+                }
+            }
+        }
+        if (nipPreviewEnabled && nipMasterIp != null && !nipMasterIp.isBlank()) {
+            String scheme = nipScheme != null && !nipScheme.isBlank() ? nipScheme.trim().toLowerCase() : "https";
+            String id = deployment.getId().toString().toLowerCase();
+            return scheme + "://app-" + id + "." + nipMasterIp.trim() + ".nip.io:" + nipNodePort;
+        }
+        if (!shadow.getServices().isEmpty() && ingressEnabled && pathBasedRouting) {
+            return "http://app-" + deployment.getNamespace() + "." + ingressDomain;
+        }
+        if (!shadow.getServices().isEmpty() && ingressEnabled) {
+            AppService svc = shadow.getServices().get(0);
+            String k8sName = AppNaming.k8sName(svc.getName());
+            return "http://" + k8sName + "-" + deployment.getNamespace() + "." + ingressDomain;
+        }
+        return null;
+    }
+
+    private String ingressServiceUrl(String namespace, AppService svc, ManagedApplication app) {
+        if (!ingressEnabled || !isExternallyExposedService(svc)) {
+            return null;
+        }
+        if (pathBasedRouting) {
+            String base = "http://app-" + namespace + "." + ingressDomain;
+            AppService primary = findPrimaryExposed(app);
+            if (primary != null && java.util.Objects.equals(svc.getId(), primary.getId())) {
+                return base;
+            }
+            return base + "/" + AppNaming.k8sName(svc.getName());
+        }
+        return "http://" + AppNaming.k8sName(svc.getName()) + "-" + namespace + "." + ingressDomain;
+    }
+
+    private AppService findPrimaryExposed(ManagedApplication app) {
+        List<AppService> exposed = app.getServices().stream()
+                .filter(this::isExternallyExposedService)
+                .toList();
+        if (exposed.isEmpty()) {
+            return null;
+        }
+        return exposed.stream()
+                .filter(s -> s.getRole() == com.backend.devsecopsplatform_backend.entity.appmgmt.AppServiceRole.FRONTEND)
+                .findFirst()
+                .orElse(exposed.get(0));
+    }
+
+    private boolean isExternallyExposedService(AppService svc) {
+        return svc.getExposedPort() != null
+                && svc.getRole() != com.backend.devsecopsplatform_backend.entity.appmgmt.AppServiceRole.WORKER;
+    }
+
+    private UUID parseUuid(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        try {
+            return UUID.fromString(raw.trim());
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+    }
+
     @SuppressWarnings("unchecked")
     private void updateServicesState(AppDeployment deployment, boolean success, Set<String> readyServices) {
         Map<String, Object> state = deployment.getServicesState();
@@ -232,22 +683,15 @@ public class AppDeploymentService {
     // =====================================================================
 
     /**
-     * §3.3 — ordre borné :
+     * §3.3 — ordre :
      * <ol>
-     *   <li>vague 0 : bases (appliquées et Ready en premier via {@code kubectl wait -l tier=database}) ;</li>
-     *   <li>vague 1 : services avec dépendance ({@code depends_on_*}) ;</li>
-     *   <li>vague 2 : services sans dépendance.</li>
+     *   <li>vague 0 : bases (kubectl wait -l tier=database) ;</li>
+     *   <li>vagues services : tri topologique — sans dépendances service d'abord,
+     *       puis ceux qui en dépendent (profondeur croissante).</li>
      * </ol>
      */
     private Map<Integer, List<AppService>> computeWaves(ManagedApplication app) {
-        Map<Integer, List<AppService>> waves = new LinkedHashMap<>();
-        waves.put(1, new ArrayList<>());
-        waves.put(2, new ArrayList<>());
-        for (AppService svc : app.getServices()) {
-            boolean hasDep = svc.getDependsOnDatabaseId() != null || svc.getDependsOnServiceId() != null;
-            waves.get(hasDep ? 1 : 2).add(svc);
-        }
-        return waves;
+        return ServiceTopology.computeWaves(app);
     }
 
     private int waveOf(Map<Integer, List<AppService>> waves, AppService svc) {
@@ -301,8 +745,7 @@ public class AppDeploymentService {
             svcState.put("status", "NotReady");
             svcState.put("wave", waveOf(waves, svc));
             svcState.put("internalHost", k8sName + "." + namespace + ".svc.cluster.local");
-            boolean exposed = svc.getRole() != com.backend.devsecopsplatform_backend.entity.appmgmt.AppServiceRole.WORKER;
-            svcState.put("externalUrl", exposed ? ("http://" + k8sName + "-" + namespace + "." + ingressDomain) : null);
+            svcState.put("externalUrl", ingressServiceUrl(namespace, svc, app));
             services.put(svc.getName(), svcState);
         }
         state.put("namespace", namespace);
@@ -313,5 +756,120 @@ public class AppDeploymentService {
 
     private String b64(String content) {
         return Base64.getEncoder().encodeToString(content.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private void addGitPipelineVariables(Map<String, String> variables, AppService service) {
+        if (service == null) {
+            throw new AppValidationException("Aucun service trouvé pour préparer les variables Git du pipeline.");
+        }
+        String branch = (service.getGitBranch() == null || service.getGitBranch().isBlank())
+                ? "main"
+                : service.getGitBranch().trim();
+        addGitPipelineVariables(variables, service, branch);
+    }
+
+    private void addGitPipelineVariables(Map<String, String> variables, AppService service, String branch) {
+        if (service == null) {
+            throw new AppValidationException("Aucun service trouvé pour préparer les variables Git du pipeline.");
+        }
+
+        String repoUrl = service.getGitRepositoryUrl();
+        if (repoUrl == null || repoUrl.isBlank()) {
+            throw new AppValidationException("Le service ne contient pas d'URL Git (GIT_REPO_URL).");
+        }
+
+        String resolvedBranch = (branch == null || branch.isBlank()) ? "main" : branch.trim();
+        String dockerfilePath = (service.getDockerfilePath() == null || service.getDockerfilePath().isBlank())
+                ? "./Dockerfile"
+                : service.getDockerfilePath().trim();
+        String buildContext = (service.getBuildContext() == null || service.getBuildContext().isBlank())
+                ? "."
+                : service.getBuildContext().trim();
+        String token = resolveDecryptedToken(service);
+
+        variables.put("GIT_REPO_URL", repoUrl.trim());
+        variables.put("GIT_BRANCH", resolvedBranch);
+        variables.put("DOCKERFILE_PATH", dockerfilePath);
+        variables.put("BUILD_CONTEXT", buildContext);
+        variables.put("GITHUB_TOKEN", token != null ? token : "");
+    }
+
+    private String resolveDecryptedToken(AppService svc) {
+        if (svc.getGitToken() != null && !svc.getGitToken().isBlank()) {
+            return svc.getGitToken();
+        }
+        if (svc.getEncryptedGithubToken() != null && !svc.getEncryptedGithubToken().isBlank()) {
+            try {
+                return encryptionService.decrypt(svc.getEncryptedGithubToken());
+            } catch (Exception e) {
+                log.warn("Impossible de déchiffrer encryptedGithubToken du service {}: {}", svc.getId(), e.getMessage());
+            }
+        }
+        return null;
+    }
+
+    private EphemeralEnvironment createEphemeralEnvironmentForDeploy(
+            AppService service,
+            User owner,
+            String branch,
+            String namespace,
+            int ttlHours
+    ) {
+        EphemeralEnvironment env = new EphemeralEnvironment();
+        env.setEnvironmentName("env-" + UUID.randomUUID().toString().substring(0, 8));
+        env.setService(service);
+        env.setGitBranch(branch != null && !branch.isBlank() ? branch : "main");
+        env.setRequestedBy(owner);
+        env.setStatus(EnvironmentStatus.PENDING);
+        env.setTtlHours(ttlHours > 0 ? ttlHours : 4);
+        env.setNamespace(namespace);
+        service.addEphemeralEnvironment(env);
+        log.info("Environnement éphémère créé pour déploiement — ttlHours={}, expiresAt sera calculé à la persistance",
+                env.getTtlHours());
+        return environmentRepository.save(env);
+    }
+
+    private void linkDeployPipelineExecution(
+            AppService service,
+            EphemeralEnvironment env,
+            Long gitlabPipelineId,
+            String branch
+    ) {
+        if (service == null || env == null || gitlabPipelineId == null) {
+            return;
+        }
+        if (pipelineExecutionRepository.findByGitlabPipelineId(gitlabPipelineId).isPresent()) {
+            return;
+        }
+        PipelineExecution execution = new PipelineExecution();
+        execution.setAppService(service);
+        execution.setGitlabPipelineId(gitlabPipelineId);
+        execution.setExecutionKind(PipelineExecutionKind.DEPLOY);
+        execution.setGitBranch(branch != null && !branch.isBlank() ? branch : env.getGitBranch());
+        execution.setStatus(PipelineStatus.fromGitLabStatus("running"));
+        execution.setStartedAt(LocalDateTime.now());
+        execution.setEnvironment(env);
+        env.setPipelineExecution(execution);
+        pipelineExecutionRepository.save(execution);
+        environmentRepository.save(env);
+        log.info("Deploy enregistré — env={} pipeline_exec gitlab=#{} service={}",
+                env.getId(), gitlabPipelineId, service.getId());
+    }
+
+    private void putBackendUrlIfConfigured(Map<String, String> variables) {
+        if (isPublicCallbackBaseUrl(callbackBaseUrl)) {
+            variables.put("BACKEND_URL", callbackBaseUrl.trim());
+        }
+    }
+
+    private static boolean isPublicCallbackBaseUrl(String url) {
+        if (url == null || url.isBlank()) {
+            return false;
+        }
+        String normalized = url.trim().toLowerCase();
+        return !normalized.contains("host.docker.internal")
+                && !normalized.contains("localhost")
+                && !normalized.startsWith("http://127.")
+                && !normalized.startsWith("https://127.");
     }
 }

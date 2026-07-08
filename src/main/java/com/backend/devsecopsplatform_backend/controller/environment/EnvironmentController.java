@@ -7,9 +7,12 @@ import com.backend.devsecopsplatform_backend.repository.UserRepository;
 import com.backend.devsecopsplatform_backend.service.GitLabService;
 import com.backend.devsecopsplatform_backend.service.environment.EnvironmentService;
 import com.fasterxml.jackson.databind.JsonNode;
-import jakarta.validation.Valid;
+import com.backend.devsecopsplatform_backend.service.appmgmt.AppDeploymentService;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
@@ -29,9 +32,14 @@ import java.util.UUID;
 public class EnvironmentController {
 
     private final EnvironmentService environmentService;
+    private final AppDeploymentService appDeploymentService;
     private final GitLabService gitLabService;
     private final EphemeralEnvironmentRepository environmentRepository;
     private final UserRepository userRepository;
+    private final ObjectMapper objectMapper;
+
+    @Value("${pipeline.secret:}")
+    private String pipelineSecret;
 
     private User getCurrentUser() {
         Authentication auth = SecurityContextHolder.getContext().getAuthentication();
@@ -43,7 +51,35 @@ public class EnvironmentController {
     }
 
     @PostMapping("/deploy")
-    public ResponseEntity<DeployResponse> deploy(@Valid @RequestBody DeployRequest request) {
+    public ResponseEntity<?> deploy(
+            @RequestHeader(value = "X-Pipeline-Secret", required = false) String secret,
+            @RequestBody JsonNode body
+    ) {
+        if (body != null && body.hasNonNull("image") && body.hasNonNull("namespace")
+                && pipelineSecret != null && !pipelineSecret.isBlank()
+                && pipelineSecret.equals(secret)) {
+            try {
+                CiDeployRequest ciRequest = objectMapper.treeToValue(body, CiDeployRequest.class);
+                log.info("📥 CI deploy: namespace={} deploymentId={}", ciRequest.getNamespace(), ciRequest.getDeploymentId());
+                return ResponseEntity.ok(appDeploymentService.applyFromCiPipeline(ciRequest));
+            } catch (com.backend.devsecopsplatform_backend.service.appmgmt.AppValidationException e) {
+                return ResponseEntity.badRequest().body(Map.of("message", e.getMessage()));
+            } catch (Exception e) {
+                log.error("❌ Erreur CI deploy: {}", e.getMessage(), e);
+                return ResponseEntity.internalServerError().body(Map.of("message", e.getMessage()));
+            }
+        }
+
+        DeployRequest request;
+        try {
+            request = objectMapper.treeToValue(body, DeployRequest.class);
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(Map.of("message", "Corps de requête invalide"));
+        }
+        if (request.getGitRepositoryUrl() == null || request.getGitRepositoryUrl().isBlank()
+                || request.getBranch() == null || request.getBranch().isBlank()) {
+            return ResponseEntity.status(401).body(Map.of("message", "Authentification requise."));
+        }
         log.info("📥 Demande de déploiement: repo={} branch={}", request.getGitRepositoryUrl(), request.getBranch());
         try {
             DeployResponse response = environmentService.deploy(request);
@@ -51,6 +87,21 @@ public class EnvironmentController {
         } catch (Exception e) {
             log.error("❌ Erreur déploiement: {}", e.getMessage());
             throw e;
+        }
+    }
+
+    @GetMapping("/deploy/status/{deploymentId}")
+    public ResponseEntity<?> deployStatus(
+            @PathVariable UUID deploymentId,
+            @RequestHeader(value = "X-Pipeline-Secret", required = false) String secret
+    ) {
+        if (pipelineSecret == null || pipelineSecret.isBlank() || !pipelineSecret.equals(secret)) {
+            return ResponseEntity.status(401).body(Map.of("message", "Authentification requise."));
+        }
+        try {
+            return ResponseEntity.ok(appDeploymentService.getCiDeployStatus(deploymentId));
+        } catch (com.backend.devsecopsplatform_backend.service.appmgmt.AppValidationException e) {
+            return ResponseEntity.status(404).body(Map.of("message", e.getMessage()));
         }
     }
 
@@ -98,12 +149,12 @@ public class EnvironmentController {
         try {
             JsonNode report = gitLabService.getScanResults(jobId);
             if (report == null) {
-                return ResponseEntity.notFound().build();
+                return ResponseEntity.noContent().build();
             }
             return ResponseEntity.ok(report);
         } catch (Exception e) {
             log.error("❌ Erreur récupération scan results job {}: {}", jobId, e.getMessage());
-            return ResponseEntity.notFound().build();
+            return ResponseEntity.noContent().build();
         }
     }
 

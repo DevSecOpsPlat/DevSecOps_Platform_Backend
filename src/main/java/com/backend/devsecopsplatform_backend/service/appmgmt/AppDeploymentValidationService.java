@@ -1,7 +1,7 @@
 package com.backend.devsecopsplatform_backend.service.appmgmt;
 
 import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDatabase;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.AppService;
+import com.backend.devsecopsplatform_backend.entity.AppService;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.AppServiceRole;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.ManagedApplication;
 import org.springframework.stereotype.Service;

@@ -14,36 +14,44 @@ import java.util.List;
 @AllArgsConstructor
 public class FindingAiRemediationResponse {
     private String problemSummary;
+    /** Cause racine du problème (pourquoi ça arrive). */
+    private String rootCause;
     private String impact;
+    /** Risque métier (impact business : données, dispo, conformité, image). */
+    private String businessRisk;
     private String location;
+    /** Comment reproduire/observer le problème si pertinent ("" sinon). */
+    private String reproduction;
     @Builder.Default
     private List<String> remediationSteps = new ArrayList<>();
-    /** Diff ou bloc de code suggéré (remplacement de fonction, patch). */
     private String suggestedPatch;
-    /** Si pertinent : exemple de fichier entier corrigé ; peut être vide. */
+    /** Code vulnérable (extrait "avant"). */
+    private String secureCodeBefore;
+    /** Code corrigé (extrait "après"). */
+    private String secureCodeAfter;
     private String fullFileRewrite;
     @Builder.Default
+    private List<String> bestPractices = new ArrayList<>();
+    /** Références officielles (CWE/CVE/OWASP/doc). */
+    @Builder.Default
+    private List<ReferenceItem> references = new ArrayList<>();
+    @Builder.Default
     private List<String> verificationHints = new ArrayList<>();
-    /** Commandes concrètes à lancer (shell, npm, mvn, scanner, CI local…) pour valider le correctif. */
     @Builder.Default
     private List<String> verificationCommands = new ArrayList<>();
-    /** Si le modèle n'a pas respecté le JSON strict. */
+    /** Confiance de l'IA : HIGH | MEDIUM | LOW. */
+    private String confidence;
     private String rawModelOutput;
-    /** MANUAL (collé par l'utilisateur), GITHUB, GITLAB, NONE — origine du contexte code envoyé au modèle. */
     private String codeContextSource;
 
-    /** Provider réellement utilisé pour cet appel (groq | ollama | gemini | huggingface | ...). */
     private String aiProviderUsed;
-    /** Nom/id du modèle réellement utilisé (ex: llama3-70b, deepseek-coder, gemini-1.5-pro...). */
     private String aiModelUsed;
-    /**
-     * Indique si un fallback automatique a été déclenché (ex: quota/429 Groq → Ollama).
-     * Sert à expliquer à l'utilisateur pourquoi le modèle affiché peut changer.
-     */
     private Boolean quotaFallbackUsed;
-    /**
-     * Etiquette simple pour l'UI (ex: HIGH). Demandé pour expliciter le “nouveau modèle” en cas de quota atteint.
-     * Valeurs typiques : DEFAULT | HIGH.
-     */
     private String aiModelTier;
+    /** CACHE | STATIC | GROQ | OPENROUTER | OLLAMA */
+    private String responseSource;
+    /** PENDING | COMPLETE | FAILED — présent si analyse Ollama asynchrone */
+    private String status;
+    /** Identifiant de job pour polling si status=PENDING */
+    private String jobId;
 }

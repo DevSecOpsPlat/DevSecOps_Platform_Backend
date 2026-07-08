@@ -80,7 +80,10 @@ public class SecurityConfig {
                         .requestMatchers("/error", "/projet/error").permitAll()
                         .requestMatchers("/auth/**", "/v3/api-docs/**", "/swagger-ui/**", "/swagger-ui.html").permitAll()
                         .requestMatchers("/projet/auth/**", "/projet/v3/api-docs/**", "/projet/swagger-ui/**", "/projet/swagger-ui.html").permitAll()
-                        // Déploiement : nécessite un JWT (on a besoin du user courant en service)
+                        // Déploiement UI (JWT) ou CI (X-Pipeline-Secret validé dans le controller)
+                        .requestMatchers(HttpMethod.POST, "/api/deploy", "/projet/api/deploy").permitAll()
+                        .requestMatchers(HttpMethod.GET, "/api/deploy/status/**", "/projet/api/deploy/status/**").permitAll()
+                        // Déploiement legacy : autres routes sous /api/deploy si ajoutées plus tard
                         .requestMatchers("/api/deploy/**", "/projet/api/deploy/**").authenticated()
                         // API pipelines (détail, logs, scans) : accès avec ou sans JWT (contrôle métier dans le controller)
                         .requestMatchers("/api/pipelines/**", "/projet/api/pipelines/**").authenticated()
@@ -97,7 +100,9 @@ public class SecurityConfig {
                                 "/api/quality-gate/internal/snapshot",
                                 "/projet/api/quality-gate/internal/snapshot",
                                 "/api/security-gate",
-                                "/projet/api/security-gate").permitAll()
+                                "/projet/api/security-gate",
+                                "/api/knowledge/pipeline-context",
+                                "/projet/api/knowledge/pipeline-context").permitAll()
                         // Quality Gate (recommandation de déploiement par branche)
                         .requestMatchers("/api/quality-gate/**", "/projet/api/quality-gate/**").authenticated()
                         // API Reports (PDF export)

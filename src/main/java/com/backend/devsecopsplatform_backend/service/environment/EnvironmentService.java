@@ -36,6 +36,7 @@ public class EnvironmentService {
     private final PipelineExecutionRepository pipelineExecutionRepository;
     private final PipelineStageSyncService pipelineStageSyncService;
     private final CloudResourceRepository cloudResourceRepository;
+    private final EnvironmentLifecycleService environmentLifecycleService;
 
     @Value("${deployment.preview.nip.enabled:false}")
     private boolean nipPreviewEnabled;
@@ -99,7 +100,7 @@ public class EnvironmentService {
         // 2. Trouver ou créer l'application
         String dockerfilePath = request.getDockerfilePath() != null && !request.getDockerfilePath().isBlank()
                 ? request.getDockerfilePath() : "./Dockerfile";
-        Application app = applicationService
+        AppService app = applicationService
                 .findOrCreateApplicationForDeploy(
                         currentUser,
                         request.getGitRepositoryUrl(),
@@ -112,7 +113,7 @@ public class EnvironmentService {
         String envName = "env-" + UUID.randomUUID().toString().substring(0, 8);
         EphemeralEnvironment env = new EphemeralEnvironment();
         env.setEnvironmentName(envName);
-        env.setApplication(app);
+        env.setService(app);
         env.setGitBranch(request.getBranch());
         env.setRequestedBy(currentUser);
         env.setStatus(EnvironmentStatus.PENDING);
@@ -173,6 +174,9 @@ public class EnvironmentService {
         // 5. Enregistrer l'exécution du pipeline (relation OneToOne)
         PipelineExecution execution = new PipelineExecution();
         execution.setGitlabPipelineId(pipeline.getId());
+        execution.setAppService(app);
+        execution.setExecutionKind(PipelineExecutionKind.DEPLOY);
+        execution.setGitBranch(request.getBranch() != null && !request.getBranch().isBlank() ? request.getBranch() : "main");
         execution.setStatus(com.backend.devsecopsplatform_backend.entity.PipelineStatus
                 .fromGitLabStatus(pipeline.getStatus() != null ? pipeline.getStatus().toString() : "running"));
         execution.setStartedAt(LocalDateTime.now());
@@ -201,14 +205,56 @@ public class EnvironmentService {
      * Enregistre l’URL publique après déploiement (callback GitLab / job pipeline).
      */
     @Transactional
-    public void publishDeploymentPublicUrl(UUID environmentId, String publicUrl) {
-        EphemeralEnvironment env = environmentRepository.findById(environmentId)
-                .orElseThrow(() -> new RuntimeException("Environnement introuvable: " + environmentId));
-        env.setUrl(publicUrl);
-        if (env.getStatus() == EnvironmentStatus.PENDING || env.getStatus() == EnvironmentStatus.BUILDING) {
-            env.setStatus(EnvironmentStatus.RUNNING);
+    public DeployResponse scan(DeployRequest request, AppService application) {
+        getCurrentUser();
+
+        if (request.getGithubToken() != null && !request.getGithubToken().isBlank()) {
+            boolean valid = gitHubValidationService.validateRepository(
+                    request.getGitRepositoryUrl(),
+                    request.getGithubToken()
+            );
+            if (!valid) {
+                throw new RuntimeException("Repository GitHub invalide ou token incorrect");
+            }
         }
-        environmentRepository.save(env);
+
+        String dockerfilePath = request.getDockerfilePath() != null && !request.getDockerfilePath().isBlank()
+                ? request.getDockerfilePath() : "./Dockerfile";
+
+        Pipeline pipeline = gitLabService.triggerScanPipeline(
+                request.getGitRepositoryUrl(),
+                request.getBranch(),
+                application.getId(),
+                dockerfilePath
+        );
+
+        PipelineExecution execution = new PipelineExecution();
+        execution.setGitlabPipelineId(pipeline.getId());
+        execution.setAppService(application);
+        execution.setExecutionKind(PipelineExecutionKind.SCAN);
+        execution.setGitBranch(request.getBranch() != null && !request.getBranch().isBlank() ? request.getBranch() : "main");
+        execution.setStatus(com.backend.devsecopsplatform_backend.entity.PipelineStatus
+                .fromGitLabStatus(pipeline.getStatus() != null ? pipeline.getStatus().toString() : "running"));
+        execution.setStartedAt(LocalDateTime.now());
+        pipelineExecutionRepository.save(execution);
+
+        log.info("✅ Scan lancé — app: {} pipeline: {} (sans environnement éphémère)",
+                application.getId(), pipeline.getId());
+
+        return DeployResponse.builder()
+                .applicationId(application.getId())
+                .gitlabPipelineId(pipeline.getId())
+                .pipelineStatus(pipeline.getStatus() != null ? pipeline.getStatus().toString() : "running")
+                .pipelineWebUrl(pipeline.getWebUrl())
+                .message("Scan de sécurité déclenché. Tag DefectDojo : pipeline-" + pipeline.getId())
+                .build();
+    }
+
+    @Transactional
+    public void publishDeploymentPublicUrl(UUID environmentId, String publicUrl) {
+        environmentRepository.findById(environmentId)
+                .orElseThrow(() -> new RuntimeException("Environnement introuvable: " + environmentId));
+        environmentLifecycleService.onReady(environmentId, publicUrl);
         log.info("🌐 URL déploiement enregistrée pour env {} : {}", environmentId, publicUrl);
     }
 
@@ -227,11 +273,13 @@ public class EnvironmentService {
             result.add(EnvironmentSummaryResponse.builder()
                     .id(e.getId())
                     .environmentName(e.getEnvironmentName())
-                    .gitRepositoryUrl(e.getApplication().getGitRepositoryUrl())
+                    .gitRepositoryUrl(e.getService().getGitRepositoryUrl())
                     .gitBranch(e.getGitBranch())
                     .ttlHours(e.getTtlHours())
                     .status(e.getStatus().name())
-                    .previewUrl(resolveDeploymentPublicUrl(e))
+                    .previewUrl(EnvironmentLifecycleService.publicUrlOrNull(e))
+                    .statusReason(e.getStatusReason())
+                    .terminatedAt(e.getTerminatedAt())
                     .createdAt(e.getCreatedAt())
                     .expiresAt(e.getExpiresAt())
                     .latestPipelineId(pipeline != null ? pipeline.getGitlabPipelineId() : null)
@@ -245,18 +293,20 @@ public class EnvironmentService {
     public List<EnvironmentSummaryResponse> getMyEnvironmentsForApplication(UUID appId) {
         User user = getCurrentUser();
         List<EphemeralEnvironment> list = environmentRepository
-                .findByRequestedByAndApplicationIdWithApplicationAndPipelineOrderByCreatedAtDesc(user, appId);
+                .findByRequestedByAndServiceIdWithServiceAndPipelineOrderByCreatedAtDesc(user, appId);
         List<EnvironmentSummaryResponse> result = new ArrayList<>();
         for (EphemeralEnvironment e : list) {
             PipelineExecution pipeline = e.getPipelineExecution();
             result.add(EnvironmentSummaryResponse.builder()
                     .id(e.getId())
                     .environmentName(e.getEnvironmentName())
-                    .gitRepositoryUrl(e.getApplication().getGitRepositoryUrl())
+                    .gitRepositoryUrl(e.getService().getGitRepositoryUrl())
                     .gitBranch(e.getGitBranch())
                     .ttlHours(e.getTtlHours())
                     .status(e.getStatus().name())
-                    .previewUrl(resolveDeploymentPublicUrl(e))
+                    .previewUrl(EnvironmentLifecycleService.publicUrlOrNull(e))
+                    .statusReason(e.getStatusReason())
+                    .terminatedAt(e.getTerminatedAt())
                     .createdAt(e.getCreatedAt())
                     .expiresAt(e.getExpiresAt())
                     .latestPipelineId(pipeline != null ? pipeline.getGitlabPipelineId() : null)
@@ -402,11 +452,13 @@ public class EnvironmentService {
         return EnvironmentSummaryResponse.builder()
                 .id(e.getId())
                 .environmentName(e.getEnvironmentName())
-                .gitRepositoryUrl(e.getApplication().getGitRepositoryUrl())
+                .gitRepositoryUrl(e.getService().getGitRepositoryUrl())
                 .gitBranch(e.getGitBranch())
                 .ttlHours(e.getTtlHours())
                 .status(e.getStatus().name())
-                .previewUrl(resolveDeploymentPublicUrl(e))
+                .previewUrl(EnvironmentLifecycleService.publicUrlOrNull(e))
+                .statusReason(e.getStatusReason())
+                .terminatedAt(e.getTerminatedAt())
                 .createdAt(e.getCreatedAt())
                 .expiresAt(e.getExpiresAt())
                 .latestPipelineId(pipeline != null ? pipeline.getGitlabPipelineId() : null)

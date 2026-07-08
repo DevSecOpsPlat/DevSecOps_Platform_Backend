@@ -2,9 +2,11 @@ package com.backend.devsecopsplatform_backend.service;
 
 import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
 import com.backend.devsecopsplatform_backend.entity.PipelineStatus;
-import com.backend.devsecopsplatform_backend.entity.EnvironmentStatus;
 import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
+import com.backend.devsecopsplatform_backend.service.environment.EnvironmentLifecycleService;
 import com.backend.devsecopsplatform_backend.service.qualitygate.QualityGateService;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -14,6 +16,7 @@ import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
@@ -33,6 +36,8 @@ public class PipelineStageSyncService {
     private final GitLabService gitLabService;
     private final PipelineExecutionRepository pipelineExecutionRepository;
     private final QualityGateService qualityGateService;
+    private final EnvironmentLifecycleService environmentLifecycleService;
+    private final ObjectMapper objectMapper;
 
     /**
      * Met à jour les stages en base pour un pipeline donné (appel API GitLab puis sauvegarde).
@@ -79,11 +84,40 @@ public class PipelineStageSyncService {
         if (stages == null) {
             return List.of();
         }
-        Object jobs = stages.get("jobs");
-        if (jobs instanceof List) {
-            return (List<Map<String, Object>>) jobs;
+        return parseJobsList(stages.get("jobs"));
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> parseJobsList(Object jobs) {
+        if (jobs == null) {
+            return List.of();
         }
-        return List.of();
+        if (jobs instanceof List<?> list) {
+            List<Map<String, Object>> out = new ArrayList<>();
+            for (Object item : list) {
+                if (item instanceof Map<?, ?> map) {
+                    out.add((Map<String, Object>) map);
+                }
+            }
+            if (!out.isEmpty()) {
+                return out;
+            }
+        }
+        try {
+            List<Map<String, Object>> converted = objectMapper.convertValue(
+                    jobs, new TypeReference<List<Map<String, Object>>>() {});
+            return converted != null ? converted : List.of();
+        } catch (Exception e) {
+            log.warn("Impossible de lire jobs depuis stages_json: {}", e.getMessage());
+            return List.of();
+        }
+    }
+
+    private int countJobsInStages(Map<String, Object> stages) {
+        if (stages == null) {
+            return 0;
+        }
+        return parseJobsList(stages.get("jobs")).size();
     }
 
     /**
@@ -102,7 +136,25 @@ public class PipelineStageSyncService {
 
     private boolean doSync(PipelineExecution execution, Long pipelineId) {
         try {
-            Map<String, Object> summary = gitLabService.getPipelineSummary(pipelineId);
+            Map<String, Object> summary = gitLabService.fetchPipelineSummaryLive(pipelineId);
+
+            Object newJobsObj = summary.get("jobs");
+            int newJobsCount = newJobsObj instanceof List<?> list ? list.size() : 0;
+            int existingJobsCount = countJobsInStages(execution.getStagesJson());
+            // Timeout GitLab → fallback vide : ne pas écraser une vue BDD valide
+            if (newJobsCount == 0) {
+                if (existingJobsCount > 0) {
+                    log.warn("⚠️ Sync pipeline #{} ignorée: GitLab a renvoyé 0 jobs (conservation BDD)", pipelineId);
+                } else {
+                    log.warn("⚠️ Sync pipeline #{} ignorée: GitLab a renvoyé 0 jobs", pipelineId);
+                }
+                return false;
+            }
+            if ("UNKNOWN".equals(summary.get("status")) && existingJobsCount > 0) {
+                log.warn("⚠️ Sync pipeline #{} ignorée: statut UNKNOWN (conservation BDD)", pipelineId);
+                return false;
+            }
+
             Map<String, Object> stagesJson = buildStagesJsonFromSummary(summary);
             execution.setStagesJson(stagesJson);
 
@@ -127,13 +179,11 @@ public class PipelineStageSyncService {
                     execution.setFinishedAt(LocalDateTime.now());
                 }
 
-                // Quand le pipeline est terminé avec succès, considérer l’environnement comme RUNNING
-                // (l’URL est résolue via nip.io ou callback).
-                if (newStatus == PipelineStatus.SUCCESS && execution.getEnvironment() != null) {
-                    var env = execution.getEnvironment();
-                    if (env.getStatus() == EnvironmentStatus.PENDING || env.getStatus() == EnvironmentStatus.BUILDING) {
-                        env.setStatus(EnvironmentStatus.RUNNING);
-                    }
+                // Pipeline CI : seule transition env = FAILED si encore PENDING/BUILDING
+                if (execution.getEnvironment() != null
+                        && (newStatus == PipelineStatus.FAILED || newStatus == PipelineStatus.CANCELED)) {
+                    String reason = buildPipelineFailureReason(summary);
+                    environmentLifecycleService.onPipelineFailed(execution.getEnvironment().getId(), reason);
                 }
             }
 
@@ -172,5 +222,27 @@ public class PipelineStageSyncService {
             }
         }
         return null;
+    }
+
+    @SuppressWarnings("unchecked")
+    private String buildPipelineFailureReason(Map<String, Object> summary) {
+        Object jobsObj = summary.get("jobs");
+        if (jobsObj instanceof List<?> jobs) {
+            for (Object item : jobs) {
+                if (!(item instanceof Map<?, ?> job)) {
+                    continue;
+                }
+                String status = String.valueOf(job.get("status")).toLowerCase();
+                if ("failed".equals(status) || "canceled".equals(status)) {
+                    Object stage = job.get("stage");
+                    if (stage == null || String.valueOf(stage).isBlank()) {
+                        stage = job.get("name");
+                    }
+                    return "Déploiement échoué au stage " + stage;
+                }
+            }
+        }
+        String pipelineStatus = summary.get("status") != null ? String.valueOf(summary.get("status")) : "failed";
+        return "Pipeline en échec (" + pipelineStatus + ")";
     }
 }

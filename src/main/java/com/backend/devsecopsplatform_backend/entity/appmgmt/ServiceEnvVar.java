@@ -1,6 +1,7 @@
 package com.backend.devsecopsplatform_backend.entity.appmgmt;
 
 import com.backend.devsecopsplatform_backend.configuration.AppCryptoConverter;
+import com.backend.devsecopsplatform_backend.entity.AppService;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import jakarta.persistence.*;
 import lombok.AllArgsConstructor;

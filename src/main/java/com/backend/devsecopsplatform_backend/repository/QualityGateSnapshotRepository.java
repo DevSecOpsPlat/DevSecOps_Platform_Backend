@@ -19,6 +19,8 @@ public interface QualityGateSnapshotRepository extends JpaRepository<QualityGate
 
     Optional<QualityGateSnapshot> findByPipelineExecutionId(UUID pipelineExecutionId);
 
+    Optional<QualityGateSnapshot> findByGitlabPipelineId(Long gitlabPipelineId);
+
     java.util.List<QualityGateSnapshot> findAllByApplicationIdAndBranchOrderByCreatedAtDesc(
             UUID applicationId, String branch);
 

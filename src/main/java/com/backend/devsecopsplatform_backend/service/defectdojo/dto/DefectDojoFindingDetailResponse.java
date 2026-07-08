@@ -44,6 +44,8 @@ public class DefectDojoFindingDetailResponse {
 
     private String codeSnippet;
     private String codeContextSource;
+    /** Message UI : chemin conteneur, fallback Dockerfile, etc. */
+    private String codeContextHint;
 
     private UUID applicationId;
 }

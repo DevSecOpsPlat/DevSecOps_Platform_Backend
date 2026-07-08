@@ -10,4 +10,6 @@ import lombok.Data;
 public class FindingAiRemediationRequest {
     /** Extrait de fichier (lignes concernées ou fichier complet si petit). Max appliqué côté serveur. */
     private String codeSnippet;
+    /** Si true : ignore le template statique et envoie un prompt IA complet (Groq/OpenRouter/Ollama). */
+    private boolean deepAnalysis;
 }

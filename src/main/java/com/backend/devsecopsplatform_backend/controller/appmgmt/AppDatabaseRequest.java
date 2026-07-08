@@ -13,7 +13,10 @@ public class AppDatabaseRequest {
     @NotBlank(message = "Le nom de la base est obligatoire")
     private String name;
 
-    @NotNull(message = "La famille de base (SQL/NOSQL) est obligatoire")
+    /**
+     * Optionnel : dérivé de {@link #engine} côté service ({@code engine.family()}).
+     * Conservé pour compatibilité clients existants.
+     */
     private DbFamily dbFamily;
 
     @NotNull(message = "Le moteur est obligatoire")
@@ -25,7 +28,9 @@ public class AppDatabaseRequest {
     @NotBlank(message = "Le nom de la base à créer est obligatoire")
     private String dbName;
 
-    @NotBlank(message = "L'utilisateur root est obligatoire")
+    /**
+     * Optionnel selon le moteur (MySQL/MariaDB/Redis/Cassandra n'utilisent pas ce champ).
+     */
     private String rootUser;
 
     /**

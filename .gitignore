@@ -31,3 +31,6 @@ build/
 
 ### VS Code ###
 .vscode/
+
+### Knowledge (RAG pipeline contexts — generated at runtime) ###
+knowledge/apps/

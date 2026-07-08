@@ -96,8 +96,8 @@ public class User {
     private TwoFactorMethod twoFactorMethod;
 
     @OneToMany(mappedBy = "createdBy", cascade = CascadeType.ALL, orphanRemoval = true)
-    @JsonIgnoreProperties("createdBy") // Évite la boucle avec Application
-    private List<Application> applications = new ArrayList<>();
+    @JsonIgnoreProperties("createdBy")
+    private List<AppService> services = new ArrayList<>();
 
 
     public boolean isActive() {

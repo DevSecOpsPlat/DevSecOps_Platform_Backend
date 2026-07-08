@@ -13,6 +13,8 @@ public class PipelineScanResponse {
     private Long pipelineId;
     private String status;
     private String webUrl;
+    private String ref;
+    private Long durationSeconds;
     private Object jobStatusCount;
     private Object jobs;
     private Map<String, JsonNode> securityReports;

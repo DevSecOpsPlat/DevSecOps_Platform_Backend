@@ -1,8 +1,9 @@
 package com.backend.devsecopsplatform_backend.service.appmgmt;
 
 import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDatabase;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.AppService;
+import com.backend.devsecopsplatform_backend.entity.AppService;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.AppServiceRole;
+import com.backend.devsecopsplatform_backend.entity.appmgmt.DbEngine;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.DbFamily;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.ManagedApplication;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.ServiceEnvVar;
@@ -56,8 +57,11 @@ public class AppK8sManifestService {
         String registryPassword;
         String pullSecretName;     // ex. gitlab-registry
         boolean ingressEnabled;
-        String ingressDomain;      // ex. local → <svc>-<ns>.local
+        String ingressDomain;      // ex. 192.168.130.138.nip.io → app-<ns>.<domain>
+        boolean pathBasedRouting; // true = un hôte /app + chemins /api ; false = hôte par service
         String imageTag;
+        /** Image complète fournie par le pipeline CI (remplace le template CI_REGISTRY_IMAGE). */
+        String resolvedServiceImage;
     }
 
     /**
@@ -107,12 +111,25 @@ public class AppK8sManifestService {
                 docs.add(secret);
             }
             docs.add(serviceDeployment(app, svc, namespace, name, opts));
-            docs.add(serviceClusterIp(svc, namespace, name));
-            if (isExternallyExposed(svc)) {
-                if (opts.isIngressEnabled()) {
-                    docs.add(serviceIngress(svc, namespace, name, opts));
-                } else {
-                    docs.add(serviceNodePort(svc, namespace, name));
+            if (svc.getExposedPort() != null) {
+                docs.add(serviceClusterIp(svc, namespace, name));
+            }
+        }
+        // Exposition externe : un seul Ingress à chemins, ou l'ancien comportement par service.
+        if (opts.isIngressEnabled() && opts.isPathBasedRouting()) {
+            Map<String, Object> ingress = applicationIngress(app, namespace, opts);
+            if (ingress != null) {
+                docs.add(ingress);
+            }
+        } else {
+            for (AppService svc : app.getServices()) {
+                if (isExternallyExposed(svc) && svc.getExposedPort() != null) {
+                    String name = AppNaming.k8sName(svc.getName());
+                    if (opts.isIngressEnabled()) {
+                        docs.add(serviceIngress(svc, namespace, name, opts));
+                    } else {
+                        docs.add(serviceNodePort(svc, namespace, name));
+                    }
                 }
             }
         }
@@ -154,8 +171,8 @@ public class AppK8sManifestService {
         Map<String, Object> m = base("v1", "Secret");
         m.put("metadata", meta(svcName + "-credentials", namespace));
         Map<String, Object> data = new LinkedHashMap<>();
-        // Clés génériques (réutilisées pour l'injection dans les services dépendants).
-        data.put("ROOT_USER", nz(db.getRootUser()));
+        // Utilisateur effectif (MySQL/MariaDB → root), pas la valeur formulaire brute si trompeuse.
+        data.put("ROOT_USER", nz(AppDatabaseRules.effectiveRootUser(db)));
         data.put("ROOT_PASSWORD", nz(db.getRootPassword()));
         data.put("DB_NAME", nz(db.getDbName()));
         data.put(CONNECTION_URL_KEY, nz(connectionUrlService.buildConnectionUrl(db, namespace)));
@@ -184,7 +201,7 @@ public class AppK8sManifestService {
     /** Deployment pour les bases NoSQL (PVC séparé). */
     private Map<String, Object> dbDeployment(AppDatabase db, String namespace, String svcName) {
         int port = dbPort(db);
-        Map<String, Object> container = dbContainer(db, svcName, port);
+        Map<String, Object> container = dbContainer(db, svcName);
         container.put("volumeMounts", List.of(volumeMount(svcName + "-data", dbDataPath(db))));
 
         Map<String, Object> podSpec = new LinkedHashMap<>();
@@ -206,7 +223,7 @@ public class AppK8sManifestService {
     /** StatefulSet pour les bases SQL (volumeClaimTemplates). */
     private Map<String, Object> dbStatefulSet(AppDatabase db, String namespace, String svcName) {
         int port = dbPort(db);
-        Map<String, Object> container = dbContainer(db, svcName, port);
+        Map<String, Object> container = dbContainer(db, svcName);
         container.put("volumeMounts", List.of(volumeMount("data", dbDataPath(db))));
 
         Map<String, Object> podSpec = new LinkedHashMap<>();
@@ -231,18 +248,27 @@ public class AppK8sManifestService {
         return m;
     }
 
-    private Map<String, Object> dbContainer(AppDatabase db, String svcName, int port) {
+    private Map<String, Object> dbContainer(AppDatabase db, String svcName) {
+        int containerListenPort = db.getEngine().defaultPort();
         Map<String, Object> container = new LinkedHashMap<>();
         container.put("name", svcName);
         container.put("image", dbImage(db));
         container.put("imagePullPolicy", "IfNotPresent");
-        container.put("ports", List.of(containerPort(port)));
+        // Toujours le port natif du moteur dans le conteneur.
+        container.put("ports", List.of(containerPort(containerListenPort)));
         List<Map<String, Object>> env = dbEnv(db, svcName + "-credentials");
         if (!env.isEmpty()) {
             container.put("env", env);
         }
-        container.put("readinessProbe", tcpProbe(port, 10, 10));
-        container.put("livenessProbe", tcpProbe(port, 30, 20));
+        if (db.getEngine() == DbEngine.REDIS
+                && db.getRootPassword() != null
+                && !db.getRootPassword().isBlank()) {
+            // Mot de passe via Secret (REDIS_PASSWORD), pas en clair dans le manifest.
+            container.put("command", List.of("sh", "-c"));
+            container.put("args", List.of("exec redis-server --requirepass \"$REDIS_PASSWORD\""));
+        }
+        container.put("readinessProbe", tcpProbe(containerListenPort, 10, 10));
+        container.put("livenessProbe", tcpProbe(containerListenPort, 30, 20));
         container.put("resources", resources("100m", "1000m", "256Mi", "1Gi"));
         return container;
     }
@@ -258,10 +284,12 @@ public class AppK8sManifestService {
                 env.add(envPlain("PGDATA", "/var/lib/postgresql/data/pgdata"));
             }
             case MARIADB -> {
+                // rootUser n'est PAS mappé (pas de MARIADB_USER) — seul le root password l'est.
                 env.add(envFromSecret("MARIADB_ROOT_PASSWORD", secretName, "ROOT_PASSWORD"));
                 env.add(envFromSecret("MARIADB_DATABASE", secretName, "DB_NAME"));
             }
             case MYSQL -> {
+                // rootUser n'est PAS mappé (MYSQL_USER=root ferait échouer l'entrypoint).
                 env.add(envFromSecret("MYSQL_ROOT_PASSWORD", secretName, "ROOT_PASSWORD"));
                 env.add(envFromSecret("MYSQL_DATABASE", secretName, "DB_NAME"));
             }
@@ -270,18 +298,23 @@ public class AppK8sManifestService {
                 env.add(envFromSecret("MONGO_INITDB_ROOT_PASSWORD", secretName, "ROOT_PASSWORD"));
                 env.add(envFromSecret("MONGO_INITDB_DATABASE", secretName, "DB_NAME"));
             }
-            case REDIS, CASSANDRA -> {
-                // Images officielles : démarrage de test sans variable obligatoire.
+            case REDIS -> {
+                // Mot de passe via args --requirepass (voir dbContainer). Secret conservé pour l'URL.
+                env.add(envFromSecret("REDIS_PASSWORD", secretName, "ROOT_PASSWORD"));
+            }
+            case CASSANDRA -> {
+                // Pas d'auth env sur l'image officielle ; keyspace non créé au boot.
             }
         }
         return env;
     }
 
     private Map<String, Object> dbService(AppDatabase db, String namespace, String svcName) {
-        int port = dbPort(db);
+        int servicePort = dbPort(db); // exposedPort (ce que consomment les apps)
+        int targetPort = db.getEngine().defaultPort(); // port réellement écouté dans le conteneur
         Map<String, Object> spec = new LinkedHashMap<>();
         spec.put("selector", Map.of("app", svcName));
-        spec.put("ports", List.of(servicePort(port, port)));
+        spec.put("ports", List.of(servicePort(servicePort, targetPort)));
         spec.put("type", "ClusterIP");
         Map<String, Object> m = base("v1", "Service");
         m.put("metadata", meta(svcName, namespace));
@@ -311,7 +344,7 @@ public class AppK8sManifestService {
 
     private Map<String, Object> serviceDeployment(ManagedApplication app, AppService svc, String namespace,
                                                   String name, ManifestOptions opts) {
-        int port = svc.getExposedPort();
+        Integer port = svc.getExposedPort();
 
         List<Map<String, Object>> env = new ArrayList<>();
         for (ServiceEnvVar var : svc.getEnvVars()) {
@@ -321,31 +354,42 @@ public class AppK8sManifestService {
                 env.add(envPlain(var.getVarKey(), nz(var.getVarValue())));
             }
         }
-        // Injection de l'URL BD via le Secret de la base (jamais en clair dans le Deployment).
-        if (svc.getDependsOnDatabaseId() != null) {
+        // Injection BD : URL (+ user/password hors URL pour les engines JDBC / Cassandra).
+        if (svc.getDependsOnDatabaseId() != null
+                && AppServiceRules.canDependOnDatabase(svc.getRole())) {
             AppDatabase db = findDb(app, svc.getDependsOnDatabaseId());
             if (db != null) {
                 String dbSvc = connectionUrlService.serviceName(db);
-                String envName = (svc.getDbUrlEnvVar() != null && !svc.getDbUrlEnvVar().isBlank())
+                String secret = dbSvc + "-credentials";
+                String urlEnv = (svc.getDbUrlEnvVar() != null && !svc.getDbUrlEnvVar().isBlank())
                         ? svc.getDbUrlEnvVar() : "DATABASE_URL";
-                env.add(envFromSecret(envName, dbSvc + "-credentials", CONNECTION_URL_KEY));
+                env.add(envFromSecret(urlEnv, secret, CONNECTION_URL_KEY));
+                if (AppDatabaseRules.credentialsOutsideUrl(db.getEngine())) {
+                    env.add(envFromSecret("DATABASE_USER", secret, "ROOT_USER"));
+                    env.add(envFromSecret("DATABASE_PASSWORD", secret, "ROOT_PASSWORD"));
+                }
             }
         }
 
         Map<String, Object> container = new LinkedHashMap<>();
         container.put("name", name);
-        container.put("image", serviceImage(svc, opts.getImageTag()));
+        String image = opts.getResolvedServiceImage() != null && !opts.getResolvedServiceImage().isBlank()
+                ? opts.getResolvedServiceImage().trim()
+                : serviceImage(svc, opts.getImageTag());
+        container.put("image", image);
         container.put("imagePullPolicy", "Always");
-        container.put("ports", List.of(containerPort(port)));
+        if (port != null) {
+            container.put("ports", List.of(containerPort(port)));
+            if (svc.getHealthCheckPath() != null && !svc.getHealthCheckPath().isBlank()) {
+                container.put("readinessProbe", httpProbe(svc.getHealthCheckPath(), port, 10, 5));
+                container.put("livenessProbe", httpProbe(svc.getHealthCheckPath(), port, 30, 15));
+            } else {
+                container.put("readinessProbe", tcpProbe(port, 10, 10));
+                container.put("livenessProbe", tcpProbe(port, 30, 20));
+            }
+        }
         if (!env.isEmpty()) {
             container.put("env", env);
-        }
-        if (svc.getHealthCheckPath() != null && !svc.getHealthCheckPath().isBlank()) {
-            container.put("readinessProbe", httpProbe(svc.getHealthCheckPath(), port, 10, 5));
-            container.put("livenessProbe", httpProbe(svc.getHealthCheckPath(), port, 30, 15));
-        } else {
-            container.put("readinessProbe", tcpProbe(port, 10, 10));
-            container.put("livenessProbe", tcpProbe(port, 30, 20));
         }
         container.put("resources", resources(
                 orDefault(svc.getCpuRequest(), "100m"),
@@ -392,7 +436,7 @@ public class AppK8sManifestService {
         }
         if (svc.getDependsOnServiceId() != null) {
             AppService dep = findSvc(app, svc.getDependsOnServiceId());
-            if (dep != null) {
+            if (dep != null && dep.getExposedPort() != null) {
                 String host = AppNaming.k8sName(dep.getName());
                 inits.add(waitForContainer("wait-for-" + host, host, dep.getExposedPort()));
             }
@@ -460,6 +504,72 @@ public class AppK8sManifestService {
         Map<String, Object> m = base("networking.k8s.io/v1", "Ingress");
         Map<String, Object> metadata = meta(name, namespace);
         metadata.put("annotations", Map.of("nginx.ingress.kubernetes.io/rewrite-target", "/"));
+        m.put("metadata", metadata);
+        m.put("spec", spec);
+        return m;
+    }
+
+    /**
+     * Un seul Ingress pour toute l'application. Le service primaire (FRONTEND, ou à défaut
+     * le premier exposé) est monté sur {@code /}. Les autres services exposés reçoivent
+     * un préfixe {@code /<nom>} — même origine, pas de CORS.
+     */
+    private Map<String, Object> applicationIngress(ManagedApplication app, String namespace, ManifestOptions opts) {
+        List<AppService> exposed = app.getServices().stream()
+                .filter(this::isExternallyExposed)
+                .filter(s -> s.getExposedPort() != null)
+                .toList();
+        if (exposed.isEmpty()) {
+            return null;
+        }
+
+        AppService primary = exposed.stream()
+                .filter(s -> s.getRole() == AppServiceRole.FRONTEND)
+                .findFirst()
+                .orElse(exposed.get(0));
+
+        String host = "app-" + namespace + "." + opts.getIngressDomain();
+        List<Map<String, Object>> paths = new ArrayList<>();
+        boolean needsRewrite = false;
+
+        for (AppService svc : exposed) {
+            String name = AppNaming.k8sName(svc.getName());
+            boolean isPrimary = java.util.Objects.equals(svc.getId(), primary.getId());
+
+            Map<String, Object> port = new LinkedHashMap<>();
+            port.put("number", svc.getExposedPort());
+            Map<String, Object> backendService = new LinkedHashMap<>();
+            backendService.put("name", name);
+            backendService.put("port", port);
+            Map<String, Object> backend = new LinkedHashMap<>();
+            backend.put("service", backendService);
+
+            Map<String, Object> path = new LinkedHashMap<>();
+            path.put("path", isPrimary ? "/" : "/" + name + "(/|$)(.*)");
+            path.put("pathType", isPrimary ? "Prefix" : "ImplementationSpecific");
+            path.put("backend", backend);
+            paths.add(path);
+            if (!isPrimary) {
+                needsRewrite = true;
+            }
+        }
+
+        Map<String, Object> http = new LinkedHashMap<>();
+        http.put("paths", paths);
+        Map<String, Object> rule = new LinkedHashMap<>();
+        rule.put("host", host);
+        rule.put("http", http);
+
+        Map<String, Object> spec = new LinkedHashMap<>();
+        spec.put("rules", List.of(rule));
+
+        Map<String, Object> m = base("networking.k8s.io/v1", "Ingress");
+        Map<String, Object> metadata = meta("app-ingress", namespace);
+        if (needsRewrite) {
+            metadata.put("annotations", Map.of(
+                    "nginx.ingress.kubernetes.io/rewrite-target", "/$2",
+                    "nginx.ingress.kubernetes.io/use-regex", "true"));
+        }
         m.put("metadata", metadata);
         m.put("spec", spec);
         return m;

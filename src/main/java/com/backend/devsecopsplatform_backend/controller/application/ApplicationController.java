@@ -2,6 +2,7 @@ package com.backend.devsecopsplatform_backend.controller.application;
 
 
 import com.backend.devsecopsplatform_backend.service.application.ApplicationService;
+import com.backend.devsecopsplatform_backend.service.environment.EnvironmentLifecycleService;
 import com.backend.devsecopsplatform_backend.service.environment.EnvironmentService;
 import com.backend.devsecopsplatform_backend.service.PipelineStageSyncService;
 import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
@@ -145,7 +146,7 @@ public class ApplicationController {
             @RequestParam(name = "size", defaultValue = "50") int size
     ) {
         try {
-            List<EphemeralEnvironment> envs = environmentRepository.findByApplication_Id(id);
+            List<EphemeralEnvironment> envs = environmentRepository.findByService_Id(id);
 
             List<DeploymentHistoryItem> history = envs.stream()
                     .filter(env -> branch == null || branch.isBlank() || branch.equals(env.getGitBranch()))
@@ -185,13 +186,15 @@ public class ApplicationController {
         item.setPipelineId(exec.getGitlabPipelineId());
         item.setPipelineStatus(exec.getStatus() != null ? exec.getStatus().name() : null);
         item.setEnvironmentStatus(env.getStatus() != null ? env.getStatus().name() : null);
+        item.setStatusReason(env.getStatusReason());
+        item.setTerminatedAt(env.getTerminatedAt());
         item.setShortSha(shortSha);
         item.setCommitMessage(null);
         item.setCreatedAt(exec.getCreatedAt());
         item.setFinishedAt(exec.getFinishedAt());
         item.setTriggeredByUsername(env.getRequestedBy() != null ? env.getRequestedBy().getUsername() : null);
         item.setJobs(jobs);
-        item.setDeploymentUrl(environmentService.resolveDeploymentPublicUrl(env));
+        item.setDeploymentUrl(EnvironmentLifecycleService.publicUrlOrNull(env));
         item.setTtlHours(env.getTtlHours());
         item.setExpiresAt(env.getExpiresAt());
         return item;

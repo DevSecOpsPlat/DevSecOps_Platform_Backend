@@ -58,9 +58,8 @@ public interface FindingRepository extends JpaRepository<Finding, UUID> {
             from Finding f
             join FindingOccurrence o on o.finding = f
             join PipelineExecution pe on o.pipelineExecution = pe
-            join EphemeralEnvironment env on pe.environment = env
-            where env.application.id = :appId
-              and (:branch is null or env.gitBranch = :branch)
+            where pe.appService.id = :appId
+              and (:branch is null or pe.gitBranch = :branch)
               and (:tool is null or f.toolName = :tool)
               and (:severity is null or f.severity = :severity)
               and (:scanType is null or f.scanType = :scanType)
@@ -81,9 +80,8 @@ public interface FindingRepository extends JpaRepository<Finding, UUID> {
             from Finding f
             join FindingOccurrence o on o.finding = f
             join PipelineExecution pe on o.pipelineExecution = pe
-            join EphemeralEnvironment env on pe.environment = env
-            where env.application.id = :appId
-              and env.gitBranch = :branch
+            where pe.appService.id = :appId
+              and pe.gitBranch = :branch
               and f.status = :status
               and f.fingerprint not in :currentFingerprints
             """)
@@ -131,8 +129,7 @@ public interface FindingRepository extends JpaRepository<Finding, UUID> {
                   select 1
                   from FindingOccurrence o2
                   join o2.pipelineExecution pe2
-                  join pe2.environment env2
-                  where o2.finding = f and env2.application.id = :appId
+                  where o2.finding = f and pe2.appService.id = :appId
               )
             order by f.updatedAt desc nulls last, f.createdAt desc
             """)

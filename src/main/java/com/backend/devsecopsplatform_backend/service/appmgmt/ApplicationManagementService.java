@@ -2,15 +2,28 @@ package com.backend.devsecopsplatform_backend.service.appmgmt;
 
 import com.backend.devsecopsplatform_backend.controller.appmgmt.*;
 import com.backend.devsecopsplatform_backend.entity.User;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.*;
-import com.backend.devsecopsplatform_backend.repository.*;
+import com.backend.devsecopsplatform_backend.entity.AppService;
+import com.backend.devsecopsplatform_backend.entity.appmgmt.AppServiceRole;
+import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDatabase;
+import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDeployment;
+import com.backend.devsecopsplatform_backend.entity.appmgmt.DbEngine;
+import com.backend.devsecopsplatform_backend.entity.appmgmt.ManagedApplication;
+import com.backend.devsecopsplatform_backend.entity.appmgmt.ServiceEnvVar;
+import com.backend.devsecopsplatform_backend.repository.AppDatabaseRepository;
+import com.backend.devsecopsplatform_backend.repository.AppDeploymentRepository;
+import com.backend.devsecopsplatform_backend.repository.AppServiceRepository;
+import com.backend.devsecopsplatform_backend.repository.ManagedApplicationRepository;
+import com.backend.devsecopsplatform_backend.repository.ServiceEnvVarRepository;
+import com.backend.devsecopsplatform_backend.repository.UserRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -37,6 +50,7 @@ public class ApplicationManagementService {
     private final UserRepository userRepository;
     private final AppConnectionUrlService connectionUrlService;
     private final AppDeploymentService deploymentService;
+    private final ImageTagAvailabilityService imageTagAvailability;
 
     // =====================================================================
     // Applications
@@ -89,7 +103,8 @@ public class ApplicationManagementService {
         validateServiceRequest(app, request, null);
 
         AppService svc = new AppService();
-        svc.setApplication(app);
+        svc.setManagedApplication(app);
+        svc.setCreatedBy(app.getCreatedBy());
         applyServiceScalars(svc, request);
         if (request.getGitToken() != null && !request.getGitToken().isBlank() && !MASK.equals(request.getGitToken())) {
             svc.setGitToken(request.getGitToken());
@@ -102,9 +117,9 @@ public class ApplicationManagementService {
     @Transactional
     public AppServiceResponse updateService(UUID appId, UUID serviceId, AppServiceRequest request) {
         loadOwnedApp(appId);
-        AppService svc = serviceRepository.findByIdAndApplication_Id(serviceId, appId)
+        AppService svc = serviceRepository.findByIdAndManagedApplication_Id(serviceId, appId)
                 .orElseThrow(() -> new AppValidationException("Service introuvable dans cette application."));
-        validateServiceRequest(svc.getApplication(), request, serviceId);
+        validateServiceRequest(svc.getManagedApplication(), request, serviceId);
         applyServiceScalars(svc, request);
         if (request.getGitToken() != null && !request.getGitToken().isBlank() && !MASK.equals(request.getGitToken())) {
             svc.setGitToken(request.getGitToken());
@@ -116,24 +131,50 @@ public class ApplicationManagementService {
     @Transactional
     public void deleteService(UUID appId, UUID serviceId) {
         loadOwnedApp(appId);
-        AppService svc = serviceRepository.findByIdAndApplication_Id(serviceId, appId)
+        AppService svc = serviceRepository.findByIdAndManagedApplication_Id(serviceId, appId)
                 .orElseThrow(() -> new AppValidationException("Service introuvable dans cette application."));
+        if (serviceRepository.countByDependsOnServiceId(serviceId) > 0) {
+            throw new AppValidationException(
+                    "Ce service est référencé par un ou plusieurs autres services. Retirez la dépendance d'abord.");
+        }
         serviceRepository.delete(svc);
     }
 
     private void applyServiceScalars(AppService svc, AppServiceRequest request) {
-        svc.setName(request.getName());
-        svc.setRole(request.getRole());
-        svc.setGitRepositoryUrl(request.getGitRepositoryUrl());
+        AppServiceRole role = request.getRole();
+        svc.setName(request.getName().trim());
+        svc.setRole(role);
+        svc.setGitRepositoryUrl(request.getGitRepositoryUrl().trim());
         svc.setGitBranch(orDefault(request.getGitBranch(), "main"));
         svc.setDockerfilePath(orDefault(request.getDockerfilePath(), "Dockerfile"));
         svc.setBuildContext(orDefault(request.getBuildContext(), "."));
-        svc.setExposedPort(request.getExposedPort());
+
+        if (AppServiceRules.requiresExposedPort(role)) {
+            svc.setExposedPort(request.getExposedPort());
+        } else {
+            svc.setExposedPort(null);
+            svc.setHealthCheckPath(null);
+        }
+
+        if (AppServiceRules.canDependOnDatabase(role)) {
+            svc.setDependsOnDatabaseId(request.getDependsOnDatabaseId());
+            svc.setDbUrlEnvVar(orDefault(request.getDbUrlEnvVar(), "DATABASE_URL"));
+        } else {
+            svc.setDependsOnDatabaseId(null);
+            svc.setDbUrlEnvVar(null);
+        }
+
         svc.setDependsOnServiceId(request.getDependsOnServiceId());
-        svc.setDependsOnDatabaseId(request.getDependsOnDatabaseId());
-        svc.setDbUrlEnvVar(orDefault(request.getDbUrlEnvVar(), "DATABASE_URL"));
         svc.setReplicas(request.getReplicas() != null ? request.getReplicas() : 1);
-        svc.setHealthCheckPath(request.getHealthCheckPath());
+
+        if (AppServiceRules.allowsHealthCheck(role)
+                && request.getHealthCheckPath() != null
+                && !request.getHealthCheckPath().isBlank()) {
+            svc.setHealthCheckPath(request.getHealthCheckPath().trim());
+        } else if (AppServiceRules.requiresExposedPort(role)) {
+            svc.setHealthCheckPath(request.getHealthCheckPath());
+        }
+
         svc.setCpuRequest(orDefault(request.getCpuRequest(), "100m"));
         svc.setCpuLimit(orDefault(request.getCpuLimit(), "500m"));
         svc.setMemoryRequest(orDefault(request.getMemoryRequest(), "128Mi"));
@@ -141,17 +182,85 @@ public class ApplicationManagementService {
     }
 
     private void validateServiceRequest(ManagedApplication app, AppServiceRequest request, UUID selfId) {
+        if (request.getRole() == null) {
+            throw new AppValidationException("Le rôle du service est obligatoire.");
+        }
+        AppServiceRole role = request.getRole();
+
+        String name = request.getName() == null ? "" : request.getName().trim();
+        if (name.isBlank()) {
+            throw new AppValidationException("Le nom du service est obligatoire.");
+        }
+        String k8s = AppNaming.k8sName(name);
+        boolean k8sClash = app.getServices().stream()
+                .filter(s -> selfId == null || !selfId.equals(s.getId()))
+                .anyMatch(s -> AppNaming.k8sName(s.getName()).equals(k8s));
+        if (k8sClash) {
+            throw new AppValidationException(
+                    "Un autre service produit déjà le même nom Kubernetes « " + k8s
+                            + " ». Choisissez un nom distinct après normalisation.");
+        }
+
+        AppServiceRules.assertGitHttpsUrl(request.getGitRepositoryUrl());
+        AppServiceRules.assertRelativePath(request.getDockerfilePath(), "Dockerfile");
+        AppServiceRules.assertRelativePath(request.getBuildContext(), "Contexte de build");
+
+        if (AppServiceRules.requiresExposedPort(role)) {
+            Integer port = request.getExposedPort();
+            if (port == null) {
+                throw new AppValidationException("Le port exposé est obligatoire pour un " + role + ".");
+            }
+            if (port < AppServiceRules.MIN_EXPOSED_PORT || port > AppServiceRules.MAX_EXPOSED_PORT) {
+                throw new AppValidationException(
+                        "Port exposé hors plage (" + AppServiceRules.MIN_EXPOSED_PORT
+                                + "–" + AppServiceRules.MAX_EXPOSED_PORT
+                                + "). Un conteneur non-root ne peut pas binder un port < 1024.");
+            }
+        } else if (request.getExposedPort() != null) {
+            // WORKER : ignorer silencieux côté apply ; on refuse une valeur explicite trompeuse
+            // uniquement si l'utilisateur tente d'exposer — ici on l'efface à applyServiceScalars.
+        }
+
+        int replicas = request.getReplicas() != null ? request.getReplicas() : 1;
+        if (replicas < 1 || replicas > AppServiceRules.MAX_REPLICAS) {
+            throw new AppValidationException(
+                    "Réplicas hors plage (1–" + AppServiceRules.MAX_REPLICAS + ").");
+        }
+
+        AppServiceRules.validateQuantities(
+                orDefault(request.getCpuRequest(), "100m"),
+                orDefault(request.getCpuLimit(), "500m"),
+                orDefault(request.getMemoryRequest(), "128Mi"),
+                orDefault(request.getMemoryLimit(), "512Mi")
+        );
+
+        // --- Dépendance base ---
         if (request.getDependsOnDatabaseId() != null) {
+            if (!AppServiceRules.canDependOnDatabase(role)) {
+                throw new AppValidationException(
+                        "Un FRONTEND ne peut pas dépendre d'une base de données. "
+                                + "Passez par un service BACKEND (évite de livrer des secrets au navigateur).");
+            }
             boolean exists = app.getDatabases().stream()
                     .anyMatch(d -> d.getId().equals(request.getDependsOnDatabaseId()));
             if (!exists) {
-                if (app.getDatabases().isEmpty()) {
-                    throw new AppValidationException(
-                            "Un backend nécessite une base de données. Ajoutez d'abord une base ou retirez la dépendance.");
-                }
                 throw new AppValidationException("La base de données liée n'existe pas dans cette application.");
             }
+            String urlEnv = orDefault(request.getDbUrlEnvVar(), "DATABASE_URL");
+            AppServiceRules.assertEnvVarKey(urlEnv);
+            if (request.getEnvVars() != null) {
+                boolean collision = request.getEnvVars().stream()
+                        .anyMatch(e -> e.getVarKey() != null && urlEnv.equals(e.getVarKey().trim()));
+                if (collision) {
+                    throw new AppValidationException(
+                            "La variable « " + urlEnv
+                                    + " » est réservée à l'injection automatique de l'URL de base. "
+                                    + "Retirez-la des variables manuelles ou changez dbUrlEnvVar.");
+                }
+            }
         }
+
+        // --- Dépendance service ---
         if (request.getDependsOnServiceId() != null) {
             if (selfId != null && request.getDependsOnServiceId().equals(selfId)) {
                 throw new AppValidationException("Un service ne peut pas dépendre de lui-même.");
@@ -162,6 +271,24 @@ public class ApplicationManagementService {
                 throw new AppValidationException("Le service dépendant n'existe pas dans cette application.");
             }
         }
+
+        // Env vars
+        if (request.getEnvVars() != null) {
+            java.util.HashSet<String> seen = new java.util.HashSet<>();
+            for (EnvVarRequest e : request.getEnvVars()) {
+                if (e.getVarKey() == null || e.getVarKey().isBlank()) {
+                    continue;
+                }
+                AppServiceRules.assertEnvVarKey(e.getVarKey());
+                String k = e.getVarKey().trim();
+                if (!seen.add(k)) {
+                    throw new AppValidationException("Clé d'environnement en double : « " + k + " ».");
+                }
+            }
+        }
+
+        // Cycles (avec l'arête en cours)
+        ServiceTopology.assertNoCycle(app, selfId, request.getDependsOnServiceId());
     }
 
     // =====================================================================
@@ -171,13 +298,24 @@ public class ApplicationManagementService {
     @Transactional
     public AppDatabaseResponse addDatabase(UUID appId, AppDatabaseRequest request) {
         ManagedApplication app = loadOwnedApp(appId);
-        validateDatabaseRequest(request);
+        validateDatabaseRequest(request, true);
+
+        String resourceName = request.getName().trim();
+        if (databaseRepository.existsByApplication_IdAndNameIgnoreCase(appId, resourceName)) {
+            throw new AppValidationException(
+                    "Une base avec le nom ressource « " + resourceName + " » existe déjà dans cette application.");
+        }
 
         AppDatabase db = new AppDatabase();
         db.setApplication(app);
         applyDatabaseScalars(db, request);
-        db.setRootPassword(orNull(request.getRootPassword()));
-        return mapDatabase(databaseRepository.save(db));
+        applyRootPasswordOnCreate(db, request);
+        try {
+            return mapDatabase(databaseRepository.saveAndFlush(db));
+        } catch (DataIntegrityViolationException e) {
+            throw new AppValidationException(
+                    "Une base avec ce nom existe déjà dans cette application.");
+        }
     }
 
     @Transactional
@@ -185,13 +323,28 @@ public class ApplicationManagementService {
         loadOwnedApp(appId);
         AppDatabase db = databaseRepository.findByIdAndApplication_Id(databaseId, appId)
                 .orElseThrow(() -> new AppValidationException("Base introuvable dans cette application."));
-        validateDatabaseRequest(request);
+        validateDatabaseRequest(request, false);
+        guardImmutableAfterDeploy(db, request);
+
+        String resourceName = request.getName().trim();
+        if (databaseRepository.existsByApplication_IdAndNameIgnoreCaseAndIdNot(appId, resourceName, databaseId)) {
+            throw new AppValidationException(
+                    "Une autre base utilise déjà le nom ressource « " + resourceName + " ».");
+        }
         applyDatabaseScalars(db, request);
-        if (request.getRootPassword() != null && !request.getRootPassword().isBlank()
+        if (AppDatabaseRules.usesRootPassword(db.getEngine())
+                && request.getRootPassword() != null
+                && !request.getRootPassword().isBlank()
                 && !MASK.equals(request.getRootPassword())) {
+            assertPasswordSafe(request.getRootPassword());
             db.setRootPassword(request.getRootPassword());
         }
-        return mapDatabase(databaseRepository.save(db));
+        try {
+            return mapDatabase(databaseRepository.saveAndFlush(db));
+        } catch (DataIntegrityViolationException e) {
+            throw new AppValidationException(
+                    "Une base avec ce nom existe déjà dans cette application.");
+        }
     }
 
     @Transactional
@@ -206,22 +359,171 @@ public class ApplicationManagementService {
         databaseRepository.delete(db);
     }
 
-    private void applyDatabaseScalars(AppDatabase db, AppDatabaseRequest request) {
-        db.setName(request.getName());
-        db.setDbFamily(request.getDbFamily());
-        db.setEngine(request.getEngine());
-        db.setVersion(request.getVersion());
-        db.setDbName(request.getDbName());
-        db.setRootUser(request.getRootUser());
-        db.setExposedPort(request.getExposedPort() != null ? request.getExposedPort()
-                : request.getEngine().defaultPort());
-        db.setStorageSize(orDefault(request.getStorageSize(), "1Gi"));
+    private void applyRootPasswordOnCreate(AppDatabase db, AppDatabaseRequest request) {
+        DbEngine engine = request.getEngine();
+        if (!AppDatabaseRules.usesRootPassword(engine)) {
+            // Colonne NOT NULL : placeholder interne, jamais utiliséé dans les manifests Cassandra.
+            db.setRootPassword("unused-" + UUID.randomUUID());
+            return;
+        }
+        if (request.getRootPassword() == null || request.getRootPassword().isBlank()) {
+            throw new AppValidationException(
+                    "Le mot de passe est obligatoire pour créer cette base (" + engine + ").");
+        }
+        assertPasswordSafe(request.getRootPassword());
+        db.setRootPassword(request.getRootPassword().trim());
     }
 
-    private void validateDatabaseRequest(AppDatabaseRequest request) {
-        if (request.getEngine().family() != request.getDbFamily()) {
-            throw new AppValidationException("Le moteur « " + request.getEngine()
+    private void applyDatabaseScalars(AppDatabase db, AppDatabaseRequest request) {
+        DbEngine engine = request.getEngine();
+        db.setName(request.getName().trim());
+        db.setEngine(engine);
+        db.setDbFamily(engine.family());
+        db.setVersion(request.getVersion().trim());
+        db.setDbName(AppDatabaseRules.normalizeLogicalDbName(engine, request.getDbName()));
+
+        if (AppDatabaseRules.usesRootUser(engine)) {
+            String user = request.getRootUser() == null ? "" : request.getRootUser().trim();
+            db.setRootUser(user.isEmpty() ? "root" : user);
+        } else {
+            // MySQL/MariaDB : only ROOT_PASSWORD is mapped — keep a sentinel for NOT NULL column.
+            db.setRootUser(request.getRootUser() != null && !request.getRootUser().isBlank()
+                    ? request.getRootUser().trim() : "root");
+        }
+
+        db.setExposedPort(request.getExposedPort() != null ? request.getExposedPort()
+                : engine.defaultPort());
+        db.setStorageSize(orDefault(request.getStorageSize(), "1Gi").trim());
+    }
+
+    private void validateDatabaseRequest(AppDatabaseRequest request, boolean creating) {
+        if (request.getEngine() == null) {
+            throw new AppValidationException("Le moteur est obligatoire.");
+        }
+        DbEngine engine = request.getEngine();
+        if (request.getDbFamily() != null && request.getDbFamily() != engine.family()) {
+            throw new AppValidationException("Le moteur « " + engine
                     + " » n'appartient pas à la famille " + request.getDbFamily() + ".");
+        }
+        if (!AppDatabaseRules.createsLogicalDbAtStartup(engine) && engine == DbEngine.CASSANDRA) {
+            // Keyspace non créé au boot — on accepte la déclaration mais on avertit via message clair
+            // si la longueur/format est mauvais (règles ci-dessous). Un Job CQL pourra suivre.
+        }
+
+        String resourceName = request.getName() == null ? "" : request.getName().trim();
+        if (!AppDatabaseRules.RESOURCE_NAME.matcher(resourceName).matches()) {
+            throw new AppValidationException(
+                    "Nom ressource invalide : minuscules, chiffres et tirets uniquement "
+                            + "(ex. main-db), 2 à 50 caractères, doit commencer et finir par une lettre ou un chiffre.");
+        }
+
+        String logicalRaw = request.getDbName() == null ? "" : request.getDbName().trim();
+        if (!AppDatabaseRules.isValidLogicalDbName(engine, logicalRaw)) {
+            if (engine == DbEngine.REDIS) {
+                throw new AppValidationException(
+                        "Pour Redis, « Index / base logique » doit être un entier entre 0 et 15.");
+            }
+            if (engine == DbEngine.CASSANDRA) {
+                throw new AppValidationException(
+                        "Keyspace Cassandra invalide : minuscules, chiffres, _ ; max 48 caractères "
+                                + "(commence par une lettre). Note : Cassandra ne crée pas le keyspace au démarrage.");
+            }
+            if (AppDatabaseRules.isReservedDbName(engine, logicalRaw)) {
+                throw new AppValidationException(
+                        "Le nom de base « " + logicalRaw + " » est réservé par " + engine + ".");
+            }
+            throw new AppValidationException(
+                    "Nom de base logique invalide : commence par une lettre, puis lettres/chiffres/_ uniquement "
+                            + "(ex. appdb).");
+        }
+
+        if (AppDatabaseRules.usesRootUser(engine)) {
+            String user = request.getRootUser() == null ? "" : request.getRootUser().trim();
+            if (!AppDatabaseRules.ROOT_USER.matcher(user).matches()) {
+                throw new AppValidationException(
+                        "Utilisateur invalide : commence par une lettre ou _, puis lettres/chiffres/_ (2–32 car.).");
+            }
+            if (AppDatabaseRules.isForbiddenRootUser(engine, user)) {
+                throw new AppValidationException(
+                        "Pour MySQL/MariaDB, n'utilisez pas « root » comme utilisateur applicatif "
+                                + "(l'image refuse MYSQL_USER=root).");
+            }
+        }
+
+        String version = request.getVersion() == null ? "" : request.getVersion().trim();
+        if (!AppDatabaseRules.ENGINE_VERSION.matcher(version).matches()) {
+            throw new AppValidationException(
+                    "Version invalide : utilisez un tag d'image numérique (ex. 16, 16.2, 8.4, 10.11).");
+        }
+        ImageTagAvailabilityService.Result tagCheck = imageTagAvailability.check(engine, version);
+        if (tagCheck == ImageTagAvailabilityService.Result.NOT_FOUND) {
+            throw new AppValidationException(
+                    "L'image « " + AppDatabaseRules.imageRef(engine, version)
+                            + " » n'existe pas sur Docker Hub. Vérifiez la version.");
+        }
+
+        String storage = request.getStorageSize() == null || request.getStorageSize().isBlank()
+                ? "1Gi" : request.getStorageSize().trim();
+        if (!AppDatabaseRules.STORAGE_SIZE.matcher(storage).matches()) {
+            throw new AppValidationException(
+                    "Taille de volume invalide : format Kubernetes requis (ex. 512Mi, 1Gi, 10Gi).");
+        }
+        long mib = AppDatabaseRules.storageToMib(storage);
+        if (mib > AppDatabaseRules.MAX_STORAGE_MIB) {
+            throw new AppValidationException(
+                    "Taille de volume trop grande (max " + (AppDatabaseRules.MAX_STORAGE_MIB / 1024) + "Gi).");
+        }
+
+        Integer port = request.getExposedPort();
+        if (port != null && (port < 1 || port > 65535)) {
+            throw new AppValidationException("Le port exposé doit être entre 1 et 65535.");
+        }
+
+        if (creating && AppDatabaseRules.usesRootPassword(engine)) {
+            if (request.getRootPassword() == null || request.getRootPassword().isBlank()) {
+                throw new AppValidationException(
+                        "Le mot de passe est obligatoire pour créer cette base (" + engine + ").");
+            }
+            assertPasswordSafe(request.getRootPassword());
+        } else if (request.getRootPassword() != null && !request.getRootPassword().isBlank()
+                && !MASK.equals(request.getRootPassword())) {
+            assertPasswordSafe(request.getRootPassword());
+        }
+    }
+
+    private void assertPasswordSafe(String pwd) {
+        String p = pwd.trim();
+        if (!AppDatabaseRules.PASSWORD_SAFE.matcher(p).matches()) {
+            throw new AppValidationException(
+                    "Mot de passe invalide : 8–128 caractères ASCII imprimables, sans espace ni contrôle.");
+        }
+    }
+
+    private void guardImmutableAfterDeploy(AppDatabase db, AppDatabaseRequest req) {
+        boolean deployed = db.getGeneratedConnectionUrl() != null && !db.getGeneratedConnectionUrl().isBlank();
+        if (!deployed) {
+            return;
+        }
+        String wantedDb = AppDatabaseRules.normalizeLogicalDbName(req.getEngine(), req.getDbName());
+        String wantedUser = req.getRootUser() == null ? db.getRootUser() : req.getRootUser().trim();
+        if (db.getEngine() != req.getEngine()
+                || !Objects.equals(db.getDbName(), wantedDb)
+                || (AppDatabaseRules.usesRootUser(db.getEngine())
+                && !Objects.equals(db.getRootUser(), wantedUser))) {
+            throw new AppValidationException(
+                    "Moteur, nom de base et utilisateur ne sont plus modifiables une fois la base déployée. "
+                            + "Supprimez la base et recréez-la.");
+        }
+        if (AppDatabaseRules.majorOf(db.getVersion()) != AppDatabaseRules.majorOf(req.getVersion())) {
+            throw new AppValidationException(
+                    "Un changement de version majeure ne peut pas se faire sur un volume existant.");
+        }
+        String wantedStorage = orDefault(req.getStorageSize(), db.getStorageSize()).trim();
+        long current = AppDatabaseRules.storageToMib(db.getStorageSize());
+        long wanted = AppDatabaseRules.storageToMib(wantedStorage);
+        if (wanted < current) {
+            throw new AppValidationException(
+                    "Un volume Kubernetes ne peut pas être réduit (actuel : " + db.getStorageSize() + ").");
         }
     }
 
@@ -231,7 +533,7 @@ public class ApplicationManagementService {
 
     public List<EnvVarResponse> listEnvVars(UUID appId, UUID serviceId) {
         loadOwnedApp(appId);
-        serviceRepository.findByIdAndApplication_Id(serviceId, appId)
+        serviceRepository.findByIdAndManagedApplication_Id(serviceId, appId)
                 .orElseThrow(() -> new AppValidationException("Service introuvable dans cette application."));
         return envVarRepository.findByAppService_Id(serviceId).stream()
                 .map(this::mapEnvVar).collect(Collectors.toList());
@@ -240,7 +542,7 @@ public class ApplicationManagementService {
     @Transactional
     public EnvVarResponse addEnvVar(UUID appId, UUID serviceId, EnvVarRequest request) {
         loadOwnedApp(appId);
-        AppService svc = serviceRepository.findByIdAndApplication_Id(serviceId, appId)
+        AppService svc = serviceRepository.findByIdAndManagedApplication_Id(serviceId, appId)
                 .orElseThrow(() -> new AppValidationException("Service introuvable dans cette application."));
         ServiceEnvVar envVar = new ServiceEnvVar();
         envVar.setAppService(svc);
@@ -253,7 +555,7 @@ public class ApplicationManagementService {
     @Transactional
     public EnvVarResponse updateEnvVar(UUID appId, UUID serviceId, UUID envVarId, EnvVarRequest request) {
         loadOwnedApp(appId);
-        serviceRepository.findByIdAndApplication_Id(serviceId, appId)
+        serviceRepository.findByIdAndManagedApplication_Id(serviceId, appId)
                 .orElseThrow(() -> new AppValidationException("Service introuvable dans cette application."));
         ServiceEnvVar envVar = envVarRepository.findByIdAndAppService_Id(envVarId, serviceId)
                 .orElseThrow(() -> new AppValidationException("Variable introuvable."));
@@ -268,7 +570,7 @@ public class ApplicationManagementService {
     @Transactional
     public void deleteEnvVar(UUID appId, UUID serviceId, UUID envVarId) {
         loadOwnedApp(appId);
-        serviceRepository.findByIdAndApplication_Id(serviceId, appId)
+        serviceRepository.findByIdAndManagedApplication_Id(serviceId, appId)
                 .orElseThrow(() -> new AppValidationException("Service introuvable dans cette application."));
         ServiceEnvVar envVar = envVarRepository.findByIdAndAppService_Id(envVarId, serviceId)
                 .orElseThrow(() -> new AppValidationException("Variable introuvable."));
@@ -309,8 +611,13 @@ public class ApplicationManagementService {
 
     @Transactional
     public AppDeploymentResponse deploy(UUID appId) {
+        return deploy(appId, null);
+    }
+
+    @Transactional
+    public AppDeploymentResponse deploy(UUID appId, ManagedDeployRequest request) {
         ManagedApplication app = loadOwnedApp(appId);
-        AppDeployment deployment = deploymentService.deploy(app);
+        AppDeployment deployment = deploymentService.deploy(app, ManagedDeployOptions.from(request));
         return mapDeployment(deployment, app);
     }
 
@@ -344,7 +651,7 @@ public class ApplicationManagementService {
     public String revealSecret(UUID appId, RevealSecretRequest request) {
         ManagedApplication app = loadOwnedApp(appId);
         String value = switch (request.getType()) {
-            case GIT_TOKEN -> serviceRepository.findByIdAndApplication_Id(request.getTargetId(), appId)
+            case GIT_TOKEN -> serviceRepository.findByIdAndManagedApplication_Id(request.getTargetId(), appId)
                     .map(AppService::getGitToken)
                     .orElseThrow(() -> new AppValidationException("Service introuvable."));
             case DB_PASSWORD -> databaseRepository.findByIdAndApplication_Id(request.getTargetId(), appId)
@@ -353,8 +660,8 @@ public class ApplicationManagementService {
             case ENV_VAR -> {
                 ServiceEnvVar envVar = envVarRepository.findById(request.getTargetId())
                         .orElseThrow(() -> new AppValidationException("Variable introuvable."));
-                if (envVar.getAppService() == null || envVar.getAppService().getApplication() == null
-                        || !envVar.getAppService().getApplication().getId().equals(app.getId())) {
+                if (envVar.getAppService() == null || envVar.getAppService().getManagedApplication() == null
+                        || !envVar.getAppService().getManagedApplication().getId().equals(app.getId())) {
                     throw new AppValidationException("Variable hors de cette application.");
                 }
                 yield envVar.getVarValue();
@@ -426,8 +733,9 @@ public class ApplicationManagementService {
                 .memoryRequest(svc.getMemoryRequest())
                 .memoryLimit(svc.getMemoryLimit())
                 .envVars(envVars)
-                .createdAt(svc.getCreatedAt())
-                .updatedAt(svc.getUpdatedAt())
+                .createdAt(svc.getCreatedAt() != null
+                        ? svc.getCreatedAt().atZone(ZoneId.systemDefault()).toInstant() : null)
+                .updatedAt(null)
                 .build();
     }
 

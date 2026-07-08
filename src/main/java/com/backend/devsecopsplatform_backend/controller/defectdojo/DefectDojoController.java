@@ -4,6 +4,8 @@ import com.backend.devsecopsplatform_backend.controller.finding.FindingAiRemedia
 import com.backend.devsecopsplatform_backend.controller.finding.FindingAiRemediationResponse;
 import com.backend.devsecopsplatform_backend.controller.finding.FindingChatRequest;
 import com.backend.devsecopsplatform_backend.service.AiAnalysisService;
+import com.backend.devsecopsplatform_backend.service.ai.RemediationRequestContext;
+import com.backend.devsecopsplatform_backend.service.ai.StaticRemediationTemplateService;
 import com.backend.devsecopsplatform_backend.service.defectdojo.DefectDojoService;
 import com.backend.devsecopsplatform_backend.service.defectdojo.dto.DefectDojoDashboard2Response;
 import com.backend.devsecopsplatform_backend.service.defectdojo.dto.DefectDojoDashboardCharts;
@@ -33,10 +35,14 @@ public class DefectDojoController {
     @GetMapping("/dashboard2")
     public ResponseEntity<DefectDojoDashboard2Response> dashboard2(
             @RequestParam UUID applicationId,
-            @RequestParam(required = false) String branch
+            @RequestParam(required = false) String branch,
+            @RequestParam(required = false) UUID environmentId,
+            @RequestParam(required = false) Long pipelineId,
+            @RequestParam(defaultValue = "true") boolean scanOnly
     ) {
         try {
-            return ResponseEntity.ok(defectDojoService.getDashboard2(applicationId, branch));
+            return ResponseEntity.ok(defectDojoService.getDashboard2(
+                    applicationId, branch, environmentId, pipelineId, scanOnly));
         } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest().build();
         } catch (Exception e) {
@@ -115,13 +121,56 @@ public class DefectDojoController {
             @RequestParam(defaultValue = "open") String category,
             @RequestParam(required = false) String severity,
             @RequestParam(required = false) String tags,
+            @RequestParam(required = false) String dateFrom,
+            @RequestParam(required = false) String dateTo,
+            @RequestParam(required = false) Integer testId,
             @RequestParam(defaultValue = "0") int page,
             @RequestParam(defaultValue = "25") int size
     ) {
         try {
-            return ResponseEntity.ok(defectDojoService.listFindings(applicationId, branch, category, severity, page, size, tags));
+            return ResponseEntity.ok(defectDojoService.listFindings(
+                    applicationId, branch, category, severity, page, size, tags, dateFrom, dateTo, testId));
         } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest().build();
+        }
+    }
+
+    public record FindingStatusRequest(String action) {}
+
+    @DeleteMapping("/findings/{findingId}")
+    public ResponseEntity<?> deleteFinding(
+            @PathVariable int findingId,
+            @RequestParam UUID applicationId,
+            @RequestParam(required = false) String branch
+    ) {
+        try {
+            defectDojoService.deleteFinding(applicationId, findingId, branch);
+            return ResponseEntity.noContent().build();
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("message", e.getMessage()));
+        } catch (IllegalStateException e) {
+            return ResponseEntity.status(502).body(Map.of("message", e.getMessage()));
+        }
+    }
+
+    @PostMapping("/findings/{findingId}/status")
+    public ResponseEntity<?> updateFindingStatus(
+            @PathVariable int findingId,
+            @RequestParam UUID applicationId,
+            @RequestParam(required = false) String branch,
+            @RequestBody(required = false) FindingStatusRequest request
+    ) {
+        try {
+            if (request == null || request.action() == null || request.action().isBlank()) {
+                return ResponseEntity.badRequest().body(Map.of("message", "Action requise"));
+            }
+            var action = DefectDojoService.FindingAction.valueOf(request.action().toUpperCase());
+            return ResponseEntity.ok(defectDojoService.updateFindingStatus(applicationId, findingId, branch, action));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of(
+                    "message", "Action invalide ou finding introuvable : " + e.getMessage()));
+        } catch (IllegalStateException e) {
+            return ResponseEntity.status(502).body(Map.of("message", e.getMessage()));
         }
     }
 
@@ -157,8 +206,23 @@ public class DefectDojoController {
             codeContextSource = detail.getCodeContextSource() != null ? detail.getCodeContextSource() : "REPO";
         }
         String ctx = defectDojoService.buildAiContext(detail);
-        FindingAiRemediationResponse out = aiAnalysisService.analyzeFindingRemediation(ctx, snippet);
+        boolean deepAnalysis = request != null && request.isDeepAnalysis();
+        RemediationRequestContext reqCtx = new RemediationRequestContext(
+                StaticRemediationTemplateService.extractRuleKey(ctx),
+                detail.getFilePath(),
+                detail.getLine(),
+                deepAnalysis
+        );
+        FindingAiRemediationResponse out = aiAnalysisService.analyzeFindingRemediation(
+                applicationId, branch, ctx, snippet, reqCtx);
         return ResponseEntity.ok(out.toBuilder().codeContextSource(codeContextSource).build());
+    }
+
+    @GetMapping("/ai-remediation/jobs/{jobId}")
+    public ResponseEntity<FindingAiRemediationResponse> pollAiRemediationJob(@PathVariable String jobId) {
+        return aiAnalysisService.pollRemediationJob(jobId)
+                .map(ResponseEntity::ok)
+                .orElse(ResponseEntity.notFound().build());
     }
 
     @PostMapping("/findings/{findingId}/ai-chat")
@@ -172,6 +236,7 @@ public class DefectDojoController {
         String ctx = defectDojoService.buildAiContext(detail);
         String snippet = detail.getCodeSnippet() != null ? detail.getCodeSnippet() : "";
         String reply = aiAnalysisService.chatAboutFinding(
+                applicationId, branch,
                 ctx,
                 request.getRemediationSummary(),
                 snippet,

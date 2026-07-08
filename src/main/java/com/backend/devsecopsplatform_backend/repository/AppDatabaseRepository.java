@@ -14,4 +14,8 @@ public interface AppDatabaseRepository extends JpaRepository<AppDatabase, UUID> 
     List<AppDatabase> findByApplication_Id(UUID applicationId);
 
     Optional<AppDatabase> findByIdAndApplication_Id(UUID id, UUID applicationId);
+
+    boolean existsByApplication_IdAndNameIgnoreCase(UUID applicationId, String name);
+
+    boolean existsByApplication_IdAndNameIgnoreCaseAndIdNot(UUID applicationId, String name, UUID id);
 }

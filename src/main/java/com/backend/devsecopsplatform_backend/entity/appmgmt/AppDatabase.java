@@ -17,9 +17,13 @@ import java.util.UUID;
  * plateforme depuis une image officielle + volume persistant + Secret credentials.
  */
 @Entity
-@Table(name = "app_database", indexes = {
-        @Index(name = "idx_appdb_application", columnList = "application_id")
-})
+@Table(name = "app_database",
+        uniqueConstraints = {
+                @UniqueConstraint(name = "uk_appdb_app_name", columnNames = {"application_id", "name"})
+        },
+        indexes = {
+                @Index(name = "idx_appdb_application", columnList = "application_id")
+        })
 @Data
 @NoArgsConstructor
 @AllArgsConstructor

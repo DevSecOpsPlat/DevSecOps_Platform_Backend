@@ -3,6 +3,8 @@ package com.backend.devsecopsplatform_backend.controller.pipeline;
 import com.backend.devsecopsplatform_backend.controller.environment.PipelineScanResponse;
 import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
 import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
+import com.backend.devsecopsplatform_backend.entity.PipelineExecutionKind;
+import com.backend.devsecopsplatform_backend.repository.AppServiceRepository;
 import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
 import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
 import com.backend.devsecopsplatform_backend.repository.UserRepository;
@@ -24,6 +26,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
@@ -36,6 +39,7 @@ public class PipelineController {
 
     private final EphemeralEnvironmentRepository environmentRepository;
     private final PipelineExecutionRepository pipelineExecutionRepository;
+    private final AppServiceRepository appServiceRepository;
     private final UserRepository userRepository;
     private final GitLabService gitLabService;
     private final PipelineStageSyncService pipelineStageSyncService;
@@ -65,7 +69,7 @@ public class PipelineController {
         Map<String, Object> response = new HashMap<>();
         response.put("type", "pipeline");
         response.put("id", latest.getGitlabPipelineId());
-        response.put("environmentId", latest.getEnvironment().getId());
+        response.put("environmentId", latest.getEnvironment() != null ? latest.getEnvironment().getId() : null);
         response.put("createdAt", latest.getCreatedAt());
 
         return ResponseEntity.ok(response);
@@ -80,14 +84,27 @@ public class PipelineController {
     @GetMapping
     public ResponseEntity<List<Map<String, Object>>> listPipelines(
             @RequestParam(defaultValue = "0") int page,
-            @RequestParam(defaultValue = "10") int size) {
+            @RequestParam(defaultValue = "50") int size,
+            @RequestParam(required = false) UUID applicationId,
+            @RequestParam(required = false) String executionKind
+    ) {
 
         var user = getCurrentUser();
-        List<EphemeralEnvironment> envs = environmentRepository.findMyEnvironments(user);
+        PipelineExecutionKind kindFilter = null;
+        if (executionKind != null && !executionKind.isBlank()) {
+            try {
+                kindFilter = PipelineExecutionKind.valueOf(executionKind.trim().toUpperCase());
+            } catch (IllegalArgumentException ignored) {
+                kindFilter = null;
+            }
+        }
 
-        // BDD-first: ne pas appeler GitLab ici (sinon 100+ pipelines => énorme latence)
         List<PipelineExecution> executions = pipelineExecutionRepository
-                .findByEnvironmentInOrderByCreatedAtDesc(envs, PageRequest.of(page, Math.min(size, 50)));
+                .findByUserAndFiltersOrderByCreatedAtDesc(
+                        user,
+                        applicationId,
+                        kindFilter,
+                        PageRequest.of(page, Math.min(Math.max(size, 1), 200)));
 
         List<Map<String, Object>> result = executions.stream()
                 .map(this::buildPipelineResponseFromDb)
@@ -100,9 +117,21 @@ public class PipelineController {
         Map<String, Object> map = new HashMap<>();
         EphemeralEnvironment env = execution.getEnvironment();
 
-        map.put("environmentId", env.getId());
-        map.put("environmentName", env.getEnvironmentName());
-        map.put("gitBranch", env.getGitBranch());
+        map.put("applicationId", execution.getAppService() != null ? execution.getAppService().getId() : null);
+        map.put("serviceName", execution.getAppService() != null ? execution.getAppService().getName() : null);
+        map.put("environmentId", env != null ? env.getId() : null);
+        if (env != null) {
+            map.put("environmentName", env.getEnvironmentName());
+        } else if (execution.getExecutionKind() == PipelineExecutionKind.SCAN
+                && execution.getGitlabPipelineId() != null) {
+            map.put("environmentName", "Scan #" + execution.getGitlabPipelineId());
+        } else if (execution.getExecutionKind() == PipelineExecutionKind.DEPLOY) {
+            map.put("environmentName", "Deploy #" + execution.getGitlabPipelineId());
+        } else {
+            map.put("environmentName", null);
+        }
+        map.put("gitBranch", execution.getGitBranch());
+        map.put("executionKind", execution.getExecutionKind() != null ? execution.getExecutionKind().name() : null);
         map.put("pipelineId", execution.getGitlabPipelineId());
         map.put("pipelineStatus", execution.getStatus().name());
         map.put("createdAt", execution.getCreatedAt());
@@ -207,16 +236,27 @@ public class PipelineController {
             Object jobs = latest.getStagesJson() != null
                     ? pipelineStageSyncService.getJobsFromStagesJson(latest)
                     : List.<Map<String, Object>>of();
+            if (jobs instanceof List<?> jobList && jobList.isEmpty()
+                    && latest.getStagesJson() != null
+                    && latest.getStagesJson().get("totalJobs") instanceof Number n
+                    && n.intValue() > 0) {
+                log.warn("⚠️ stages_json indique {} jobs mais extraction renvoie 0 (env {})",
+                        n.intValue(), envId);
+            }
             Object jobStatusCount = latest.getStagesJson() != null
                     ? pipelineStageSyncService.getJobStatusCountFromStagesJson(latest)
                     : Map.of(latest.getStatus().name(), 1L);
             if (jobStatusCount instanceof Map && ((Map<?, ?>) jobStatusCount).isEmpty()) {
                 jobStatusCount = Map.of(latest.getStatus().name(), 1L);
             }
+            Map<String, Object> stages = latest.getStagesJson();
+            Object duration = stages != null ? stages.get("duration") : null;
             return ResponseEntity.ok(PipelineScanResponse.builder()
                     .pipelineId(pipelineId)
-                    .status(latest.getStagesJson() != null ? (String) latest.getStagesJson().get("status") : latest.getStatus().name())
-                    .webUrl(latest.getStagesJson() != null ? (String) latest.getStagesJson().get("webUrl") : null)
+                    .status(stages != null ? (String) stages.get("status") : latest.getStatus().name())
+                    .webUrl(stages != null ? (String) stages.get("webUrl") : null)
+                    .ref(stages != null ? (String) stages.get("ref") : null)
+                    .durationSeconds(duration instanceof Number num ? num.longValue() : null)
                     .jobStatusCount(jobStatusCount)
                     .jobs(jobs)
                     .securityReports(Map.of())
@@ -284,14 +324,24 @@ public class PipelineController {
     @GetMapping("/by-id/{pipelineId}")
     public ResponseEntity<PipelineScanResponse> getByPipelineId(
             @PathVariable Long pipelineId,
+            @RequestParam(name = "applicationId", required = false) UUID applicationId,
             @RequestParam(name = "includeReports", defaultValue = "false") boolean includeReports,
             @RequestParam(name = "refresh", defaultValue = "false") boolean refresh
     ) {
         var user = getCurrentUser();
-        PipelineExecution execution = pipelineExecutionRepository.findByGitlabPipelineId(pipelineId)
-                .orElseThrow(() -> new RuntimeException("Pipeline inconnu"));
+        Optional<PipelineExecution> executionOpt = pipelineExecutionRepository.findByGitlabPipelineId(pipelineId);
 
-        if (!execution.getEnvironment().getRequestedBy().getId().equals(user.getId())) {
+        if (executionOpt.isEmpty()) {
+            if (applicationId == null) {
+                return ResponseEntity.badRequest().build();
+            }
+            appServiceRepository.findByIdAndCreatedBy(applicationId, user)
+                    .orElseThrow(() -> new RuntimeException("Application introuvable ou accès refusé"));
+            return ResponseEntity.ok(fetchPipelineLiveFromGitLab(pipelineId, includeReports, refresh));
+        }
+
+        PipelineExecution execution = executionOpt.get();
+        if (!canAccessExecution(execution, user)) {
             return ResponseEntity.status(403).build();
         }
 
@@ -385,12 +435,12 @@ public class PipelineController {
         try {
             JsonNode report = gitLabService.getScanResults(jobId);
             if (report == null) {
-                return ResponseEntity.notFound().build();
+                return ResponseEntity.noContent().build();
             }
             return ResponseEntity.ok(report);
         } catch (Exception e) {
             log.error("❌ Erreur récupération scan results job {}: {}", jobId, e.getMessage());
-            return ResponseEntity.notFound().build();
+            return ResponseEntity.noContent().build();
         }
     }
 
@@ -403,7 +453,7 @@ public class PipelineController {
         var user = getCurrentUser();
         PipelineExecution execution = pipelineExecutionRepository.findByGitlabPipelineId(pipelineId)
                 .orElseThrow(() -> new RuntimeException("Pipeline inconnu"));
-        if (!execution.getEnvironment().getRequestedBy().getId().equals(user.getId())) {
+        if (!canAccessExecution(execution, user)) {
             return ResponseEntity.status(403).build();
         }
         try {
@@ -432,7 +482,7 @@ public class PipelineController {
             Long pipelineId = job.getPipeline().getId();
             PipelineExecution execution = pipelineExecutionRepository.findByGitlabPipelineId(pipelineId)
                     .orElseThrow(() -> new RuntimeException("Pipeline inconnu"));
-            if (!execution.getEnvironment().getRequestedBy().getId().equals(user.getId())) {
+            if (!canAccessExecution(execution, user)) {
                 return ResponseEntity.status(403).build();
             }
             gitLabService.retryJob(jobId);
@@ -461,21 +511,20 @@ public class PipelineController {
         PipelineExecution execution = pipelineExecutionRepository.findByGitlabPipelineId(pipelineId)
                 .orElseThrow(() -> new RuntimeException("Pipeline inconnu"));
 
-        if (!execution.getEnvironment().getRequestedBy().getId().equals(user.getId())) {
+        if (!canAccessExecution(execution, user)) {
             return ResponseEntity.status(403).build();
         }
-
-        EphemeralEnvironment env = execution.getEnvironment();
 
         try {
             // Supprimer le pipeline
             pipelineExecutionRepository.delete(execution);
             log.info("✅ Pipeline {} supprimé", pipelineId);
 
-            // 🔥 CORRECTION: Un environnement = Un pipeline
-            // Donc on supprime TOUJOURS l'environnement quand on supprime son pipeline
-            environmentRepository.delete(env);
-            log.info("✅ Environnement {} supprimé (associé au pipeline)", env.getId());
+            EphemeralEnvironment env = execution.getEnvironment();
+            if (env != null) {
+                environmentRepository.delete(env);
+                log.info("✅ Environnement {} supprimé (associé au pipeline)", env.getId());
+            }
 
             return ResponseEntity.noContent().build();
 
@@ -483,6 +532,44 @@ public class PipelineController {
             log.error("❌ Erreur suppression pipeline: {}", e.getMessage());
             return ResponseEntity.internalServerError().build();
         }
+    }
+
+    private PipelineScanResponse fetchPipelineLiveFromGitLab(
+            Long pipelineId,
+            boolean includeReports,
+            boolean refresh
+    ) {
+        if (refresh) {
+            try {
+                pipelineStageSyncService.syncStagesForPipeline(pipelineId);
+            } catch (Exception e) {
+                log.debug("Sync GitLab ignorée pour pipeline {}: {}", pipelineId, e.getMessage());
+            }
+        }
+        Map<String, Object> summary = gitLabService.getPipelineSummary(pipelineId);
+        Map<String, JsonNode> reports = includeReports
+                ? gitLabService.getAllSecurityReports(pipelineId)
+                : Map.of();
+        return PipelineScanResponse.builder()
+                .pipelineId(pipelineId)
+                .status((String) summary.get("status"))
+                .webUrl((String) summary.get("webUrl"))
+                .jobStatusCount(summary.get("jobStatusCount"))
+                .jobs(summary.get("jobs"))
+                .ref((String) summary.get("ref"))
+                .securityReports(reports)
+                .dataSource("gitlab")
+                .build();
+    }
+
+    private boolean canAccessExecution(PipelineExecution execution, com.backend.devsecopsplatform_backend.entity.User user) {
+        if (execution == null || user == null) {
+            return false;
+        }
+        if (execution.getAppService() == null || execution.getAppService().getCreatedBy() == null) {
+            return false;
+        }
+        return execution.getAppService().getCreatedBy().getId().equals(user.getId());
     }
 }
 

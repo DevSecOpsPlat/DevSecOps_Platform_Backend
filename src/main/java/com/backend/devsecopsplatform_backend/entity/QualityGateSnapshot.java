@@ -36,7 +36,8 @@ public class QualityGateSnapshot {
     @Column(name = "application_id", nullable = false)
     private UUID applicationId;
 
-    @Column(name = "environment_id", nullable = false)
+    /** Null pour les pipelines scan (sans environnement éphémère). */
+    @Column(name = "environment_id", nullable = true)
     private UUID environmentId;
 
     @Column(name = "pipeline_execution_id", nullable = false, unique = true)

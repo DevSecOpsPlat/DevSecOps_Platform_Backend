@@ -4,7 +4,7 @@ import com.backend.devsecopsplatform_backend.controller.admin.CreateUserRequest;
 import com.backend.devsecopsplatform_backend.controller.admin.CreateUserResponse;
 import com.backend.devsecopsplatform_backend.dto.complaint.ComplaintApiDto;
 import com.backend.devsecopsplatform_backend.entity.AccountStatus;
-import com.backend.devsecopsplatform_backend.entity.Application;
+import com.backend.devsecopsplatform_backend.entity.AppService;
 import com.backend.devsecopsplatform_backend.entity.EnvironmentStatus;
 import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
 import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
@@ -14,10 +14,11 @@ import com.backend.devsecopsplatform_backend.entity.User;
 import com.backend.devsecopsplatform_backend.entity.AuditAction;
 import com.backend.devsecopsplatform_backend.entity.UserActivityLog;
 import com.backend.devsecopsplatform_backend.entity.UserActivityType;
-import com.backend.devsecopsplatform_backend.repository.ApplicationRepository;
+import com.backend.devsecopsplatform_backend.repository.AppServiceRepository;
 import com.backend.devsecopsplatform_backend.repository.ComplaintRepository;
 import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
 import com.backend.devsecopsplatform_backend.repository.LoginAttemptRepository;
+import com.backend.devsecopsplatform_backend.repository.ManagedApplicationRepository;
 import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
 import com.backend.devsecopsplatform_backend.repository.UserActivityLogRepository;
 import com.backend.devsecopsplatform_backend.repository.UserRepository;
@@ -60,7 +61,8 @@ public class AdminUserService {
     private final UserRepository userRepository;
     private final EphemeralEnvironmentRepository ephemeralEnvironmentRepository;
     private final PipelineExecutionRepository pipelineExecutionRepository;
-    private final ApplicationRepository applicationRepository;
+    private final AppServiceRepository applicationRepository;
+    private final ManagedApplicationRepository managedApplicationRepository;
     private final UserActivityLogRepository activityLogRepository;
     private final ComplaintRepository complaintRepository;
     private final LoginAttemptRepository loginAttemptRepository;
@@ -177,15 +179,24 @@ public class AdminUserService {
         activityLogRepository.deleteAll(activityLogRepository.findByUserOrderByCreatedAtDesc(user));
         complaintRepository.deleteAll(complaintRepository.findByAuthorWithMessages(user));
 
-        List<Application> applications = applicationRepository.findByCreatedByOrderByCreatedAtDesc(user);
-        if (!applications.isEmpty()) {
-            applicationRepository.deleteAll(applications);
+        // 1. Environnements d'abord (FK vers app_service)
+        List<EphemeralEnvironment> envs =
+                ephemeralEnvironmentRepository.findByRequestedByOrderByCreatedAtDesc(user);
+        if (!envs.isEmpty()) {
+            ephemeralEnvironmentRepository.deleteAll(envs);
         }
 
-        List<EphemeralEnvironment> remainingEnvs =
-                ephemeralEnvironmentRepository.findByRequestedByOrderByCreatedAtDesc(user);
-        if (!remainingEnvs.isEmpty()) {
-            ephemeralEnvironmentRepository.deleteAll(remainingEnvs);
+        // 2. Projets (cascade → services liés, databases, deployments)
+        List<com.backend.devsecopsplatform_backend.entity.appmgmt.ManagedApplication> projects =
+                managedApplicationRepository.findByCreatedByOrderByCreatedAtDesc(user);
+        if (!projects.isEmpty()) {
+            managedApplicationRepository.deleteAll(projects);
+        }
+
+        // 3. Services orphelins (sans projet parent)
+        List<AppService> orphanServices = applicationRepository.findByCreatedByOrderByCreatedAtDesc(user);
+        if (!orphanServices.isEmpty()) {
+            applicationRepository.deleteAll(orphanServices);
         }
 
         userRepository.delete(user);
@@ -381,7 +392,7 @@ public class AdminUserService {
                 : u.getRoles().stream().map(Role::name).toList();
 
         List<EphemeralEnvironment> envs =
-                ephemeralEnvironmentRepository.findByRequestedByWithApplicationAndPipelineOrderByCreatedAtDesc(u);
+                ephemeralEnvironmentRepository.findByRequestedByWithServiceAndPipelineOrderByCreatedAtDesc(u);
 
         AdminPipelineCounts globalPipelineCounts =
                 buildPipelineCounts(pipelineExecutionRepository.countByUserGroupByStatus(u));
@@ -390,9 +401,9 @@ public class AdminUserService {
                 buildApplicationPipelineCountsMap(pipelineExecutionRepository.countByUserGroupByApplicationAndStatus(u));
 
         Map<UUID, Long> envCountByAppId = envs.stream()
-                .collect(Collectors.groupingBy(e -> e.getApplication().getId(), Collectors.counting()));
+                .collect(Collectors.groupingBy(e -> e.getService().getId(), Collectors.counting()));
 
-        List<Application> appList = applicationRepository.findByCreatedByOrderByCreatedAtDesc(u);
+        List<AppService> appList = applicationRepository.findByCreatedByOrderByCreatedAtDesc(u);
         List<AdminUserApplicationDetail> appDetails = appList.stream()
                 .map(app -> new AdminUserApplicationDetail(
                         app.getId(),
@@ -434,7 +445,7 @@ public class AdminUserService {
     }
 
     private AdminUserEnvironmentDetail toEnvironmentDetail(EphemeralEnvironment e) {
-        Application app = e.getApplication();
+        AppService app = e.getService();
         PipelineExecution pe = e.getPipelineExecution();
         return new AdminUserEnvironmentDetail(
                 e.getId(),
