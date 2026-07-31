@@ -1295,18 +1295,17 @@ public class AppDeploymentService {
     }
 
     private void putBackendUrlIfConfigured(Map<String, String> variables) {
-        if (isPublicCallbackBaseUrl(callbackBaseUrl)) {
+        if (isReachableCallbackBaseUrl(callbackBaseUrl)) {
             variables.put("BACKEND_URL", callbackBaseUrl.trim());
         }
     }
 
-    private static boolean isPublicCallbackBaseUrl(String url) {
+    private static boolean isReachableCallbackBaseUrl(String url) {
         if (url == null || url.isBlank()) {
             return false;
         }
         String normalized = url.trim().toLowerCase();
-        return !normalized.contains("host.docker.internal")
-                && !normalized.contains("localhost")
+        return !normalized.contains("localhost")
                 && !normalized.startsWith("http://127.")
                 && !normalized.startsWith("https://127.");
     }
