@@ -107,6 +107,13 @@ public class AppService {
     @Column(name = "health_check_path", length = 255)
     private String healthCheckPath;
 
+    /**
+     * Chemin métier interne du service (ex. {@code /projet} pour Spring context-path).
+     * Publicement le backend reste exposé sous {@code /api} ; Traefik réécrit vers ce chemin.
+     */
+    @Column(name = "context_path", length = 120)
+    private String contextPath;
+
     @Column(name = "cpu_request", length = 20)
     private String cpuRequest;
 

@@ -14,6 +14,8 @@ public class ManagedAppResponse {
     private String name;
     private String slug;
     private String description;
+    /** Hostname Ingress custom (null = nip.io). */
+    private String customHostname;
     private String createdByUsername;
     private Instant createdAt;
     private Instant updatedAt;

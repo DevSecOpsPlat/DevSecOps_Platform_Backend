@@ -153,6 +153,49 @@ public class EmailService {
         }
     }
 
+    /**
+     * E-mail texte libre (alertes runtime, notifications opérationnelles).
+     */
+    public EmailSendResult sendPlainText(String toEmail, String subject, String body) {
+        String recipient = normalizeEmail(toEmail);
+        if (!EMAIL.matcher(recipient).matches()) {
+            String reason = "Adresse destinataire invalide : " + recipient;
+            log.error(reason);
+            return EmailSendResult.notSent("", recipient, reason);
+        }
+        if (!mailEnabled) {
+            String reason = "SMTP désactivé (app.mail.enabled=false).";
+            log.warn("{} — destinataire : {} — sujet : {}", reason, recipient, subject);
+            return EmailSendResult.notSent("", recipient, reason);
+        }
+        if (!StringUtils.hasText(mailPassword)) {
+            String reason = "Variable PASSSMTP vide.";
+            log.error("{} — destinataire : {}", reason, recipient);
+            return EmailSendResult.notSent("", recipient, reason);
+        }
+        if (mailSender == null) {
+            String reason = "Serveur SMTP non configuré.";
+            log.error("{} — destinataire : {}", reason, recipient);
+            return EmailSendResult.notSent("", recipient, reason);
+        }
+        try {
+            MimeMessage mime = mailSender.createMimeMessage();
+            MimeMessageHelper helper = new MimeMessageHelper(mime, false, "UTF-8");
+            helper.setFrom(new InternetAddress(mailFrom.trim(), "EnviroTest", "UTF-8"));
+            helper.setTo(new InternetAddress(recipient));
+            helper.setReplyTo(mailFrom.trim());
+            helper.setSubject(subject != null ? subject : "Alerte EnviroTest");
+            helper.setText(body != null ? body : "", false);
+            mailSender.send(mime);
+            log.info("E-mail plain envoyé — destinataire: {} | sujet: {}", recipient, subject);
+            return EmailSendResult.sent("", recipient);
+        } catch (Exception e) {
+            String reason = friendlySmtpError(e);
+            log.error("Échec envoi e-mail plain — destinataire: {} — {}", recipient, reason, e);
+            return EmailSendResult.notSent("", recipient, reason);
+        }
+    }
+
     private String normalizeEmail(String email) {
         return email == null ? "" : email.trim().toLowerCase();
     }

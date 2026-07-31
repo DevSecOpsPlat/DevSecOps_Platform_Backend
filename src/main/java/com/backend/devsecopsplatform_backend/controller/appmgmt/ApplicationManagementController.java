@@ -5,6 +5,7 @@ import com.backend.devsecopsplatform_backend.service.appmgmt.AppValidationExcept
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
@@ -73,10 +74,7 @@ public class ApplicationManagementController {
 
     @DeleteMapping("/{id}/services/{sid}")
     public ResponseEntity<?> deleteService(@PathVariable UUID id, @PathVariable UUID sid) {
-        return handle(() -> {
-            service.deleteService(id, sid);
-            return ResponseEntity.noContent().build();
-        });
+        return handle(() -> ResponseEntity.ok(service.deleteService(id, sid)));
     }
 
     // ---------- Databases ----------
@@ -94,10 +92,7 @@ public class ApplicationManagementController {
 
     @DeleteMapping("/{id}/databases/{dbid}")
     public ResponseEntity<?> deleteDatabase(@PathVariable UUID id, @PathVariable UUID dbid) {
-        return handle(() -> {
-            service.deleteDatabase(id, dbid);
-            return ResponseEntity.noContent().build();
-        });
+        return handle(() -> ResponseEntity.ok(service.deleteDatabase(id, dbid)));
     }
 
     // ---------- Env vars ----------
@@ -149,6 +144,89 @@ public class ApplicationManagementController {
     @DeleteMapping("/{id}/deployments/{did}")
     public ResponseEntity<?> teardown(@PathVariable UUID id, @PathVariable UUID did) {
         return handle(() -> ResponseEntity.ok(service.teardownDeployment(id, did)));
+    }
+
+    /** Prolonge le TTL de l'environnement (1–24 h, plafond 72 h depuis Ready). */
+    @PostMapping("/{id}/deployments/{did}/extend-ttl")
+    public ResponseEntity<?> extendTtl(
+            @PathVariable UUID id,
+            @PathVariable UUID did,
+            @Valid @RequestBody ExtendTtlRequest request) {
+        return handle(() -> ResponseEntity.ok(
+                service.extendDeploymentTtl(id, did, request.getAdditionalHours())));
+    }
+
+    /**
+     * Applique les variables d'env du service sur le cluster RUNNING (sans rebuild CI).
+     */
+    @PostMapping("/{id}/services/{sid}/sync-runtime")
+    public ResponseEntity<?> syncServiceRuntime(@PathVariable UUID id, @PathVariable UUID sid) {
+        return handle(() -> ResponseEntity.ok(service.syncServiceRuntime(id, sid)));
+    }
+
+    /**
+     * Rebuild CI d'un seul service dans le namespace RUNNING (même déploiement).
+     */
+    @PostMapping("/{id}/services/{sid}/rebuild")
+    public ResponseEntity<?> rebuildService(@PathVariable UUID id, @PathVariable UUID sid) {
+        return handle(() -> ResponseEntity.ok(service.rebuildService(id, sid)));
+    }
+
+    /** Pods du namespace (phase, ready, restarts). */
+    @GetMapping("/{id}/deployments/{did}/pods")
+    public ResponseEntity<?> listDeploymentPods(@PathVariable UUID id, @PathVariable UUID did) {
+        return handle(() -> ResponseEntity.ok(service.listDeploymentPods(id, did)));
+    }
+
+    /** Monitoring léger : métriques, alertes, health URL. */
+    @GetMapping("/{id}/deployments/{did}/monitoring")
+    public ResponseEntity<?> getDeploymentMonitoring(@PathVariable UUID id, @PathVariable UUID did) {
+        return handle(() -> ResponseEntity.ok(service.getDeploymentMonitoring(id, did)));
+    }
+
+    /** Alertes runtime live + historique (CrashLoop, OOM, health KO…). */
+    @GetMapping("/{id}/deployments/{did}/alerts")
+    public ResponseEntity<?> getDeploymentAlerts(@PathVariable UUID id, @PathVariable UUID did) {
+        return handle(() -> ResponseEntity.ok(service.listDeploymentAlerts(id, did)));
+    }
+
+    /** Historique métriques long terme (échantillons CPU/MEM/net). */
+    @GetMapping("/{id}/deployments/{did}/metrics/history")
+    public ResponseEntity<?> getMetricsHistory(
+            @PathVariable UUID id,
+            @PathVariable UUID did,
+            @RequestParam(required = false) String from,
+            @RequestParam(required = false) String to) {
+        return handle(() -> {
+            java.time.Instant fromInst = from != null && !from.isBlank() ? java.time.Instant.parse(from) : null;
+            java.time.Instant toInst = to != null && !to.isBlank() ? java.time.Instant.parse(to) : null;
+            return ResponseEntity.ok(service.getDeploymentMetricsHistory(id, did, fromInst, toInst));
+        });
+    }
+
+    /** Logs d'un workload (label app) ou d'un pod. */
+    @GetMapping("/{id}/deployments/{did}/logs")
+    public ResponseEntity<?> getDeploymentLogs(
+            @PathVariable UUID id,
+            @PathVariable UUID did,
+            @RequestParam String workload,
+            @RequestParam(required = false, defaultValue = "300") Integer tailLines) {
+        return handle(() -> ResponseEntity.ok(service.getDeploymentLogs(id, did, workload, tailLines)));
+    }
+
+    /** Pipeline GitLab CI du déploiement (jobs + statut, live). */
+    @GetMapping("/{id}/deployments/{did}/ci-pipeline")
+    public ResponseEntity<?> getDeploymentCiPipeline(@PathVariable UUID id, @PathVariable UUID did) {
+        return handle(() -> ResponseEntity.ok(service.getDeploymentCiPipeline(id, did)));
+    }
+
+    /** Logs texte d'un job GitLab du pipeline de déploiement. */
+    @GetMapping(value = "/{id}/deployments/{did}/ci-jobs/{jobId}/logs", produces = MediaType.TEXT_PLAIN_VALUE)
+    public ResponseEntity<?> getDeploymentCiJobLogs(
+            @PathVariable UUID id,
+            @PathVariable UUID did,
+            @PathVariable Long jobId) {
+        return handle(() -> ResponseEntity.ok(service.getDeploymentCiJobLogs(id, did, jobId)));
     }
 
     @PostMapping("/{id}/deployments/{did}/reveal-secret")

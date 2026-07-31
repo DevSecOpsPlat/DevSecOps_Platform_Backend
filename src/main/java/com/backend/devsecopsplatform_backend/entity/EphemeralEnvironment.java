@@ -105,12 +105,15 @@ public class EphemeralEnvironment {
 
     @PrePersist
     public void calculateExpiresAt() {
-        if (expiresAt == null && ttlHours != null) {
-            expiresAt = LocalDateTime.now().plusHours(ttlHours);
-        }
+        // Ne pas fixer expiresAt à la création : le TTL démarre au Ready
+        // (EnvironmentLifecycleService.onReady). Un expiresAt provisoire ferait
+        // expirer l'env avant même que le cluster soit prêt.
     }
 
     public boolean isExpired() {
+        if (expiresAt == null) {
+            return false;
+        }
         return LocalDateTime.now().isAfter(expiresAt) &&
                 status != EnvironmentStatus.DESTROYED;
     }
@@ -120,8 +123,18 @@ public class EphemeralEnvironment {
     }
 
     public void extendLifetime(int additionalHours) {
-        this.ttlHours += additionalHours;
-        this.expiresAt = this.expiresAt.plusHours(additionalHours);
+        if (additionalHours <= 0) {
+            return;
+        }
+        int currentTtl = this.ttlHours != null && this.ttlHours > 0 ? this.ttlHours : 0;
+        this.ttlHours = currentTtl + additionalHours;
+        if (this.expiresAt != null) {
+            this.expiresAt = this.expiresAt.plusHours(additionalHours);
+        } else if (this.readyAt != null) {
+            this.expiresAt = this.readyAt.plusHours(this.ttlHours);
+        } else {
+            this.expiresAt = LocalDateTime.now().plusHours(additionalHours);
+        }
     }
 
     public void markAsDestroyed() {

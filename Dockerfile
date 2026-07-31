@@ -20,4 +20,5 @@ COPY --from=build /app/target/*.jar ./app.jar
 
 EXPOSE 8089
 
-ENTRYPOINT ["java", "-jar", "/app/app.jar"]
+# allowRestrictedHeaders=host : sonde health domaines custom via IP Traefik + Host
+ENTRYPOINT ["java", "-Djdk.httpclient.allowRestrictedHeaders=host", "-jar", "/app/app.jar"]

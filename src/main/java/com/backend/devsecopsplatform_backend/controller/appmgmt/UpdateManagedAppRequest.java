@@ -13,4 +13,8 @@ public class UpdateManagedAppRequest {
 
     @Size(max = 5000)
     private String description;
+
+    /** Hostname personnalisé (ex. demo.example.com). Vide = nip.io par défaut. */
+    @Size(max = 253)
+    private String customHostname;
 }

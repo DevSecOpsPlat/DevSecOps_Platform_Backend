@@ -16,7 +16,12 @@ public interface AppDeploymentRepository extends JpaRepository<AppDeployment, UU
 
     Optional<AppDeployment> findByIdAndApplication_Id(UUID id, UUID applicationId);
 
+    Optional<AppDeployment> findByEphemeralEnvironmentId(UUID ephemeralEnvironmentId);
+
     /** Charge {@code application} uniquement — pas les collections (évite le conflit bag Hibernate). */
     @EntityGraph(attributePaths = {"application"})
     Optional<AppDeployment> findWithApplicationById(UUID id);
+
+    @EntityGraph(attributePaths = {"application", "application.createdBy"})
+    List<AppDeployment> findByStatus(com.backend.devsecopsplatform_backend.entity.appmgmt.AppDeploymentStatus status);
 }

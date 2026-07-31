@@ -58,6 +58,11 @@ public class AppServiceRequest {
 
     private String healthCheckPath;
 
+    /**
+     * Chemin métier optionnel (ex. {@code /projet}). Laisser vide si le service écoute à {@code /}.
+     */
+    private String contextPath;
+
     private String cpuRequest;
     private String cpuLimit;
     private String memoryRequest;

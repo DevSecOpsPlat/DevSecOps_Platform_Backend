@@ -3,29 +3,40 @@ package com.backend.devsecopsplatform_backend.service.appmgmt;
 import com.backend.devsecopsplatform_backend.controller.appmgmt.*;
 import com.backend.devsecopsplatform_backend.entity.User;
 import com.backend.devsecopsplatform_backend.entity.AppService;
+import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
+import com.backend.devsecopsplatform_backend.entity.EnvironmentStatus;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.AppServiceRole;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDatabase;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDeployment;
+import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDeploymentStatus;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.DbEngine;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.ManagedApplication;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.ServiceEnvVar;
 import com.backend.devsecopsplatform_backend.repository.AppDatabaseRepository;
 import com.backend.devsecopsplatform_backend.repository.AppDeploymentRepository;
 import com.backend.devsecopsplatform_backend.repository.AppServiceRepository;
+import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
 import com.backend.devsecopsplatform_backend.repository.ManagedApplicationRepository;
 import com.backend.devsecopsplatform_backend.repository.ServiceEnvVarRepository;
 import com.backend.devsecopsplatform_backend.repository.UserRepository;
+import com.backend.devsecopsplatform_backend.service.GitLabService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Instant;
+import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.stream.Collectors;
@@ -47,10 +58,19 @@ public class ApplicationManagementService {
     private final AppDatabaseRepository databaseRepository;
     private final ServiceEnvVarRepository envVarRepository;
     private final AppDeploymentRepository deploymentRepository;
+    private final EphemeralEnvironmentRepository environmentRepository;
     private final UserRepository userRepository;
     private final AppConnectionUrlService connectionUrlService;
     private final AppDeploymentService deploymentService;
     private final ImageTagAvailabilityService imageTagAvailability;
+    private final K8sManifestApplyService k8sManifestApplyService;
+    private final GitLabService gitLabService;
+    private final DeploymentRuntimeAlertService deploymentRuntimeAlertService;
+    private final DeploymentMetricsSamplerService deploymentMetricsSamplerService;
+
+    /** IP Traefik / master — sonde health des domaines custom via Host header. */
+    @Value("${deployment.preview.nip.master-ip:192.168.92.10}")
+    private String ingressProbeIp;
 
     // =====================================================================
     // Applications
@@ -84,7 +104,22 @@ public class ApplicationManagementService {
         ManagedApplication app = loadOwnedApp(id);
         app.setName(request.getName());
         app.setDescription(request.getDescription());
-        return mapApp(appRepository.save(app), true);
+        String previousHost = app.getCustomHostname();
+        String newHost = AppDeploymentService.normalizeCustomHostname(request.getCustomHostname());
+        app.setCustomHostname(newHost);
+        ManagedApplication saved = appRepository.save(app);
+        // Si hostname changé et env RUNNING → réapplique Ingress
+        boolean hostChanged = !java.util.Objects.equals(
+                previousHost != null ? previousHost.trim().toLowerCase() : null,
+                newHost);
+        if (hostChanged) {
+            try {
+                deploymentService.syncIngressHostname(saved);
+            } catch (Exception e) {
+                log.warn("Sync Ingress hostname échoué pour app {}: {}", id, e.getMessage());
+            }
+        }
+        return mapApp(saved, true);
     }
 
     @Transactional
@@ -129,15 +164,20 @@ public class ApplicationManagementService {
     }
 
     @Transactional
-    public void deleteService(UUID appId, UUID serviceId) {
-        loadOwnedApp(appId);
+    public ClusterPruneResponse deleteService(UUID appId, UUID serviceId) {
+        ManagedApplication app = loadOwnedApp(appId);
         AppService svc = serviceRepository.findByIdAndManagedApplication_Id(serviceId, appId)
                 .orElseThrow(() -> new AppValidationException("Service introuvable dans cette application."));
         if (serviceRepository.countByDependsOnServiceId(serviceId) > 0) {
             throw new AppValidationException(
                     "Ce service est référencé par un ou plusieurs autres services. Retirez la dépendance d'abord.");
         }
+        String logicalName = svc.getName();
+        String k8sName = AppNaming.k8sName(logicalName);
         serviceRepository.delete(svc);
+        // Flush so remaining-services queries in prune don't see the deleted row.
+        serviceRepository.flush();
+        return deploymentService.pruneRemovedService(app, logicalName, k8sName);
     }
 
     private void applyServiceScalars(AppService svc, AppServiceRequest request) {
@@ -173,6 +213,12 @@ public class ApplicationManagementService {
             svc.setHealthCheckPath(request.getHealthCheckPath().trim());
         } else if (AppServiceRules.requiresExposedPort(role)) {
             svc.setHealthCheckPath(request.getHealthCheckPath());
+        }
+
+        if (AppServiceRules.requiresExposedPort(role)) {
+            svc.setContextPath(AppServiceRules.normalizeContextPath(request.getContextPath()));
+        } else {
+            svc.setContextPath(null);
         }
 
         svc.setCpuRequest(orDefault(request.getCpuRequest(), "100m"));
@@ -216,6 +262,7 @@ public class ApplicationManagementService {
                                 + "–" + AppServiceRules.MAX_EXPOSED_PORT
                                 + "). Un conteneur non-root ne peut pas binder un port < 1024.");
             }
+            AppServiceRules.assertContextPath(request.getContextPath());
         } else if (request.getExposedPort() != null) {
             // WORKER : ignorer silencieux côté apply ; on refuse une valeur explicite trompeuse
             // uniquement si l'utilisateur tente d'exposer — ici on l'efface à applyServiceScalars.
@@ -348,15 +395,21 @@ public class ApplicationManagementService {
     }
 
     @Transactional
-    public void deleteDatabase(UUID appId, UUID databaseId) {
-        loadOwnedApp(appId);
+    public ClusterPruneResponse deleteDatabase(UUID appId, UUID databaseId) {
+        ManagedApplication app = loadOwnedApp(appId);
         AppDatabase db = databaseRepository.findByIdAndApplication_Id(databaseId, appId)
                 .orElseThrow(() -> new AppValidationException("Base introuvable dans cette application."));
         if (serviceRepository.countByDependsOnDatabaseId(databaseId) > 0) {
             throw new AppValidationException(
                     "Cette base est référencée par un ou plusieurs services. Retirez la dépendance d'abord.");
         }
+        // Snapshot avant delete (nom K8s dérivé de l'entité)
+        AppDatabase snapshot = new AppDatabase();
+        snapshot.setName(db.getName());
+        snapshot.setEngine(db.getEngine());
         databaseRepository.delete(db);
+        databaseRepository.flush();
+        return deploymentService.pruneRemovedDatabase(app, snapshot);
     }
 
     private void applyRootPasswordOnCreate(AppDatabase db, AppDatabaseRequest request) {
@@ -628,10 +681,21 @@ public class ApplicationManagementService {
                 .collect(Collectors.toList());
     }
 
+    @Transactional
     public AppDeploymentResponse getDeployment(UUID appId, UUID deploymentId) {
         ManagedApplication app = loadOwnedApp(appId);
         AppDeployment deployment = deploymentRepository.findByIdAndApplication_Id(deploymentId, appId)
                 .orElseThrow(() -> new AppValidationException("Déploiement introuvable."));
+        // Réconcilie DEPLOYING coincé (ex. rebuild backend pods Ready mais UI encore Deploying)
+        if (deployment.getStatus() == AppDeploymentStatus.DEPLOYING) {
+            try {
+                deploymentService.getCiDeployStatus(deploymentId);
+                deployment = deploymentRepository.findByIdAndApplication_Id(deploymentId, appId)
+                        .orElse(deployment);
+            } catch (Exception e) {
+                log.debug("reconcile DEPLOYING {}: {}", deploymentId, e.getMessage());
+            }
+        }
         return mapDeployment(deployment, app);
     }
 
@@ -641,6 +705,536 @@ public class ApplicationManagementService {
         AppDeployment deployment = deploymentRepository.findByIdAndApplication_Id(deploymentId, appId)
                 .orElseThrow(() -> new AppValidationException("Déploiement introuvable."));
         return mapDeployment(deploymentService.teardown(deployment), app);
+    }
+
+    /**
+     * Prolonge le TTL de l'environnement éphémère lié au déploiement (max 72 h depuis Ready).
+     */
+    @Transactional
+    public AppDeploymentResponse extendDeploymentTtl(UUID appId, UUID deploymentId, int additionalHours) {
+        ManagedApplication app = loadOwnedApp(appId);
+        AppDeployment deployment = deploymentRepository.findByIdAndApplication_Id(deploymentId, appId)
+                .orElseThrow(() -> new AppValidationException("Déploiement introuvable."));
+
+        if (deployment.getStatus() != AppDeploymentStatus.RUNNING
+                && deployment.getStatus() != AppDeploymentStatus.DEPLOYING) {
+            throw new AppValidationException("TTL prolongé uniquement sur un déploiement RUNNING ou DEPLOYING.");
+        }
+        if (additionalHours < 1 || additionalHours > 24) {
+            throw new AppValidationException("additionalHours doit être entre 1 et 24.");
+        }
+
+        UUID envId = deployment.getEphemeralEnvironmentId();
+        if (envId == null) {
+            throw new AppValidationException("Aucun environnement éphémère lié à ce déploiement.");
+        }
+        EphemeralEnvironment env = environmentRepository.findById(envId)
+                .orElseThrow(() -> new AppValidationException("Environnement éphémère introuvable."));
+
+        if (env.getStatus() == EnvironmentStatus.DESTROYED
+                || env.getStatus() == EnvironmentStatus.EXPIRED) {
+            throw new AppValidationException("Environnement déjà arrêté ou expiré — impossible de prolonger.");
+        }
+        if (env.getExpiresAt() == null && env.getReadyAt() == null) {
+            throw new AppValidationException("TTL pas encore démarré (environnement pas Ready).");
+        }
+
+        final int maxTotalHours = 72;
+        LocalDateTime ready = env.getReadyAt() != null ? env.getReadyAt() : LocalDateTime.now();
+        LocalDateTime currentExpires = env.getExpiresAt() != null
+                ? env.getExpiresAt()
+                : ready.plusHours(env.getTtlHours() != null && env.getTtlHours() > 0 ? env.getTtlHours() : 4);
+        LocalDateTime maxExpires = ready.plusHours(maxTotalHours);
+
+        if (!currentExpires.isBefore(maxExpires)) {
+            throw new AppValidationException("TTL déjà au maximum (" + maxTotalHours + " h depuis Ready).");
+        }
+
+        long hoursUntilCap = java.time.Duration.between(currentExpires, maxExpires).toHours();
+        int applied = (int) Math.min(additionalHours, Math.max(1, hoursUntilCap));
+        if (hoursUntilCap < 1) {
+            // moins d'1 h avant le plafond : avance jusqu'au cap
+            env.setExpiresAt(maxExpires);
+            int ttlFromReady = (int) Math.max(1, java.time.Duration.between(ready, maxExpires).toHours());
+            env.setTtlHours(ttlFromReady);
+            applied = additionalHours;
+        } else {
+            env.extendLifetime(applied);
+            if (env.getExpiresAt().isAfter(maxExpires)) {
+                env.setExpiresAt(maxExpires);
+            }
+            int ttlFromReady = (int) Math.max(1, java.time.Duration.between(ready, env.getExpiresAt()).toHours());
+            env.setTtlHours(Math.min(ttlFromReady, maxTotalHours));
+        }
+
+        if (env.getStatus() != EnvironmentStatus.RUNNING
+                && env.getStatus() != EnvironmentStatus.BUILDING
+                && env.getStatus() != EnvironmentStatus.PENDING) {
+            env.setStatus(EnvironmentStatus.RUNNING);
+            env.setDestroyedAt(null);
+        }
+
+        environmentRepository.save(env);
+
+        // Aligne servicesState.ttlHours pour l'UI
+        Map<String, Object> state = deployment.getServicesState();
+        if (state != null) {
+            state.put("ttlHours", env.getTtlHours());
+            deployment.setServicesState(state);
+            deploymentRepository.save(deployment);
+        }
+
+        log.info("TTL prolongé — deployment={} env={} +{}h → expiresAt={} ttlHours={}",
+                deploymentId, envId, applied, env.getExpiresAt(), env.getTtlHours());
+        return mapDeployment(deployment, app);
+    }
+
+    /**
+     * Synchronise les variables d'environnement du service vers le(s) namespace(s) RUNNING
+     * sans passer par le pipeline CI.
+     */
+    public RuntimeSyncResponse syncServiceRuntime(UUID appId, UUID serviceId) {
+        ManagedApplication app = loadOwnedApp(appId);
+        serviceRepository.findByIdAndManagedApplication_Id(serviceId, appId)
+                .orElseThrow(() -> new AppValidationException("Service introuvable dans cette application."));
+        return deploymentService.syncServiceRuntime(app, serviceId);
+    }
+
+    /**
+     * Rebuild CI d'un seul service dans le namespace RUNNING (même déploiement, pas de nouveau NS).
+     */
+    @Transactional
+    public AppDeploymentResponse rebuildService(UUID appId, UUID serviceId) {
+        ManagedApplication app = loadOwnedApp(appId);
+        serviceRepository.findByIdAndManagedApplication_Id(serviceId, appId)
+                .orElseThrow(() -> new AppValidationException("Service introuvable dans cette application."));
+        AppDeployment deployment = deploymentService.rebuildServiceInPlace(app, serviceId);
+        return mapDeployment(deployment, app);
+    }
+
+    /**
+     * Liste les pods du namespace d'un déploiement (observabilité cluster).
+     */
+    public Map<String, Object> listDeploymentPods(UUID appId, UUID deploymentId) {
+        loadOwnedApp(appId);
+        AppDeployment deployment = deploymentRepository.findByIdAndApplication_Id(deploymentId, appId)
+                .orElseThrow(() -> new AppValidationException("Déploiement introuvable."));
+        Map<String, Object> out = new java.util.LinkedHashMap<>();
+        out.put("namespace", deployment.getNamespace());
+        out.put("deploymentId", deployment.getId());
+        out.put("status", deployment.getStatus());
+
+        if (deployment.getStatus() == AppDeploymentStatus.STOPPED
+                || deployment.getStatus() == AppDeploymentStatus.FAILED) {
+            out.put("pods", List.of());
+            out.put("message", deployment.getStatus() == AppDeploymentStatus.STOPPED
+                    ? "Environnement arrêté — aucun pod."
+                    : "Déploiement en échec — pods non listés.");
+            return out;
+        }
+        if (!k8sManifestApplyService.isConfigured()) {
+            throw new AppValidationException("Cluster K8s non configuré.");
+        }
+        if (deployment.getNamespace() == null || deployment.getNamespace().isBlank()) {
+            throw new AppValidationException("Namespace absent pour ce déploiement.");
+        }
+        try {
+            out.put("pods", k8sManifestApplyService.listPods(deployment.getNamespace()));
+        } catch (Exception e) {
+            log.warn("listPods ns={}: {}", deployment.getNamespace(), e.getMessage());
+            out.put("pods", List.of());
+            out.put("message", "Namespace inaccessible (supprimé ou en cours de suppression).");
+        }
+        return out;
+    }
+
+    /**
+     * Monitoring léger : métriques pods, alertes, health HTTP de l'URL publique.
+     */
+    @Transactional(readOnly = true)
+    public Map<String, Object> getDeploymentMonitoring(UUID appId, UUID deploymentId) {
+        ManagedApplication app = loadOwnedApp(appId);
+        AppDeployment deployment = deploymentRepository.findByIdAndApplication_Id(deploymentId, appId)
+                .orElseThrow(() -> new AppValidationException("Déploiement introuvable."));
+        Map<String, Object> out = new java.util.LinkedHashMap<>();
+        out.put("namespace", deployment.getNamespace());
+        out.put("deploymentId", deployment.getId());
+        out.put("status", deployment.getStatus());
+        out.put("checkedAt", Instant.now().toString());
+        out.put("applicationName", app.getName());
+        out.put("applicationSlug", app.getSlug());
+        Instant expiresAt = null;
+        if (deployment.getEphemeralEnvironmentId() != null) {
+            EphemeralEnvironment env = environmentRepository.findById(deployment.getEphemeralEnvironmentId()).orElse(null);
+            if (env != null) {
+                expiresAt = toInstant(env.getExpiresAt());
+            }
+        }
+        out.put("expiresAt", expiresAt != null ? expiresAt.toString() : null);
+
+        if (deployment.getStatus() == AppDeploymentStatus.STOPPED
+                || deployment.getStatus() == AppDeploymentStatus.FAILED) {
+            out.put("pods", List.of());
+            out.put("workloads", List.of());
+            out.put("services", List.of());
+            out.put("events", List.of());
+            out.put("alerts", List.of());
+            out.put("summary", Map.of("totalPods", 0, "readyPods", 0, "alertCount", 0, "metricsAvailable", false));
+            out.put("health", Map.of("checked", false, "message", "Environnement non actif"));
+            return out;
+        }
+        if (!k8sManifestApplyService.isConfigured()) {
+            throw new AppValidationException("Cluster K8s non configuré.");
+        }
+        if (deployment.getNamespace() == null || deployment.getNamespace().isBlank()) {
+            throw new AppValidationException("Namespace absent pour ce déploiement.");
+        }
+
+        Map<String, Object> mon;
+        try {
+            mon = k8sManifestApplyService.getNamespaceMonitoring(deployment.getNamespace());
+        } catch (Exception e) {
+            log.warn("monitoring ns={}: {}", deployment.getNamespace(), e.getMessage());
+            mon = new java.util.LinkedHashMap<>();
+            mon.put("pods", List.of());
+            mon.put("alerts", new java.util.ArrayList<Map<String, Object>>());
+            mon.put("summary", Map.of("totalPods", 0, "readyPods", 0, "alertCount", 0, "metricsAvailable", false));
+            mon.put("message", "Namespace inaccessible.");
+        }
+        out.putAll(mon);
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> alerts = mon.get("alerts") instanceof List<?> list
+                ? (List<Map<String, Object>>) list
+                : new java.util.ArrayList<>();
+
+        // Ingress flag
+        Map<String, Object> state = deployment.getServicesState();
+        if (state != null && Boolean.FALSE.equals(state.get("ingressApplied"))) {
+            Map<String, Object> a = new java.util.LinkedHashMap<>();
+            a.put("severity", "warn");
+            a.put("pod", null);
+            a.put("workload", null);
+            a.put("message", state.get("ingressError") != null
+                    ? "Ingress non appliqué : " + state.get("ingressError")
+                    : "Ingress non appliqué — URL publique indisponible");
+            alerts.add(a);
+        }
+
+        // Health HTTP — chemins issus des services + candidats multi-stack
+        String appUrl = null;
+        if (state != null && state.get("services") instanceof Map<?, ?> services) {
+            for (Object v : services.values()) {
+                if (v instanceof Map<?, ?> svc) {
+                    Object ext = svc.get("externalUrl");
+                    if (ext != null && !String.valueOf(ext).isBlank()) {
+                        appUrl = String.valueOf(ext);
+                        break;
+                    }
+                }
+            }
+        }
+        List<String> preferredPaths = collectHealthProbePaths(app);
+        Map<String, Object> health = probeHttpHealth(appUrl, preferredPaths);
+        out.put("health", health);
+        out.put("appUrl", appUrl);
+        if (Boolean.FALSE.equals(health.get("ok")) && Boolean.TRUE.equals(health.get("checked"))) {
+            Map<String, Object> a = new java.util.LinkedHashMap<>();
+            a.put("severity", "warn");
+            a.put("pod", null);
+            a.put("workload", null);
+            a.put("message", "Health URL : " + health.get("message"));
+            alerts.add(a);
+        }
+        out.put("alerts", alerts);
+        Object summaryObj = out.get("summary");
+        if (summaryObj instanceof Map<?, ?> summary) {
+            Map<String, Object> s = new java.util.LinkedHashMap<>();
+            summary.forEach((k, v) -> s.put(String.valueOf(k), v));
+            s.put("alertCount", alerts.size());
+            out.put("summary", s);
+        }
+        return out;
+    }
+
+    /**
+     * Alertes runtime live + historique 24 h pour un déploiement.
+     */
+    @Transactional(readOnly = true)
+    public Map<String, Object> listDeploymentAlerts(UUID appId, UUID deploymentId) {
+        ManagedApplication app = loadOwnedApp(appId);
+        AppDeployment deployment = deploymentRepository.findByIdAndApplication_Id(deploymentId, appId)
+                .orElseThrow(() -> new AppValidationException("Déploiement introuvable."));
+        return deploymentRuntimeAlertService.listForDeployment(app, deployment);
+    }
+
+    /** Historique métriques namespace (échantillons DB). */
+    @Transactional(readOnly = true)
+    public Map<String, Object> getDeploymentMetricsHistory(
+            UUID appId, UUID deploymentId, Instant from, Instant to) {
+        loadOwnedApp(appId);
+        deploymentRepository.findByIdAndApplication_Id(deploymentId, appId)
+                .orElseThrow(() -> new AppValidationException("Déploiement introuvable."));
+        return deploymentMetricsSamplerService.history(appId, deploymentId, from, to);
+    }
+
+    /**
+     * Chemins health prioritaires : config service + variantes Ingress path-based (/api/…).
+     */
+    private List<String> collectHealthProbePaths(ManagedApplication app) {
+        LinkedHashSet<String> paths = new LinkedHashSet<>();
+        if (app != null && app.getServices() != null) {
+            for (AppService svc : app.getServices()) {
+                String raw = svc.getHealthCheckPath();
+                if (raw == null || raw.isBlank()) {
+                    continue;
+                }
+                String path = raw.trim();
+                if (!path.startsWith("/")) {
+                    path = "/" + path;
+                }
+                paths.add(path);
+                // Exposé derrière /api (Traefik rewrite) — cas backend classique
+                if (!path.startsWith("/api/") && !path.equals("/api")) {
+                    paths.add("/api" + (path.startsWith("/") ? path : "/" + path));
+                }
+                String ctx = svc.getContextPath();
+                if (ctx != null && !ctx.isBlank()) {
+                    String c = ctx.trim();
+                    if (!c.startsWith("/")) {
+                        c = "/" + c;
+                    }
+                    if (c.endsWith("/")) {
+                        c = c.substring(0, c.length() - 1);
+                    }
+                    if (!path.startsWith(c + "/") && !path.equals(c)) {
+                        paths.add(c + path);
+                    }
+                }
+            }
+        }
+        // Candidats multi-technologies (ordre : génériques d'abord, Spring ensuite, root en dernier)
+        for (String p : List.of(
+                "/api/health",
+                "/health",
+                "/api/healthz",
+                "/healthz",
+                "/api/ready",
+                "/ready",
+                "/readyz",
+                "/livez",
+                "/api/v1/health",
+                "/v1/health",
+                "/api/status",
+                "/status",
+                "/api/actuator/health",
+                "/actuator/health",
+                "/api/actuator/health/liveness",
+                "/actuator/health/liveness",
+                "/"
+        )) {
+            paths.add(p);
+        }
+        return new ArrayList<>(paths);
+    }
+
+    private Map<String, Object> probeHttpHealth(String appUrl, List<String> preferredPaths) {
+        Map<String, Object> health = new java.util.LinkedHashMap<>();
+        if (appUrl == null || appUrl.isBlank()) {
+            health.put("checked", false);
+            health.put("ok", null);
+            health.put("url", null);
+            health.put("message", "Pas d'URL publique");
+            return health;
+        }
+        health.put("url", appUrl);
+        String base = appUrl.endsWith("/") ? appUrl.substring(0, appUrl.length() - 1) : appUrl.trim();
+        List<String> paths = preferredPaths != null && !preferredPaths.isEmpty()
+                ? preferredPaths
+                : List.of("/api/health", "/health", "/api/actuator/health", "/actuator/health", "/");
+
+        java.net.URI publicUri;
+        try {
+            publicUri = java.net.URI.create(base);
+        } catch (Exception e) {
+            health.put("checked", false);
+            health.put("ok", null);
+            health.put("message", "URL invalide");
+            return health;
+        }
+        String publicHost = publicUri.getHost();
+        // Domaine custom / .local : le backend Docker ne résout pas le hosts Windows.
+        // On sonde Traefik (IP master) avec le header Host = hostname public.
+        boolean rewriteViaIngressIp = shouldProbeViaIngressIp(publicHost);
+        String probeScheme = publicUri.getScheme() != null ? publicUri.getScheme() : "http";
+        String probeAuthority = rewriteViaIngressIp
+                ? (ingressProbeIp != null && !ingressProbeIp.isBlank() ? ingressProbeIp.trim() : "192.168.92.10")
+                : (publicUri.getPort() > 0 ? publicHost + ":" + publicUri.getPort() : publicHost);
+        String probeBase = probeScheme + "://" + probeAuthority;
+
+        try {
+            int lastCode = 0;
+            String lastErr = null;
+            String lastPublicTarget = null;
+            String lastProbeTarget = null;
+            List<String> tried = new ArrayList<>();
+            for (String path : paths) {
+                String pathPart = (path == null || path.isBlank()) ? "/" : path;
+                if (!pathPart.startsWith("/")) {
+                    pathPart = "/" + pathPart;
+                }
+                String publicTarget = "/".equals(pathPart) ? base + "/" : base + pathPart;
+                String probeTarget = "/".equals(pathPart) ? probeBase + "/" : probeBase + pathPart;
+                tried.add(pathPart);
+                lastPublicTarget = publicTarget;
+                lastProbeTarget = probeTarget;
+                try {
+                    int code = httpGetStatus(probeTarget, rewriteViaIngressIp ? publicHost : null);
+                    lastCode = code;
+                    if (code >= 200 && code < 300) {
+                        health.put("checked", true);
+                        health.put("ok", true);
+                        health.put("statusCode", code);
+                        health.put("probedUrl", publicTarget);
+                        health.put("message", "HTTP " + code + " OK (" + pathPart + ")"
+                                + (rewriteViaIngressIp ? " via Traefik+" + publicHost : ""));
+                        health.put("triedPaths", tried);
+                        return health;
+                    }
+                    if (code == 401 || code == 403) {
+                        health.put("checked", true);
+                        health.put("ok", true);
+                        health.put("statusCode", code);
+                        health.put("probedUrl", publicTarget);
+                        health.put("message", "HTTP " + code + " (protégé, joignable) — " + pathPart);
+                        health.put("triedPaths", tried);
+                        return health;
+                    }
+                    if (code == 404 || code == 405) {
+                        continue;
+                    }
+                } catch (Exception e) {
+                    lastErr = e.getMessage();
+                }
+            }
+            health.put("checked", true);
+            health.put("ok", false);
+            health.put("statusCode", lastCode > 0 ? lastCode : null);
+            health.put("probedUrl", lastPublicTarget);
+            health.put("triedPaths", tried);
+            if (lastErr != null) {
+                health.put("message", lastErr
+                        + (rewriteViaIngressIp ? " (sonde " + lastProbeTarget + " Host=" + publicHost + ")" : ""));
+            } else {
+                health.put("message", "Aucun endpoint health trouvé (dernier HTTP " + lastCode + ")");
+            }
+        } catch (Exception e) {
+            health.put("checked", true);
+            health.put("ok", false);
+            health.put("message", e.getMessage());
+        }
+        return health;
+    }
+
+    /**
+     * Custom domain / .local hors nip.io → sonder via IP Traefik + Host header
+     * (le fichier hosts Windows n'existe pas dans le conteneur backend).
+     */
+    private static boolean shouldProbeViaIngressIp(String host) {
+        if (host == null || host.isBlank()) {
+            return false;
+        }
+        String h = host.toLowerCase();
+        if (h.endsWith(".nip.io")) {
+            return false;
+        }
+        if (h.matches("\\d{1,3}(\\.\\d{1,3}){3}")) {
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * GET HTTP. Si hostHeader est fourni, force le header Host (requis pour Traefik
+     * quand on sonde l'IP au lieu du DNS local Windows).
+     * HttpURLConnection ignore Host — on utilise HttpClient + allowRestrictedHeaders.
+     */
+    private static int httpGetStatus(String url, String hostHeader) throws Exception {
+        System.setProperty("jdk.httpclient.allowRestrictedHeaders", "host");
+        var client = java.net.http.HttpClient.newBuilder()
+                .followRedirects(java.net.http.HttpClient.Redirect.NORMAL)
+                .connectTimeout(java.time.Duration.ofSeconds(3))
+                .build();
+        var builder = java.net.http.HttpRequest.newBuilder()
+                .uri(java.net.URI.create(url))
+                .timeout(java.time.Duration.ofSeconds(4))
+                .GET();
+        if (hostHeader != null && !hostHeader.isBlank()) {
+            builder.header("Host", hostHeader);
+        }
+        java.net.http.HttpResponse<Void> response = client.send(
+                builder.build(),
+                java.net.http.HttpResponse.BodyHandlers.discarding());
+        return response.statusCode();
+    }
+
+    /**
+     * Logs d'un workload (label app) ou d'un pod nommé.
+     */
+    public Map<String, Object> getDeploymentLogs(UUID appId, UUID deploymentId, String workload, Integer tailLines) {
+        loadOwnedApp(appId);
+        AppDeployment deployment = deploymentRepository.findByIdAndApplication_Id(deploymentId, appId)
+                .orElseThrow(() -> new AppValidationException("Déploiement introuvable."));
+        if (deployment.getStatus() == AppDeploymentStatus.STOPPED) {
+            throw new AppValidationException("Environnement arrêté — logs indisponibles.");
+        }
+        if (!k8sManifestApplyService.isConfigured()) {
+            throw new AppValidationException("Cluster K8s non configuré.");
+        }
+        if (workload == null || workload.isBlank()) {
+            throw new AppValidationException("Paramètre workload requis (ex. front, api, db-mydb).");
+        }
+        int tail = tailLines != null ? tailLines : 300;
+        return k8sManifestApplyService.getPodLogs(deployment.getNamespace(), workload.trim(), tail);
+    }
+
+    /**
+     * Résumé live du pipeline GitLab CI lié au déploiement (jobs + statut).
+     */
+    public Map<String, Object> getDeploymentCiPipeline(UUID appId, UUID deploymentId) {
+        loadOwnedApp(appId);
+        AppDeployment deployment = deploymentRepository.findByIdAndApplication_Id(deploymentId, appId)
+                .orElseThrow(() -> new AppValidationException("Déploiement introuvable."));
+        Long pipelineId = deployment.getGitlabPipelineId();
+        if (pipelineId == null) {
+            throw new AppValidationException("Aucun pipeline CI associé à ce déploiement.");
+        }
+        Map<String, Object> summary = gitLabService.getPipelineSummary(pipelineId);
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("pipelineId", summary.getOrDefault("id", pipelineId));
+        out.put("status", summary.get("status"));
+        out.put("webUrl", summary.get("webUrl"));
+        out.put("ref", summary.get("ref"));
+        out.put("jobStatusCount", summary.getOrDefault("jobStatusCount", Map.of()));
+        out.put("jobs", summary.getOrDefault("jobs", List.of()));
+        out.put("dataSource", "gitlab");
+        return out;
+    }
+
+    /**
+     * Logs texte d'un job GitLab du pipeline de ce déploiement.
+     */
+    public String getDeploymentCiJobLogs(UUID appId, UUID deploymentId, Long jobId) {
+        loadOwnedApp(appId);
+        AppDeployment deployment = deploymentRepository.findByIdAndApplication_Id(deploymentId, appId)
+                .orElseThrow(() -> new AppValidationException("Déploiement introuvable."));
+        if (deployment.getGitlabPipelineId() == null) {
+            throw new AppValidationException("Aucun pipeline CI associé à ce déploiement.");
+        }
+        if (jobId == null) {
+            throw new AppValidationException("jobId requis.");
+        }
+        return gitLabService.getJobLogs(jobId);
     }
 
     // =====================================================================
@@ -685,8 +1279,17 @@ public class ApplicationManagementService {
         AppDeploymentResponse last = null;
         List<String> warnings = new ArrayList<>();
         if (withDetail) {
-            last = deploymentRepository.findByApplication_IdOrderByCreatedAtDesc(app.getId()).stream()
-                    .findFirst().map(d -> mapDeployment(d, app)).orElse(null);
+            AppDeployment lastEntity = deploymentRepository.findByApplication_IdOrderByCreatedAtDesc(app.getId())
+                    .stream().findFirst().orElse(null);
+            if (lastEntity != null && lastEntity.getStatus() == AppDeploymentStatus.DEPLOYING) {
+                try {
+                    deploymentService.getCiDeployStatus(lastEntity.getId());
+                    lastEntity = deploymentRepository.findById(lastEntity.getId()).orElse(lastEntity);
+                } catch (Exception e) {
+                    log.debug("reconcile lastDeployment DEPLOYING {}: {}", lastEntity.getId(), e.getMessage());
+                }
+            }
+            last = lastEntity != null ? mapDeployment(lastEntity, app) : null;
             for (AppService svc : app.getServices()) {
                 if (svc.getRole() == AppServiceRole.BACKEND && svc.getDependsOnDatabaseId() == null
                         && app.getDatabases().isEmpty()) {
@@ -700,6 +1303,7 @@ public class ApplicationManagementService {
                 .name(app.getName())
                 .slug(app.getSlug())
                 .description(app.getDescription())
+                .customHostname(app.getCustomHostname())
                 .createdByUsername(app.getCreatedBy() != null ? app.getCreatedBy().getUsername() : null)
                 .createdAt(app.getCreatedAt())
                 .updatedAt(app.getUpdatedAt())
@@ -728,6 +1332,7 @@ public class ApplicationManagementService {
                 .dbUrlEnvVar(svc.getDbUrlEnvVar())
                 .replicas(svc.getReplicas())
                 .healthCheckPath(svc.getHealthCheckPath())
+                .contextPath(svc.getContextPath())
                 .cpuRequest(svc.getCpuRequest())
                 .cpuLimit(svc.getCpuLimit())
                 .memoryRequest(svc.getMemoryRequest())
@@ -771,6 +1376,65 @@ public class ApplicationManagementService {
     private AppDeploymentResponse mapDeployment(AppDeployment deployment, ManagedApplication app) {
         List<AppDatabaseResponse> databases = app.getDatabases().stream()
                 .map(this::mapDatabase).collect(Collectors.toList());
+
+        Instant serverTime = Instant.now();
+        Integer ttlHours = null;
+        Instant expiresAt = null;
+        Instant readyAt = null;
+        Long remainingSeconds = null;
+
+        UUID envId = deployment.getEphemeralEnvironmentId();
+        if (envId != null) {
+            EphemeralEnvironment env = environmentRepository.findById(envId).orElse(null);
+            if (env != null) {
+                ttlHours = env.getTtlHours();
+                readyAt = toInstant(env.getReadyAt());
+                expiresAt = toInstant(env.getExpiresAt());
+
+                // Déploiement RUNNING mais TTL jamais armé (onReady ignoré / env détruit trop tôt)
+                if (deployment.getStatus() == AppDeploymentStatus.RUNNING
+                        && (readyAt == null || expiresAt == null)) {
+                    Instant base = deployment.getDeployedAt() != null
+                            ? deployment.getDeployedAt()
+                            : deployment.getCreatedAt();
+                    int ttl = ttlHours != null && ttlHours > 0 ? ttlHours : 4;
+                    if (base != null) {
+                        readyAt = base;
+                        expiresAt = base.plusSeconds(ttl * 3600L);
+                        // Répare l'entité pour les prochains polls / scheduler
+                        try {
+                            LocalDateTime readyLdt = LocalDateTime.ofInstant(base, ZoneId.systemDefault());
+                            env.setReadyAt(readyLdt);
+                            env.setExpiresAt(readyLdt.plusHours(ttl));
+                            if (env.getStatus() == EnvironmentStatus.DESTROYED
+                                    || env.getStatus() == EnvironmentStatus.EXPIRED
+                                    || env.getStatus() == EnvironmentStatus.PENDING
+                                    || env.getStatus() == EnvironmentStatus.BUILDING) {
+                                env.setStatus(EnvironmentStatus.RUNNING);
+                                env.setDestroyedAt(null);
+                            }
+                            environmentRepository.save(env);
+                            log.info("TTL réparé pour env {} — ready={}, expires={} ({}h)",
+                                    envId, env.getReadyAt(), env.getExpiresAt(), ttl);
+                        } catch (Exception e) {
+                            log.warn("Impossible de réparer TTL env {}: {}", envId, e.getMessage());
+                        }
+                    }
+                }
+
+                if (expiresAt != null
+                        && deployment.getStatus() != AppDeploymentStatus.STOPPED
+                        && deployment.getStatus() != AppDeploymentStatus.FAILED) {
+                    remainingSeconds = expiresAt.getEpochSecond() - serverTime.getEpochSecond();
+                }
+            }
+        }
+        // Fallback TTL depuis servicesState si env absent
+        if (ttlHours == null && deployment.getServicesState() != null
+                && deployment.getServicesState().get("ttlHours") instanceof Number n) {
+            ttlHours = n.intValue();
+        }
+
         return AppDeploymentResponse.builder()
                 .id(deployment.getId())
                 .namespace(deployment.getNamespace())
@@ -781,7 +1445,19 @@ public class ApplicationManagementService {
                 .createdAt(deployment.getCreatedAt())
                 .updatedAt(deployment.getUpdatedAt())
                 .databases(databases)
+                .ttlHours(ttlHours)
+                .expiresAt(expiresAt)
+                .readyAt(readyAt)
+                .serverTime(serverTime)
+                .remainingSeconds(remainingSeconds)
                 .build();
+    }
+
+    private static Instant toInstant(LocalDateTime ldt) {
+        if (ldt == null) {
+            return null;
+        }
+        return ldt.atZone(ZoneId.systemDefault()).toInstant();
     }
 
     // =====================================================================

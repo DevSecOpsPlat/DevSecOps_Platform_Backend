@@ -62,18 +62,31 @@ public class EnvironmentLifecycleService {
   public void onReady(UUID environmentId, String publicUrl) {
     EphemeralEnvironment env = load(environmentId);
     EnvironmentStatus from = env.getStatus();
+    // Resusciter si détruit trop tôt alors que le déploiement devient Ready
+    if (from == EnvironmentStatus.DESTROYED || from == EnvironmentStatus.EXPIRED) {
+      log.warn("onReady: env {} était {} — restauration RUNNING (TTL)", environmentId, from);
+      env.setStatus(EnvironmentStatus.PENDING);
+      env.setDestroyedAt(null);
+      from = EnvironmentStatus.PENDING;
+    }
     if (from != EnvironmentStatus.PENDING
         && from != EnvironmentStatus.BUILDING
-        && from != EnvironmentStatus.DEGRADED) {
+        && from != EnvironmentStatus.DEGRADED
+        && from != EnvironmentStatus.RUNNING) {
       log.debug("onReady ignoré pour env {} (état {})", environmentId, from);
       return;
     }
     if (publicUrl != null && !publicUrl.isBlank()) {
       env.setUrl(publicUrl.trim());
     }
+    // TTL démarre au Ready (recalcule même si PrePersist avait posé un expiresAt provisoire)
     if (env.getReadyAt() == null) {
       env.setReadyAt(LocalDateTime.now());
     }
+    int ttl = env.getTtlHours() != null && env.getTtlHours() > 0 ? env.getTtlHours() : 4;
+    env.setExpiresAt(env.getReadyAt().plusHours(ttl));
+    log.info("TTL env {} — prêt à {}, expire à {} ({} h)",
+        environmentId, env.getReadyAt(), env.getExpiresAt(), ttl);
     applyTransition(env, EnvironmentStatus.RUNNING, null, false);
     environmentRepository.save(env);
     log.info("✅ Env {} prêt → RUNNING", environmentId);
@@ -135,7 +148,8 @@ public class EnvironmentLifecycleService {
   ) {
     env.setStatus(to);
     if (reason != null && !reason.isBlank()) {
-      env.setStatusReason(reason);
+      // Colonne status_reason = varchar(255) : tronquer pour ne pas masquer l'échec réel.
+      env.setStatusReason(reason.length() <= 255 ? reason : reason.substring(0, 252) + "...");
     }
     if (terminated && env.getTerminatedAt() == null) {
       env.setTerminatedAt(LocalDateTime.now());

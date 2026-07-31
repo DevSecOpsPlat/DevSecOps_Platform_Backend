@@ -30,5 +30,13 @@ public enum AlertType {
     ACCOUNT_ENABLED,
     ACCOUNT_DISABLED,
     ADMIN_PASSWORD_RESET,
-    ADMIN_EMAIL_CHANGED
+    ADMIN_EMAIL_CHANGED,
+    /** Pod CrashLoopBackOff / ImagePullBackOff sur un déploiement managé. */
+    DEPLOYMENT_CRASH_LOOP,
+    /** Pod OOMKilled (mémoire insuffisante). */
+    DEPLOYMENT_OOM,
+    /** Pod Failed. */
+    DEPLOYMENT_POD_FAILED,
+    /** Health URL publique KO. */
+    DEPLOYMENT_HEALTH_FAILED
 }

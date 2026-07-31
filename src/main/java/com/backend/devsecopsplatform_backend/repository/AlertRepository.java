@@ -49,4 +49,10 @@ public interface AlertRepository extends JpaRepository<Alert, UUID>, JpaSpecific
 
     List<Alert> findTop1ByDeletedFalseAndIpAddressAndCreatedAtAfterOrderByCreatedAtDesc(
             String ipAddress, LocalDateTime since);
+
+    boolean existsByDeletedFalseAndTypeAndMessageAndCreatedAtAfter(
+            AlertType type, String message, LocalDateTime since);
+
+    List<Alert> findByDeletedFalseAndTypeInAndCreatedAtAfterOrderByCreatedAtDesc(
+            List<AlertType> types, LocalDateTime since);
 }

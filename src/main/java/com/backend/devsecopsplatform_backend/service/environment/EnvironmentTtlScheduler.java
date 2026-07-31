@@ -21,6 +21,7 @@ public class EnvironmentTtlScheduler {
     private final EphemeralEnvironmentRepository environmentRepository;
     private final EnvironmentLifecycleService lifecycle;
     private final K8sManifestApplyService k8sManifestApplyService;
+    private final com.backend.devsecopsplatform_backend.service.appmgmt.AppDeploymentService appDeploymentService;
 
     /**
      * Passe logique : marque EXPIRED les environnements vivants dont le TTL est dépassé.
@@ -39,6 +40,7 @@ public class EnvironmentTtlScheduler {
             log.info("⏰ Env {} (id={}) TTL dépassé (expiresAt={}) → EXPIRED",
                     env.getEnvironmentName(), env.getId(), env.getExpiresAt());
             lifecycle.onExpired(env.getId(), reason);
+            appDeploymentService.markStoppedFromTtl(env.getId());
         }
     }
 

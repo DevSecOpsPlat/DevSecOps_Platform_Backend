@@ -22,4 +22,15 @@ public class AppDeploymentResponse {
     private Instant updatedAt;
     /** Bases avec URL de connexion générée (mot de passe masqué), pour l'écran d'état. */
     private List<AppDatabaseResponse> databases;
+
+    /** TTL configuré (heures) — depuis l'environnement éphémère lié. */
+    private Integer ttlHours;
+    /** Instant d'expiration serveur (horloge backend). Null tant que non Ready. */
+    private Instant expiresAt;
+    /** Instant où l'env est devenu Ready (début réel du TTL). */
+    private Instant readyAt;
+    /** Horloge serveur pour corriger le décalage client (countdown exact). */
+    private Instant serverTime;
+    /** Secondes restantes (calcul serveur). Negatif si expiré. */
+    private Long remainingSeconds;
 }

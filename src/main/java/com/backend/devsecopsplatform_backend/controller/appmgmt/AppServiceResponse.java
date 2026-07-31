@@ -26,6 +26,7 @@ public class AppServiceResponse {
     private String dbUrlEnvVar;
     private Integer replicas;
     private String healthCheckPath;
+    private String contextPath;
     private String cpuRequest;
     private String cpuLimit;
     private String memoryRequest;

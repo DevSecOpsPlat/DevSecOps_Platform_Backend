@@ -2,11 +2,13 @@ package com.backend.devsecopsplatform_backend.configuration;
 
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.gitlab4j.api.GitLabApi;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
 
 @Configuration
 public class GitLabConfig {
@@ -23,12 +25,17 @@ public class GitLabConfig {
         return new GitLabApi(gitlabUrl, gitlabToken);
     }
 
+    /**
+     * ObjectMapper partagé — doit écrire Instant/LocalDateTime en ISO-8601
+     * (pas en epoch secondes), sinon le front Angular date pipe / Date.parse casse
+     * (affichage 1970 + chrono TTL vide).
+     */
     @Bean
+    @Primary
     public ObjectMapper objectMapper() {
         ObjectMapper mapper = new ObjectMapper();
-        // Indispensable pour gérer les dates Java 8 (LocalDateTime) de tes entités
         mapper.registerModule(new JavaTimeModule());
-        // Éviter les erreurs si le JSON contient des champs inconnus
+        mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
         mapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
         return mapper;
     }

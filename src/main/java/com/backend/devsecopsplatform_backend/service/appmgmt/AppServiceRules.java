@@ -32,6 +32,9 @@ public final class AppServiceRules {
     /** Identifiant C pour clé d'env K8s. */
     public static final Pattern ENV_VAR_KEY = Pattern.compile("^[A-Za-z_][A-Za-z0-9_]*$");
 
+    /** Chemin métier HTTP (context-path) : /projet, /api/v1 — pas de // ni de trailing slash. */
+    public static final Pattern CONTEXT_PATH = Pattern.compile("^(/[A-Za-z0-9._\\-]+)+$");
+
     public static final Pattern CPU_QUANTITY = Pattern.compile(
             "^([0-9]+(\\.[0-9]+)?)(m)?$"
     );
@@ -94,6 +97,37 @@ public final class AppServiceRules {
             throw new AppValidationException(
                     fieldLabel + " invalide : chemin relatif requis, sans « .. », espace ni chemin absolu "
                             + "(ex. Dockerfile, ./Dockerfile, backend/).");
+        }
+    }
+
+    /**
+     * Normalise un chemin métier : {@code null}/vide/{@code /} → {@code null} ;
+     * {@code /projet/} → {@code /projet}.
+     */
+    public static String normalizeContextPath(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        String path = raw.trim();
+        while (path.endsWith("/") && path.length() > 1) {
+            path = path.substring(0, path.length() - 1);
+        }
+        if ("/".equals(path)) {
+            return null;
+        }
+        return path;
+    }
+
+    public static void assertContextPath(String raw) {
+        String path = normalizeContextPath(raw);
+        if (path == null) {
+            return;
+        }
+        if (path.contains("..") || path.contains(" ") || path.contains("//")
+                || !CONTEXT_PATH.matcher(path).matches()) {
+            throw new AppValidationException(
+                    "Chemin métier invalide « " + raw
+                            + " » : utilisez un chemin absolu simple (ex. /projet, /api/v1).");
         }
     }
 

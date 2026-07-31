@@ -59,6 +59,11 @@ public class AppK8sManifestService {
         String pullSecretName;     // ex. gitlab-registry
         boolean ingressEnabled;
         String ingressDomain;      // ex. 192.168.130.138.nip.io → app-<ns>.<domain>
+        /**
+         * Hostname override (custom domain). Si renseigné, remplace
+         * {@code app-{ns}.{ingressDomain}} pour l'Ingress applicatif.
+         */
+        String customHostname;
         boolean pathBasedRouting; // true = un hôte /app + chemins /api ; false = hôte par service
         /** Images complètes, validées par nom K8s, pour le déploiement atomique multi-service. */
         Map<String, String> resolvedServiceImages;
@@ -154,6 +159,16 @@ public class AppK8sManifestService {
         return dumpAll(docs);
     }
 
+    /**
+     * Ingress + Middleware Traefik uniquement — à appliquer après que les workloads soient Ready
+     * (évite qu'un hang CRD bloque l'attente pods / le statut CI).
+     */
+    public String generateIngressBundle(ManagedApplication app, String namespace, ManifestOptions opts) {
+        List<Map<String, Object>> docs = new ArrayList<>();
+        appendIngressDocs(app, namespace, opts, docs);
+        return dumpAll(docs);
+    }
+
     private void appendIngressDocs(
             ManagedApplication app,
             String namespace,
@@ -161,6 +176,7 @@ public class AppK8sManifestService {
             List<Map<String, Object>> docs
     ) {
         if (opts.isIngressEnabled() && opts.isPathBasedRouting()) {
+            docs.addAll(applicationPathMiddlewares(app, namespace, opts));
             Map<String, Object> ingress = applicationIngress(app, namespace, opts);
             if (ingress != null) {
                 docs.add(ingress);
@@ -306,7 +322,9 @@ public class AppK8sManifestService {
         podSpec.put("volumes", List.of(pvcVolume(svcName + "-data", svcName + "-data")));
 
         Map<String, Object> m = base("apps/v1", "Deployment");
-        m.put("metadata", meta(svcName, namespace));
+        Map<String, Object> metadata = meta(svcName, namespace);
+        metadata.put("labels", dbLabels(svcName));
+        m.put("metadata", metadata);
         Map<String, Object> spec = new LinkedHashMap<>();
         spec.put("replicas", 1);
         Map<String, Object> selector = new LinkedHashMap<>();
@@ -327,7 +345,9 @@ public class AppK8sManifestService {
         podSpec.put("containers", List.of(container));
 
         Map<String, Object> m = base("apps/v1", "StatefulSet");
-        m.put("metadata", meta(svcName, namespace));
+        Map<String, Object> metadata = meta(svcName, namespace);
+        metadata.put("labels", dbLabels(svcName));
+        m.put("metadata", metadata);
         Map<String, Object> spec = new LinkedHashMap<>();
         spec.put("serviceName", svcName);
         spec.put("replicas", 1);
@@ -448,7 +468,8 @@ public class AppK8sManifestService {
             if (var.isSecret()) {
                 env.add(envFromSecret(var.getVarKey(), name + "-secrets", var.getVarKey()));
             } else {
-                env.add(envPlain(var.getVarKey(), nz(var.getVarValue())));
+                env.add(envPlain(var.getVarKey(),
+                        resolveServiceUrlPlaceholders(nz(var.getVarValue()), app, svc, namespace)));
             }
         }
         // Injection BD : URL (+ user/password hors URL pour les engines JDBC / Cassandra).
@@ -468,6 +489,26 @@ public class AppK8sManifestService {
                 }
             }
         }
+        AppService dependency = findServiceDependency(app, svc);
+        if (svc.getRole() == AppServiceRole.FRONTEND && resolveFrontendApiBackend(app, svc) != null) {
+            for (String alias : List.of(
+                    "API_URL",
+                    "PUBLIC_API_URL",
+                    "VITE_API_URL",
+                    "VUE_APP_API_URL",
+                    "REACT_APP_API_URL",
+                    "NEXT_PUBLIC_API_URL",
+                    "NUXT_PUBLIC_API_BASE",
+                    "ANGULAR_API_URL")) {
+                addPlainEnvIfAbsent(env, alias, "/api");
+            }
+            addPlainEnvIfAbsent(env, "DEPENDENCY_URL", "/api");
+        } else if (dependency != null && dependency.getExposedPort() != null) {
+            String dependencyUrl = internalServiceUrl(dependency, namespace);
+            addPlainEnvIfAbsent(env, "DEPENDENCY_URL", dependencyUrl);
+            addPlainEnvIfAbsent(env, "UPSTREAM_URL", dependencyUrl);
+            addPlainEnvIfAbsent(env, "SERVICE_URL", dependencyUrl);
+        }
 
         Map<String, Object> container = new LinkedHashMap<>();
         container.put("name", name);
@@ -476,8 +517,9 @@ public class AppK8sManifestService {
         if (port != null) {
             container.put("ports", List.of(containerPort(port)));
             if (svc.getHealthCheckPath() != null && !svc.getHealthCheckPath().isBlank()) {
-                container.put("readinessProbe", httpProbe(svc.getHealthCheckPath(), port, 10, 5));
-                container.put("livenessProbe", httpProbe(svc.getHealthCheckPath(), port, 30, 15));
+                String probePath = resolveHealthProbePath(svc);
+                container.put("readinessProbe", httpProbe(probePath, port, 10, 5));
+                container.put("livenessProbe", httpProbe(probePath, port, 30, 15));
             } else {
                 container.put("readinessProbe", tcpProbe(port, 10, 10));
                 container.put("livenessProbe", tcpProbe(port, 30, 20));
@@ -578,7 +620,7 @@ public class AppK8sManifestService {
     }
 
     private Map<String, Object> serviceIngress(AppService svc, String namespace, String name, ManifestOptions opts) {
-        String host = name + "-" + namespace + "." + opts.getIngressDomain();
+        String host = resolveServiceHost(name, namespace, opts);
 
         Map<String, Object> backendService = new LinkedHashMap<>();
         backendService.put("name", name);
@@ -605,7 +647,7 @@ public class AppK8sManifestService {
 
         Map<String, Object> m = base("networking.k8s.io/v1", "Ingress");
         Map<String, Object> metadata = meta(name, namespace);
-        Map<String, String> annotations = ingressAnnotations(opts, false);
+        Map<String, String> annotations = ingressAnnotations(opts, false, "/");
         if (!annotations.isEmpty()) {
             metadata.put("annotations", annotations);
         }
@@ -614,10 +656,29 @@ public class AppK8sManifestService {
         return m;
     }
 
+    /** Hostname Ingress applicatif (custom ou app-ns.domain). */
+    static String resolveAppHost(String namespace, ManifestOptions opts) {
+        if (opts != null && opts.getCustomHostname() != null && !opts.getCustomHostname().isBlank()) {
+            return opts.getCustomHostname().trim().toLowerCase();
+        }
+        String domain = opts != null && opts.getIngressDomain() != null ? opts.getIngressDomain() : "nip.io";
+        return "app-" + namespace + "." + domain;
+    }
+
+    private static String resolveServiceHost(String k8sName, String namespace, ManifestOptions opts) {
+        if (opts != null && opts.getCustomHostname() != null && !opts.getCustomHostname().isBlank()) {
+            // Domaine custom → un seul hôte (path-based) ; host per-service déconseillé
+            return opts.getCustomHostname().trim().toLowerCase();
+        }
+        String domain = opts != null && opts.getIngressDomain() != null ? opts.getIngressDomain() : "nip.io";
+        return k8sName + "-" + namespace + "." + domain;
+    }
+
     /**
-     * Un seul Ingress pour toute l'application. Le service primaire (FRONTEND, ou à défaut
-     * le premier exposé) est monté sur {@code /}. Les autres services exposés reçoivent
-     * un préfixe {@code /<nom>} — même origine, pas de CORS.
+     * Un seul Ingress pour toute l'application. Le frontend est monté sur {@code /}, le
+     * backend primaire sur {@code /api}, puis les éventuels autres services sur
+     * {@code /<nom>}. {@code /api} est réécrit vers le chemin métier du backend
+     * ({@code contextPath}, ex. {@code /projet}) ou simplement retiré s'il est vide.
      */
     private Map<String, Object> applicationIngress(ManagedApplication app, String namespace, ManifestOptions opts) {
         List<AppService> exposed = app.getServices().stream()
@@ -632,15 +693,19 @@ public class AppK8sManifestService {
                 .filter(s -> s.getRole() == AppServiceRole.FRONTEND)
                 .findFirst()
                 .orElse(exposed.get(0));
+        AppService primaryBackend = resolveFrontendApiBackend(app, primary);
 
-        String host = "app-" + namespace + "." + opts.getIngressDomain();
+        String host = resolveAppHost(namespace, opts);
         List<Map<String, Object>> paths = new ArrayList<>();
         boolean needsNginxRewrite = false;
         boolean traefik = isTraefikIngress(opts);
+        String nginxRewriteTarget = "/$2";
 
         for (AppService svc : exposed) {
             String name = AppNaming.k8sName(svc.getName());
             boolean isPrimary = java.util.Objects.equals(svc.getId(), primary.getId());
+            boolean isApiBackend = primaryBackend != null
+                    && java.util.Objects.equals(svc.getId(), primaryBackend.getId());
 
             Map<String, Object> port = new LinkedHashMap<>();
             port.put("number", svc.getExposedPort());
@@ -655,12 +720,17 @@ public class AppK8sManifestService {
                 path.put("path", "/");
                 path.put("pathType", "Prefix");
             } else if (traefik) {
-                path.put("path", "/" + name);
+                path.put("path", isApiBackend ? "/api" : "/" + name);
                 path.put("pathType", "Prefix");
             } else {
-                path.put("path", "/" + name + "(/|$)(.*)");
+                String prefix = isApiBackend ? "/api" : "/" + name;
+                path.put("path", prefix + "(/|$)(.*)");
                 path.put("pathType", "ImplementationSpecific");
                 needsNginxRewrite = true;
+                if (isApiBackend) {
+                    String context = AppServiceRules.normalizeContextPath(svc.getContextPath());
+                    nginxRewriteTarget = context == null ? "/$2" : context + "/$2";
+                }
             }
             path.put("backend", backend);
             paths.add(path);
@@ -678,13 +748,108 @@ public class AppK8sManifestService {
 
         Map<String, Object> m = base("networking.k8s.io/v1", "Ingress");
         Map<String, Object> metadata = meta("app-ingress", namespace);
-        Map<String, String> annotations = ingressAnnotations(opts, needsNginxRewrite);
+        Map<String, String> annotations = ingressAnnotations(opts, needsNginxRewrite, nginxRewriteTarget);
+        List<String> middlewareRefs = traefikMiddlewareRefs(namespace, app, primary, primaryBackend);
+        if (!middlewareRefs.isEmpty()) {
+            annotations.put("traefik.ingress.kubernetes.io/router.middlewares",
+                    String.join(",", middlewareRefs));
+        }
         if (!annotations.isEmpty()) {
             metadata.put("annotations", annotations);
         }
         m.put("metadata", metadata);
         m.put("spec", spec);
         return m;
+    }
+
+    private List<Map<String, Object>> applicationPathMiddlewares(
+            ManagedApplication app,
+            String namespace,
+            ManifestOptions opts
+    ) {
+        if (!isTraefikIngress(opts)) {
+            return List.of();
+        }
+        List<AppService> exposed = app.getServices().stream()
+                .filter(this::isExternallyExposed)
+                .filter(s -> s.getExposedPort() != null)
+                .toList();
+        AppService primary = exposed.stream()
+                .filter(s -> s.getRole() == AppServiceRole.FRONTEND)
+                .findFirst()
+                .orElse(exposed.isEmpty() ? null : exposed.get(0));
+        if (primary == null) {
+            return List.of();
+        }
+        AppService primaryBackend = resolveFrontendApiBackend(app, primary);
+        List<Map<String, Object>> middlewares = new ArrayList<>();
+
+        String backendContext = primaryBackend == null
+                ? null
+                : AppServiceRules.normalizeContextPath(primaryBackend.getContextPath());
+        if (primaryBackend != null && backendContext != null) {
+            Map<String, Object> rewrite = base("traefik.io/v1alpha1", "Middleware");
+            rewrite.put("metadata", meta("app-api-rewrite", namespace));
+            Map<String, Object> replace = new LinkedHashMap<>();
+            replace.put("regex", "^/api(.*)$");
+            replace.put("replacement", backendContext + "$1");
+            rewrite.put("spec", Map.of("replacePathRegex", replace));
+            middlewares.add(rewrite);
+        }
+
+        List<String> stripPrefixes = new ArrayList<>();
+        for (AppService service : exposed) {
+            if (java.util.Objects.equals(service.getId(), primary.getId())) {
+                continue;
+            }
+            boolean isApiBackend = primaryBackend != null
+                    && java.util.Objects.equals(service.getId(), primaryBackend.getId());
+            if (isApiBackend) {
+                if (backendContext == null) {
+                    stripPrefixes.add("/api");
+                }
+            } else {
+                stripPrefixes.add("/" + AppNaming.k8sName(service.getName()));
+            }
+        }
+        if (!stripPrefixes.isEmpty()) {
+            Map<String, Object> strip = base("traefik.io/v1alpha1", "Middleware");
+            strip.put("metadata", meta("app-strip-prefix", namespace));
+            strip.put("spec", Map.of("stripPrefix", Map.of("prefixes", stripPrefixes)));
+            middlewares.add(strip);
+        }
+        return middlewares;
+    }
+
+    private List<String> traefikMiddlewareRefs(
+            String namespace,
+            ManagedApplication app,
+            AppService primary,
+            AppService primaryBackend
+    ) {
+        List<String> refs = new ArrayList<>();
+        if (primaryBackend != null
+                && AppServiceRules.normalizeContextPath(primaryBackend.getContextPath()) != null) {
+            refs.add(namespace + "-app-api-rewrite@kubernetescrd");
+        }
+        boolean needsStrip = app.getServices().stream()
+                .filter(this::isExternallyExposed)
+                .filter(s -> s.getExposedPort() != null)
+                .anyMatch(service -> {
+                    if (java.util.Objects.equals(service.getId(), primary.getId())) {
+                        return false;
+                    }
+                    boolean isApiBackend = primaryBackend != null
+                            && java.util.Objects.equals(service.getId(), primaryBackend.getId());
+                    if (isApiBackend) {
+                        return AppServiceRules.normalizeContextPath(primaryBackend.getContextPath()) == null;
+                    }
+                    return true;
+                });
+        if (needsStrip) {
+            refs.add(namespace + "-app-strip-prefix@kubernetescrd");
+        }
+        return refs;
     }
 
     private void applyIngressClassName(Map<String, Object> spec, ManifestOptions opts) {
@@ -698,7 +863,11 @@ public class AppK8sManifestService {
         return controller == null || controller.isBlank() || "traefik".equalsIgnoreCase(controller.trim());
     }
 
-    private Map<String, String> ingressAnnotations(ManifestOptions opts, boolean needsNginxRewrite) {
+    private Map<String, String> ingressAnnotations(
+            ManifestOptions opts,
+            boolean needsNginxRewrite,
+            String nginxRewriteTarget
+    ) {
         if (isTraefikIngress(opts)) {
             Map<String, String> traefik = new LinkedHashMap<>();
             traefik.put("traefik.ingress.kubernetes.io/router.entrypoints", "web");
@@ -707,9 +876,11 @@ public class AppK8sManifestService {
             return traefik;
         }
         if (needsNginxRewrite) {
-            return Map.of(
-                    "nginx.ingress.kubernetes.io/rewrite-target", "/$2",
-                    "nginx.ingress.kubernetes.io/use-regex", "true");
+            Map<String, String> nginx = new LinkedHashMap<>();
+            nginx.put("nginx.ingress.kubernetes.io/rewrite-target",
+                    nginxRewriteTarget == null || nginxRewriteTarget.isBlank() ? "/$2" : nginxRewriteTarget);
+            nginx.put("nginx.ingress.kubernetes.io/use-regex", "true");
+            return nginx;
         }
         return Map.of("nginx.ingress.kubernetes.io/rewrite-target", "/");
     }
@@ -753,6 +924,79 @@ public class AppK8sManifestService {
         e.put("name", name);
         e.put("value", value);
         return e;
+    }
+
+    private void addPlainEnvIfAbsent(List<Map<String, Object>> env, String name, String value) {
+        boolean exists = env.stream().anyMatch(item -> name.equals(item.get("name")));
+        if (!exists) {
+            env.add(envPlain(name, value));
+        }
+    }
+
+    private AppService findServiceDependency(ManagedApplication app, AppService service) {
+        if (service.getDependsOnServiceId() == null) {
+            return null;
+        }
+        return app.getServices().stream()
+                .filter(candidate -> service.getDependsOnServiceId().equals(candidate.getId()))
+                .findFirst()
+                .orElse(null);
+    }
+
+    private AppService resolveFrontendApiBackend(ManagedApplication app, AppService frontend) {
+        AppService declaredDependency = findServiceDependency(app, frontend);
+        if (declaredDependency != null
+                && declaredDependency.getRole() == AppServiceRole.BACKEND
+                && declaredDependency.getExposedPort() != null
+                && isExternallyExposed(declaredDependency)) {
+            return declaredDependency;
+        }
+        return app.getServices().stream()
+                .filter(service -> service.getRole() == AppServiceRole.BACKEND)
+                .filter(this::isExternallyExposed)
+                .filter(service -> service.getExposedPort() != null)
+                .findFirst()
+                .orElse(null);
+    }
+
+    private String internalServiceUrl(AppService service, String namespace) {
+        String base = "http://" + AppNaming.k8sName(service.getName()) + "."
+                + namespace + ".svc.cluster.local:" + service.getExposedPort();
+        String context = AppServiceRules.normalizeContextPath(service.getContextPath());
+        return context == null ? base : base + context;
+    }
+
+    private String resolveHealthProbePath(AppService service) {
+        String path = service.getHealthCheckPath().trim();
+        if (!path.startsWith("/")) {
+            path = "/" + path;
+        }
+        String context = AppServiceRules.normalizeContextPath(service.getContextPath());
+        if (context == null || path.equals(context) || path.startsWith(context + "/")) {
+            return path;
+        }
+        return context + path;
+    }
+
+    private String resolveServiceUrlPlaceholders(
+            String value,
+            ManagedApplication app,
+            AppService service,
+            String namespace
+    ) {
+        AppService dependency = findServiceDependency(app, service);
+        String dependencyUrl = null;
+        if (service.getRole() == AppServiceRole.FRONTEND && resolveFrontendApiBackend(app, service) != null) {
+            dependencyUrl = "/api";
+        } else if (dependency != null && dependency.getExposedPort() != null) {
+            dependencyUrl = internalServiceUrl(dependency, namespace);
+        }
+        String resolved = value.replace("${PUBLIC_API_URL}",
+                service.getRole() == AppServiceRole.FRONTEND ? "/api" : "");
+        if (dependencyUrl != null) {
+            resolved = resolved.replace("${DEPENDENCY_URL}", dependencyUrl);
+        }
+        return resolved;
     }
 
     private Map<String, Object> envFromSecret(String name, String secretName, String key) {

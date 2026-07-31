@@ -46,6 +46,13 @@ public class ManagedApplication {
     @Column(name = "description", columnDefinition = "TEXT")
     private String description;
 
+    /**
+     * Hostname Ingress personnalisé (ex. demo.example.com).
+     * Si null → défaut {@code app-{namespace}.{ingressDomain}} (nip.io).
+     */
+    @Column(name = "custom_hostname", length = 253)
+    private String customHostname;
+
     @ManyToOne(fetch = FetchType.LAZY, optional = false)
     @JoinColumn(name = "created_by", nullable = false)
     @JsonIgnoreProperties({"services", "ephemeralEnvironments", "password"})
