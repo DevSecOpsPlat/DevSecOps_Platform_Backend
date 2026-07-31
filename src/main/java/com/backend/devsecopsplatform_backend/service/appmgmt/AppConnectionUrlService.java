@@ -68,6 +68,26 @@ public class AppConnectionUrlService {
     }
 
     /**
+     * URI applicative standard pour les frameworks non-JDBC (SQLAlchemy, Node, etc.).
+     * Les moteurs déjà basés sur une URI conservent leur format habituel.
+     */
+    public String buildApplicationConnectionUrl(AppDatabase db, String namespace) {
+        String host = internalHost(db, namespace);
+        int port = db.getExposedPort() != null ? db.getExposedPort() : db.getEngine().defaultPort();
+        String dbName = db.getDbName();
+        String user = enc(AppDatabaseRules.effectiveRootUser(db));
+        String password = enc(db.getRootPassword() != null ? db.getRootPassword() : "");
+        String userInfo = user + ":" + password + "@";
+
+        return switch (db.getEngine()) {
+            case POSTGRES -> "postgresql://" + userInfo + host + ":" + port + "/" + dbName;
+            case MYSQL -> "mysql://" + userInfo + host + ":" + port + "/" + dbName;
+            case MARIADB -> "mariadb://" + userInfo + host + ":" + port + "/" + dbName;
+            default -> buildConnectionUrl(db, namespace);
+        };
+    }
+
+    /**
      * Version masquée de l'URL (mot de passe remplacé par ••••••), pour l'API et l'UI.
      * Masque sur la forme claire ET encodée pour éviter une fuite si l'encodage diffère.
      */

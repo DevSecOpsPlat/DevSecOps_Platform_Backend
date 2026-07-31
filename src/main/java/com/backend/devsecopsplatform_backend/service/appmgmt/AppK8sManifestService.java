@@ -42,6 +42,7 @@ import java.util.UUID;
 public class AppK8sManifestService {
 
     private static final String CONNECTION_URL_KEY = "CONNECTION_URL";
+    private static final String JDBC_URL_KEY = "JDBC_URL";
 
     private final AppConnectionUrlService connectionUrlService;
 
@@ -270,7 +271,8 @@ public class AppK8sManifestService {
         data.put("ROOT_USER", nz(AppDatabaseRules.effectiveRootUser(db)));
         data.put("ROOT_PASSWORD", nz(db.getRootPassword()));
         data.put("DB_NAME", nz(db.getDbName()));
-        data.put(CONNECTION_URL_KEY, nz(connectionUrlService.buildConnectionUrl(db, namespace)));
+        data.put(CONNECTION_URL_KEY, nz(connectionUrlService.buildApplicationConnectionUrl(db, namespace)));
+        data.put(JDBC_URL_KEY, nz(connectionUrlService.buildConnectionUrl(db, namespace)));
         m.put("stringData", data);
         return m;
     }
@@ -458,7 +460,8 @@ public class AppK8sManifestService {
                 String secret = dbSvc + "-credentials";
                 String urlEnv = (svc.getDbUrlEnvVar() != null && !svc.getDbUrlEnvVar().isBlank())
                         ? svc.getDbUrlEnvVar() : "DATABASE_URL";
-                env.add(envFromSecret(urlEnv, secret, CONNECTION_URL_KEY));
+                String urlSecretKey = requiresJdbcUrl(urlEnv) ? JDBC_URL_KEY : CONNECTION_URL_KEY;
+                env.add(envFromSecret(urlEnv, secret, urlSecretKey));
                 if (AppDatabaseRules.credentialsOutsideUrl(db.getEngine())) {
                     env.add(envFromSecret("DATABASE_USER", secret, "ROOT_USER"));
                     env.add(envFromSecret("DATABASE_PASSWORD", secret, "ROOT_PASSWORD"));
@@ -511,6 +514,11 @@ public class AppK8sManifestService {
         spec.put("template", podTemplate(labels, podSpec));
         m.put("spec", spec);
         return m;
+    }
+
+    private static boolean requiresJdbcUrl(String envName) {
+        String normalized = envName != null ? envName.trim().toUpperCase() : "";
+        return normalized.contains("JDBC") || normalized.startsWith("SPRING_DATASOURCE_");
     }
 
     /**
