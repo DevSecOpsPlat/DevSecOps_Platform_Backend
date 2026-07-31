@@ -1,6 +1,7 @@
 package com.backend.devsecopsplatform_backend.repository;
 
 import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDeployment;
+import org.springframework.data.jpa.repository.EntityGraph;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.stereotype.Repository;
 
@@ -14,4 +15,8 @@ public interface AppDeploymentRepository extends JpaRepository<AppDeployment, UU
     List<AppDeployment> findByApplication_IdOrderByCreatedAtDesc(UUID applicationId);
 
     Optional<AppDeployment> findByIdAndApplication_Id(UUID id, UUID applicationId);
+
+    /** Charge {@code application} uniquement — pas les collections (évite le conflit bag Hibernate). */
+    @EntityGraph(attributePaths = {"application"})
+    Optional<AppDeployment> findWithApplicationById(UUID id);
 }

@@ -36,6 +36,8 @@ public interface EphemeralEnvironmentRepository extends JpaRepository<EphemeralE
     List<EphemeralEnvironment> findByStatusIn(Collection<EnvironmentStatus> statuses);
     List<EphemeralEnvironment> findByService_Id(UUID serviceId);
 
+    Optional<EphemeralEnvironment> findFirstByNamespaceOrderByCreatedAtDesc(String namespace);
+
     List<EphemeralEnvironment> findByService_IdAndGitBranchOrderByCreatedAtDesc(
             UUID serviceId, String gitBranch);
 

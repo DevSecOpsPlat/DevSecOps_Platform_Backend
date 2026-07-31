@@ -38,9 +38,11 @@ public class EnvironmentReconcileScheduler {
             boolean ready = k8sManifestApplyService.areAllDeploymentsReady(namespace);
             if (ready) {
                 lifecycle.onReady(env.getId(), env.getUrl());
-            } else if (env.getStatus() == EnvironmentStatus.RUNNING) {
+            } else if (env.getStatus() == EnvironmentStatus.RUNNING
+                    && k8sManifestApplyService.hasWorkloads(namespace)) {
                 lifecycle.onDegraded(env.getId(), "Aucun pod prêt dans le namespace");
             }
+            // BUILDING / PENDING : pas de transition DEGRADED tant que les workloads n'existent pas
         }
     }
 }

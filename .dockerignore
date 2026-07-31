@@ -1,0 +1,21 @@
+# Maven build output
+target
+
+# Logs
+**/*.log
+
+# Git
+.git
+.gitignore
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode
+.idea
+.bevel
+
+# Docker
+docker-compose*.yml

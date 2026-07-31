@@ -2,6 +2,7 @@ package com.backend.devsecopsplatform_backend.repository;
 
 import com.backend.devsecopsplatform_backend.entity.AppService;
 import com.backend.devsecopsplatform_backend.entity.User;
+import org.springframework.data.jpa.repository.EntityGraph;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
@@ -75,6 +76,9 @@ public interface AppServiceRepository extends JpaRepository<AppService, UUID> {
     List<AppService> findActiveApplications();
 
     List<AppService> findByManagedApplication_Id(UUID managedApplicationId);
+
+    @EntityGraph(attributePaths = {"envVars"})
+    List<AppService> findWithEnvVarsByManagedApplication_Id(UUID managedApplicationId);
 
     Optional<AppService> findByIdAndManagedApplication_Id(UUID id, UUID managedApplicationId);
 

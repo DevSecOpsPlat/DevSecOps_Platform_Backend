@@ -1,0 +1,41 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: envirotest-postgres
+    environment:
+      POSTGRES_DB: EnviroTest
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: admin
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: envirotest-backend
+    depends_on:
+      - db
+    ports:
+      - "8089:8089"
+    env_file:
+      - ../DevSecOps_Platform_Frontend/.env
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/EnviroTest
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: admin
+      APP_SECURITY_TRUST_LOCALHOST: "false"
+      SERVER_PORT: 8089
+      APP_FRONTEND_URL: http://localhost:4200
+      K8S_API_URL: ${K8S_API_URL:-https://192.168.92.10:6443}
+      K8S_TOKEN: ${K8S_TOKEN:-}
+      K8S_INSECURE_SKIP_TLS_VERIFY: ${K8S_INSECURE_SKIP_TLS_VERIFY:-true}
+      DEPLOYMENT_INGRESS_DOMAIN: ${DEPLOYMENT_INGRESS_DOMAIN:-192.168.92.10.nip.io}
+      DEPLOYMENT_PREVIEW_NIP_MASTER_IP: ${DEPLOYMENT_PREVIEW_NIP_MASTER_IP:-192.168.92.10}
+      PIPELINE_SECRET: ${PIPELINE_SECRET:-}
+      BACKEND_PUBLIC_URL: ${BACKEND_PUBLIC_URL:-}
+
+volumes:
+  postgres_data:

@@ -50,6 +50,10 @@ public class AppDeployment {
     @Column(name = "gitlab_pipeline_id")
     private Long gitlabPipelineId;
 
+    /** Environnement éphémère lié (TTL, lifecycle) — distinct de {@link #id}. */
+    @Column(name = "ephemeral_environment_id")
+    private UUID ephemeralEnvironmentId;
+
     @Column(name = "deployed_at")
     private Instant deployedAt;
 

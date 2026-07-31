@@ -1,6 +1,7 @@
 package com.backend.devsecopsplatform_backend.service.appmgmt;
 
 import com.backend.devsecopsplatform_backend.entity.AppService;
+import com.backend.devsecopsplatform_backend.entity.appmgmt.AppServiceRole;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.ManagedApplication;
 
 import java.util.ArrayList;
@@ -22,14 +23,14 @@ public final class ServiceTopology {
     }
 
     /**
-     * Vague = 1 + profondeur max des dépendances service.
-     * Les services sans {@code dependsOnServiceId} sont en vague 1 (après les bases = vague 0).
-     * Un service qui dépend d'un autre est déployé après celui-ci.
+     * Les bases sont en vague 0, les backends/workers commencent en vague 1 et les frontends
+     * en vague 2. Une dépendance impose toujours une vague strictement postérieure.
      *
      * <p>Note : {@code dependsOnDatabaseId} n'augmente pas la vague service —
      * les bases sont toujours appliquées en vague 0 avant tout service.</p>
      */
     public static Map<Integer, List<AppService>> computeWaves(ManagedApplication app) {
+        assertNoCycle(app, null, null);
         Map<UUID, AppService> byId = new HashMap<>();
         for (AppService svc : app.getServices()) {
             if (svc.getId() != null) {
@@ -37,18 +38,17 @@ public final class ServiceTopology {
             }
         }
 
-        Map<UUID, Integer> depthCache = new HashMap<>();
+        Map<UUID, Integer> waveCache = new HashMap<>();
         Map<Integer, List<AppService>> waves = new LinkedHashMap<>();
 
         for (AppService svc : app.getServices()) {
-            int depth = depthOf(svc, byId, depthCache, new HashSet<>());
-            int wave = depth + 1; // 1-based among services
+            int wave = waveOf(svc, byId, waveCache, new HashSet<>());
             waves.computeIfAbsent(wave, k -> new ArrayList<>()).add(svc);
         }
         return waves;
     }
 
-    private static int depthOf(
+    private static int waveOf(
             AppService svc,
             Map<UUID, AppService> byId,
             Map<UUID, Integer> cache,
@@ -57,24 +57,25 @@ public final class ServiceTopology {
         if (svc.getId() != null && cache.containsKey(svc.getId())) {
             return cache.get(svc.getId());
         }
-        UUID depId = svc.getDependsOnServiceId();
-        if (depId == null) {
-            if (svc.getId() != null) {
-                cache.put(svc.getId(), 0);
-            }
-            return 0;
-        }
         if (svc.getId() != null && !visiting.add(svc.getId())) {
-            // Cycle — profondeur 0 ici ; assertNoCycle lève l'erreur métier.
-            return 0;
+            throw new AppValidationException("Cycle de dépendances détecté entre services.");
         }
-        AppService dep = byId.get(depId);
-        int d = dep == null ? 0 : 1 + depthOf(dep, byId, cache, visiting);
+
+        int wave = svc.getRole() == AppServiceRole.FRONTEND ? 2 : 1;
+        UUID depId = svc.getDependsOnServiceId();
+        AppService dep = depId != null ? byId.get(depId) : null;
+        if (dep != null) {
+            if (svc.getRole() != AppServiceRole.FRONTEND && dep.getRole() == AppServiceRole.FRONTEND) {
+                throw new AppValidationException(
+                        "Un backend ou worker ne peut pas dépendre d'un frontend.");
+            }
+            wave = Math.max(wave, waveOf(dep, byId, cache, visiting) + 1);
+        }
         if (svc.getId() != null) {
             visiting.remove(svc.getId());
-            cache.put(svc.getId(), d);
+            cache.put(svc.getId(), wave);
         }
-        return d;
+        return wave;
     }
 
     /**
@@ -86,9 +87,6 @@ public final class ServiceTopology {
             UUID pendingEdgeFrom,
             UUID pendingEdgeTo
     ) {
-        if (pendingEdgeTo == null) {
-            return;
-        }
         Map<UUID, UUID> edges = new HashMap<>();
         for (AppService svc : app.getServices()) {
             if (svc.getId() != null && svc.getDependsOnServiceId() != null) {

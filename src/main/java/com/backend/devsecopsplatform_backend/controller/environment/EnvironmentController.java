@@ -8,7 +8,6 @@ import com.backend.devsecopsplatform_backend.service.GitLabService;
 import com.backend.devsecopsplatform_backend.service.environment.EnvironmentService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.backend.devsecopsplatform_backend.service.appmgmt.AppDeploymentService;
-import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -16,6 +15,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
+import org.springframework.security.authentication.AnonymousAuthenticationToken;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.bind.annotation.*;
 
@@ -38,7 +38,7 @@ public class EnvironmentController {
     private final UserRepository userRepository;
     private final ObjectMapper objectMapper;
 
-    @Value("${pipeline.secret:}")
+    @Value("${pipeline.secret}")
     private String pipelineSecret;
 
     private User getCurrentUser() {
@@ -52,16 +52,22 @@ public class EnvironmentController {
 
     @PostMapping("/deploy")
     public ResponseEntity<?> deploy(
-            @RequestHeader(value = "X-Pipeline-Secret", required = false) String secret,
-            @RequestBody JsonNode body
+            @RequestBody JsonNode body,
+            @RequestHeader(value = "X-Pipeline-Secret", required = false) String pipelineHeader
     ) {
-        if (body != null && body.hasNonNull("image") && body.hasNonNull("namespace")
-                && pipelineSecret != null && !pipelineSecret.isBlank()
-                && pipelineSecret.equals(secret)) {
+        boolean hasCiImages = body != null
+                && ((body.hasNonNull("image") && !body.path("image").asText().isBlank())
+                || (body.hasNonNull("images") && body.path("images").isObject()
+                && !body.path("images").isEmpty()));
+        if (hasCiImages && body.hasNonNull("namespace")) {
+            if (!isPipelineSecretValid(pipelineHeader)) {
+                return ResponseEntity.status(401)
+                        .body(Map.of("message", "Secret pipeline invalide ou manquant."));
+            }
             try {
                 CiDeployRequest ciRequest = objectMapper.treeToValue(body, CiDeployRequest.class);
                 log.info("📥 CI deploy: namespace={} deploymentId={}", ciRequest.getNamespace(), ciRequest.getDeploymentId());
-                return ResponseEntity.ok(appDeploymentService.applyFromCiPipeline(ciRequest));
+                return ResponseEntity.accepted().body(appDeploymentService.scheduleCiDeploy(ciRequest));
             } catch (com.backend.devsecopsplatform_backend.service.appmgmt.AppValidationException e) {
                 return ResponseEntity.badRequest().body(Map.of("message", e.getMessage()));
             } catch (Exception e) {
@@ -78,7 +84,7 @@ public class EnvironmentController {
         }
         if (request.getGitRepositoryUrl() == null || request.getGitRepositoryUrl().isBlank()
                 || request.getBranch() == null || request.getBranch().isBlank()) {
-            return ResponseEntity.status(401).body(Map.of("message", "Authentification requise."));
+            return ResponseEntity.badRequest().body(Map.of("message", "gitRepositoryUrl et branch requis."));
         }
         log.info("📥 Demande de déploiement: repo={} branch={}", request.getGitRepositoryUrl(), request.getBranch());
         try {
@@ -93,16 +99,28 @@ public class EnvironmentController {
     @GetMapping("/deploy/status/{deploymentId}")
     public ResponseEntity<?> deployStatus(
             @PathVariable UUID deploymentId,
-            @RequestHeader(value = "X-Pipeline-Secret", required = false) String secret
+            @RequestHeader(value = "X-Pipeline-Secret", required = false) String pipelineHeader
     ) {
-        if (pipelineSecret == null || pipelineSecret.isBlank() || !pipelineSecret.equals(secret)) {
-            return ResponseEntity.status(401).body(Map.of("message", "Authentification requise."));
+        if (!isPipelineSecretValid(pipelineHeader) && !hasAuthenticatedUser()) {
+            return ResponseEntity.status(401)
+                    .body(Map.of("message", "Authentification ou secret pipeline requis."));
         }
         try {
             return ResponseEntity.ok(appDeploymentService.getCiDeployStatus(deploymentId));
         } catch (com.backend.devsecopsplatform_backend.service.appmgmt.AppValidationException e) {
             return ResponseEntity.status(404).body(Map.of("message", e.getMessage()));
         }
+    }
+
+    private boolean isPipelineSecretValid(String candidate) {
+        return pipelineSecret != null && !pipelineSecret.isBlank() && pipelineSecret.equals(candidate);
+    }
+
+    private boolean hasAuthenticatedUser() {
+        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+        return authentication != null
+                && authentication.isAuthenticated()
+                && !(authentication instanceof AnonymousAuthenticationToken);
     }
 
     @GetMapping("/environments")

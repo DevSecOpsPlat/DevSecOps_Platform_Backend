@@ -59,17 +59,31 @@ public class AppK8sManifestService {
         boolean ingressEnabled;
         String ingressDomain;      // ex. 192.168.130.138.nip.io → app-<ns>.<domain>
         boolean pathBasedRouting; // true = un hôte /app + chemins /api ; false = hôte par service
-        String imageTag;
-        /** Image complète fournie par le pipeline CI (remplace le template CI_REGISTRY_IMAGE). */
-        String resolvedServiceImage;
+        /** Images complètes, validées par nom K8s, pour le déploiement atomique multi-service. */
+        Map<String, String> resolvedServiceImages;
+        /** Contrôleur ingress : {@code traefik} (K3s) ou {@code nginx}. */
+        String ingressController;
+        /** ingressClassName (ex. traefik sur K3s). */
+        String ingressClassName;
+        /** TTL namespace (heures) — annotation pour opérations / schedulers. */
+        Integer namespaceTtlHours;
+        /** ID déploiement — annotation sur le namespace. */
+        String deploymentId;
+        /** Active ResourceQuota + LimitRange sur le namespace. */
+        boolean resourceQuotaEnabled;
+        String namespaceCpuQuota;
+        String namespaceMemoryQuota;
     }
 
-    /**
-     * Image d'un service : {@code $CI_REGISTRY_IMAGE/<name>:<tag>}. Le préfixe registre est
-     * résolu par le pipeline (envsubst) qui connaît {@code $CI_REGISTRY_IMAGE}.
-     */
-    public String serviceImage(AppService svc, String imageTag) {
-        return "${CI_REGISTRY_IMAGE}/" + AppNaming.k8sName(svc.getName()) + ":" + imageTag;
+    private String resolveServiceImage(String k8sName, ManifestOptions opts) {
+        Map<String, String> images = opts.getResolvedServiceImages();
+        if (images != null) {
+            String mapped = images.get(k8sName);
+            if (mapped != null && !mapped.isBlank() && !mapped.contains("${")) {
+                return mapped.trim();
+            }
+        }
+        throw new AppValidationException("Image CI résolue manquante pour le service: " + k8sName);
     }
 
     // =====================================================================
@@ -82,8 +96,12 @@ public class AppK8sManifestService {
      */
     public String generateDatabaseBundle(ManagedApplication app, String namespace, ManifestOptions opts) {
         List<Map<String, Object>> docs = new ArrayList<>();
-        docs.add(namespaceManifest(namespace));
+        docs.add(namespaceManifest(namespace, opts));
         docs.add(imagePullSecretManifest(namespace, opts));
+        if (opts.isResourceQuotaEnabled()) {
+            docs.add(resourceQuotaManifest(namespace, opts));
+            docs.add(limitRangeManifest(namespace));
+        }
 
         for (AppDatabase db : app.getDatabases()) {
             String svcName = connectionUrlService.serviceName(db);
@@ -103,8 +121,22 @@ public class AppK8sManifestService {
      * Ingress/NodePort. À appliquer après que les bases soient Ready.
      */
     public String generateServiceBundle(ManagedApplication app, String namespace, ManifestOptions opts) {
+        return generateServiceWaveBundle(app, namespace, opts, app.getServices(), true);
+    }
+
+    /**
+     * Manifestes d'une vague de services (sans namespace). L'Ingress est ajouté uniquement
+     * sur la dernière vague ({@code includeIngress=true}).
+     */
+    public String generateServiceWaveBundle(
+            ManagedApplication app,
+            String namespace,
+            ManifestOptions opts,
+            List<AppService> waveServices,
+            boolean includeIngress
+    ) {
         List<Map<String, Object>> docs = new ArrayList<>();
-        for (AppService svc : app.getServices()) {
+        for (AppService svc : waveServices) {
             String name = AppNaming.k8sName(svc.getName());
             Map<String, Object> secret = serviceSecret(svc, namespace, name);
             if (secret != null) {
@@ -115,7 +147,18 @@ public class AppK8sManifestService {
                 docs.add(serviceClusterIp(svc, namespace, name));
             }
         }
-        // Exposition externe : un seul Ingress à chemins, ou l'ancien comportement par service.
+        if (includeIngress) {
+            appendIngressDocs(app, namespace, opts, docs);
+        }
+        return dumpAll(docs);
+    }
+
+    private void appendIngressDocs(
+            ManagedApplication app,
+            String namespace,
+            ManifestOptions opts,
+            List<Map<String, Object>> docs
+    ) {
         if (opts.isIngressEnabled() && opts.isPathBasedRouting()) {
             Map<String, Object> ingress = applicationIngress(app, namespace, opts);
             if (ingress != null) {
@@ -133,16 +176,68 @@ public class AppK8sManifestService {
                 }
             }
         }
-        return dumpAll(docs);
     }
 
     // =====================================================================
     // Namespace + imagePullSecret
     // =====================================================================
 
-    private Map<String, Object> namespaceManifest(String namespace) {
+    private Map<String, Object> namespaceManifest(String namespace, ManifestOptions opts) {
         Map<String, Object> m = base("v1", "Namespace");
-        m.put("metadata", meta(namespace, null));
+        Map<String, Object> metadata = meta(namespace, null);
+        Map<String, String> labels = new LinkedHashMap<>();
+        labels.put("app.kubernetes.io/managed-by", "devsecops-platform");
+        if (opts.getDeploymentId() != null && !opts.getDeploymentId().isBlank()) {
+            labels.put("devsecops.platform/deployment-id", opts.getDeploymentId().trim());
+        }
+        metadata.put("labels", labels);
+
+        Map<String, String> annotations = new LinkedHashMap<>();
+        if (opts.getNamespaceTtlHours() != null && opts.getNamespaceTtlHours() > 0) {
+            annotations.put("devsecops.platform/ttl-hours", String.valueOf(opts.getNamespaceTtlHours()));
+        }
+        if (!annotations.isEmpty()) {
+            metadata.put("annotations", annotations);
+        }
+        m.put("metadata", metadata);
+        return m;
+    }
+
+    private Map<String, Object> resourceQuotaManifest(String namespace, ManifestOptions opts) {
+        String cpu = opts.getNamespaceCpuQuota() != null ? opts.getNamespaceCpuQuota() : "4";
+        String memory = opts.getNamespaceMemoryQuota() != null ? opts.getNamespaceMemoryQuota() : "8Gi";
+
+        Map<String, Object> hard = new LinkedHashMap<>();
+        hard.put("requests.cpu", cpu);
+        hard.put("requests.memory", memory);
+        hard.put("limits.cpu", cpu);
+        hard.put("limits.memory", memory);
+        hard.put("pods", "20");
+        hard.put("persistentvolumeclaims", "10");
+
+        Map<String, Object> spec = new LinkedHashMap<>();
+        spec.put("hard", hard);
+
+        Map<String, Object> m = base("v1", "ResourceQuota");
+        m.put("metadata", meta("env-quota", namespace));
+        m.put("spec", spec);
+        return m;
+    }
+
+    private Map<String, Object> limitRangeManifest(String namespace) {
+        Map<String, Object> defaultRequest = Map.of("cpu", "50m", "memory", "64Mi");
+        Map<String, Object> defaultLimit = Map.of("cpu", "1", "memory", "1Gi");
+        Map<String, Object> limit = new LinkedHashMap<>();
+        limit.put("type", "Container");
+        limit.put("defaultRequest", defaultRequest);
+        limit.put("default", defaultLimit);
+
+        Map<String, Object> spec = new LinkedHashMap<>();
+        spec.put("limits", List.of(limit));
+
+        Map<String, Object> m = base("v1", "LimitRange");
+        m.put("metadata", meta("env-limits", namespace));
+        m.put("spec", spec);
         return m;
     }
 
@@ -373,10 +468,7 @@ public class AppK8sManifestService {
 
         Map<String, Object> container = new LinkedHashMap<>();
         container.put("name", name);
-        String image = opts.getResolvedServiceImage() != null && !opts.getResolvedServiceImage().isBlank()
-                ? opts.getResolvedServiceImage().trim()
-                : serviceImage(svc, opts.getImageTag());
-        container.put("image", image);
+        container.put("image", resolveServiceImage(name, opts));
         container.put("imagePullPolicy", "Always");
         if (port != null) {
             container.put("ports", List.of(containerPort(port)));
@@ -458,6 +550,7 @@ public class AppK8sManifestService {
         Map<String, Object> spec = new LinkedHashMap<>();
         spec.put("selector", Map.of("app", name));
         spec.put("ports", List.of(servicePort(svc.getExposedPort(), svc.getExposedPort())));
+        // ClusterIP + Ingress Traefik (:80) = scalable multi-apps (évite 1 NodePort/LB par app)
         spec.put("type", "ClusterIP");
         Map<String, Object> m = base("v1", "Service");
         m.put("metadata", meta(name, namespace));
@@ -500,10 +593,14 @@ public class AppK8sManifestService {
 
         Map<String, Object> spec = new LinkedHashMap<>();
         spec.put("rules", List.of(rule));
+        applyIngressClassName(spec, opts);
 
         Map<String, Object> m = base("networking.k8s.io/v1", "Ingress");
         Map<String, Object> metadata = meta(name, namespace);
-        metadata.put("annotations", Map.of("nginx.ingress.kubernetes.io/rewrite-target", "/"));
+        Map<String, String> annotations = ingressAnnotations(opts, false);
+        if (!annotations.isEmpty()) {
+            metadata.put("annotations", annotations);
+        }
         m.put("metadata", metadata);
         m.put("spec", spec);
         return m;
@@ -530,7 +627,8 @@ public class AppK8sManifestService {
 
         String host = "app-" + namespace + "." + opts.getIngressDomain();
         List<Map<String, Object>> paths = new ArrayList<>();
-        boolean needsRewrite = false;
+        boolean needsNginxRewrite = false;
+        boolean traefik = isTraefikIngress(opts);
 
         for (AppService svc : exposed) {
             String name = AppNaming.k8sName(svc.getName());
@@ -545,13 +643,19 @@ public class AppK8sManifestService {
             backend.put("service", backendService);
 
             Map<String, Object> path = new LinkedHashMap<>();
-            path.put("path", isPrimary ? "/" : "/" + name + "(/|$)(.*)");
-            path.put("pathType", isPrimary ? "Prefix" : "ImplementationSpecific");
+            if (isPrimary) {
+                path.put("path", "/");
+                path.put("pathType", "Prefix");
+            } else if (traefik) {
+                path.put("path", "/" + name);
+                path.put("pathType", "Prefix");
+            } else {
+                path.put("path", "/" + name + "(/|$)(.*)");
+                path.put("pathType", "ImplementationSpecific");
+                needsNginxRewrite = true;
+            }
             path.put("backend", backend);
             paths.add(path);
-            if (!isPrimary) {
-                needsRewrite = true;
-            }
         }
 
         Map<String, Object> http = new LinkedHashMap<>();
@@ -562,17 +666,44 @@ public class AppK8sManifestService {
 
         Map<String, Object> spec = new LinkedHashMap<>();
         spec.put("rules", List.of(rule));
+        applyIngressClassName(spec, opts);
 
         Map<String, Object> m = base("networking.k8s.io/v1", "Ingress");
         Map<String, Object> metadata = meta("app-ingress", namespace);
-        if (needsRewrite) {
-            metadata.put("annotations", Map.of(
-                    "nginx.ingress.kubernetes.io/rewrite-target", "/$2",
-                    "nginx.ingress.kubernetes.io/use-regex", "true"));
+        Map<String, String> annotations = ingressAnnotations(opts, needsNginxRewrite);
+        if (!annotations.isEmpty()) {
+            metadata.put("annotations", annotations);
         }
         m.put("metadata", metadata);
         m.put("spec", spec);
         return m;
+    }
+
+    private void applyIngressClassName(Map<String, Object> spec, ManifestOptions opts) {
+        if (opts.getIngressClassName() != null && !opts.getIngressClassName().isBlank()) {
+            spec.put("ingressClassName", opts.getIngressClassName().trim());
+        }
+    }
+
+    private boolean isTraefikIngress(ManifestOptions opts) {
+        String controller = opts.getIngressController();
+        return controller == null || controller.isBlank() || "traefik".equalsIgnoreCase(controller.trim());
+    }
+
+    private Map<String, String> ingressAnnotations(ManifestOptions opts, boolean needsNginxRewrite) {
+        if (isTraefikIngress(opts)) {
+            Map<String, String> traefik = new LinkedHashMap<>();
+            traefik.put("traefik.ingress.kubernetes.io/router.entrypoints", "web");
+            // Vite (et d'autres) rejettent/bloquent le Host nip.io → 504 via Traefik
+            traefik.put("traefik.ingress.kubernetes.io/service.passhostheader", "false");
+            return traefik;
+        }
+        if (needsNginxRewrite) {
+            return Map.of(
+                    "nginx.ingress.kubernetes.io/rewrite-target", "/$2",
+                    "nginx.ingress.kubernetes.io/use-regex", "true");
+        }
+        return Map.of("nginx.ingress.kubernetes.io/rewrite-target", "/");
     }
 
     // =====================================================================
