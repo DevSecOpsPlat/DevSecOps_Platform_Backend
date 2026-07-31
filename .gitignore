@@ -31,6 +31,7 @@ build/
 
 ### VS Code ###
 .vscode/
+.runner_system_id
 
 ### Knowledge (RAG pipeline contexts — generated at runtime) ###
 knowledge/apps/
