@@ -28,7 +28,13 @@ public class EnvironmentLifecycleService {
       EnvironmentStatus.DEGRADED
   );
 
+  /**
+   * Statuts exclus du passage TTL → EXPIRED.
+   * PENDING/BUILDING : le TTL ne démarre qu'au Ready (expiresAt provisoire à la création).
+   */
   public static final Set<EnvironmentStatus> TTL_IMMUNE = EnumSet.of(
+      EnvironmentStatus.PENDING,
+      EnvironmentStatus.BUILDING,
       EnvironmentStatus.DESTROYED,
       EnvironmentStatus.EXPIRED,
       EnvironmentStatus.FAILED

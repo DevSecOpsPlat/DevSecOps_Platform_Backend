@@ -1,0 +1,89 @@
+# EnviroTest — Hostinger : front + API sur 2 sous-domaines
+#
+# DNS Hostinger (zone envirotest.cloud) :
+#   Type A    @ (ou envirotest.cloud)     → <IP publique du serveur / PC>
+#   Type A    api                         → <même IP>
+#   (option) AAAA si IPv6 Hostinger / serveur
+#
+# Sur le serveur qui écoute 80/443 (VPS Linux ou PC avec Nginx) :
+#   - Docker : frontend :4200 , backend :8089
+#   - Ce fichier proxy HTTPS vers ces ports
+#   - Certificats Let's Encrypt (certbot) OU SSL Hostinger
+#
+# Installation (Linux) :
+#   sudo cp hostinger-envirotest.conf.example /etc/nginx/conf.d/envirotest.conf
+#   sudo certbot --nginx -d envirotest.cloud -d api.envirotest.cloud
+#   sudo nginx -t && sudo systemctl reload nginx
+#
+# Windows (Nginx for Windows) : adapter les chemins ssl_certificate.
+
+# ─── Front : https://envirotest.cloud → Angular (Docker :4200) ───
+server {
+    listen 80;
+    server_name envirotest.cloud www.envirotest.cloud;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name envirotest.cloud www.envirotest.cloud;
+
+    # Remplacer par tes chemins certbot / Hostinger
+    ssl_certificate     /etc/letsencrypt/live/envirotest.cloud/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/envirotest.cloud/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header X-Content-Type-Options "nosniff" always;
+
+    location / {
+        proxy_pass http://127.0.0.1:4200;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+}
+
+# ─── API : https://api.envirotest.cloud → Spring Boot (Docker :8089, context /projet) ───
+server {
+    listen 80;
+    server_name api.envirotest.cloud;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name api.envirotest.cloud;
+
+    ssl_certificate     /etc/letsencrypt/live/api.envirotest.cloud/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/api.envirotest.cloud/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header X-Content-Type-Options "nosniff" always;
+
+    # Tout le trafic API passe sous /projet (context-path Spring)
+    location /projet/ {
+        proxy_pass http://127.0.0.1:8089/projet/;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_connect_timeout 60s;
+        proxy_send_timeout    120s;
+        proxy_read_timeout    120s;
+        client_max_body_size  20m;
+    }
+
+    # Racine API → redirige vers le context
+    location = / {
+        return 302 /projet/;
+    }
+}
