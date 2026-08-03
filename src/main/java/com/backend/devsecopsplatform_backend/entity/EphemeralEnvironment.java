@@ -105,9 +105,16 @@ public class EphemeralEnvironment {
 
     @PrePersist
     public void calculateExpiresAt() {
-        // Ne pas fixer expiresAt à la création : le TTL démarre au Ready
-        // (EnvironmentLifecycleService.onReady). Un expiresAt provisoire ferait
-        // expirer l'env avant même que le cluster soit prêt.
+        // Colonne NOT NULL : valeur provisoire à la création.
+        // Le TTL « réel » démarre au Ready (EnvironmentLifecycleService.onReady
+        // recalcule expiresAt). PENDING/BUILDING sont immunisés côté scheduler.
+        if (expiresAt == null) {
+            int ttl = ttlHours != null && ttlHours > 0 ? ttlHours : 4;
+            expiresAt = LocalDateTime.now().plusHours(ttl);
+        }
+        if (ttlHours == null || ttlHours <= 0) {
+            ttlHours = 4;
+        }
     }
 
     public boolean isExpired() {

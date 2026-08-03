@@ -1738,8 +1738,7 @@ public class AppDeploymentService {
         env.setTtlHours(ttlHours > 0 ? ttlHours : 4);
         env.setNamespace(namespace);
         service.addEphemeralEnvironment(env);
-        log.info("Environnement éphémère créé pour déploiement — ttlHours={}, expiresAt sera calculé à la persistance",
-                env.getTtlHours());
+        log.info("Environnement éphémère créé pour déploiement — ttlHours={}", env.getTtlHours());
         return environmentRepository.save(env);
     }
 
@@ -1781,6 +1780,8 @@ public class AppDeploymentService {
             return false;
         }
         String normalized = url.trim().toLowerCase();
+        // localhost/127.x injoignables depuis un runner distant.
+        // host.docker.internal OK pour runner self-hosted Docker Desktop → backend local.
         return !normalized.contains("localhost")
                 && !normalized.startsWith("http://127.")
                 && !normalized.startsWith("https://127.");
