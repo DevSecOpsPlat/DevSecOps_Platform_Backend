@@ -90,6 +90,12 @@ public class GitLabService {
     @Value("${pipeline.secret:}")
     private String pipelineSecret;
 
+    @Value("${defectdojo.url:}")
+    private String defectDojoUrl;
+
+    @Value("${defectdojo.token:}")
+    private String defectDojoToken;
+
     // ============================================
     // PIPELINE - CRÉATION ET DÉCLENCHEMENT
     // ============================================
@@ -157,6 +163,7 @@ public class GitLabService {
             addVar(variablesList, "K8S_NAMESPACE", ns);
             addVar(variablesList, "ACTION", "deploy");
             addBackendUrlIfConfigured(variablesList);
+            addScanToolUrlsIfConfigured(variablesList);
             addVar(variablesList, "PIPELINE_SECRET", pipelineSecret != null ? pipelineSecret : "");
 
             return postPipeline(variablesList);
@@ -195,6 +202,7 @@ public class GitLabService {
             addVar(variablesList, "APPLICATION_ID", applicationId.toString());
             addVar(variablesList, "DOCKERFILE_PATH", dockerPath);
             addBackendUrlIfConfigured(variablesList);
+            addScanToolUrlsIfConfigured(variablesList);
             addVar(variablesList, "PIPELINE_SECRET", pipelineSecret != null ? pipelineSecret : "");
 
             return postPipeline(variablesList);
@@ -244,24 +252,43 @@ public class GitLabService {
     }
 
     /**
-     * N'envoie BACKEND_URL au pipeline que si une URL publique est configurée côté backend.
+     * Envoie BACKEND_URL au pipeline si une URL joignable depuis le runner est configurée.
+     * Inclut {@code host.docker.internal} (runner self-hosted Docker Desktop → backend local).
      * Sinon la variable CI/CD GitLab (BACKEND_URL) est utilisée telle quelle.
      */
     private void addBackendUrlIfConfigured(List<Map<String, String>> variablesList) {
-        if (!isPublicCallbackBaseUrl(callbackBaseUrl)) {
+        if (!isReachableFromLocalRunner(callbackBaseUrl)) {
             log.debug("BACKEND_URL non envoyé au pipeline — utilisation de la variable CI/CD GitLab si définie");
             return;
         }
         addVar(variablesList, "BACKEND_URL", callbackBaseUrl.trim());
     }
 
-    private static boolean isPublicCallbackBaseUrl(String url) {
+    /**
+     * Injecte Sonar + DefectDojo dans le pipeline (évite Cloudflare / variables GitLab qui changent).
+     * URLs locales {@code host.docker.internal} OK avec un runner Docker sur la même machine.
+     */
+    private void addScanToolUrlsIfConfigured(List<Map<String, String>> variablesList) {
+        if (isReachableFromLocalRunner(sonarHostUrl) && sonarToken != null && !sonarToken.isBlank()) {
+            addVar(variablesList, "SONAR_HOST_URL", sonarHostUrl.trim().replaceAll("/+$", ""));
+            addVar(variablesList, "SONAR_TOKEN", sonarToken.trim());
+            log.info("SONAR_HOST_URL injecté dans le pipeline: {}", sonarHostUrl.trim());
+        }
+        if (isReachableFromLocalRunner(defectDojoUrl) && defectDojoToken != null && !defectDojoToken.isBlank()) {
+            addVar(variablesList, "DEFECTDOJO_URL", defectDojoUrl.trim().replaceAll("/+$", ""));
+            addVar(variablesList, "DEFECTDOJO_TOKEN", defectDojoToken.trim());
+            log.info("DEFECTDOJO_URL injecté dans le pipeline: {}", defectDojoUrl.trim());
+        }
+    }
+
+    /** URL utilisable depuis un job CI sur Docker Desktop (ou URL publique https). */
+    private static boolean isReachableFromLocalRunner(String url) {
         if (url == null || url.isBlank()) {
             return false;
         }
         String normalized = url.trim().toLowerCase();
-        return !normalized.contains("host.docker.internal")
-                && !normalized.contains("localhost")
+        // localhost/127.x : le job CI voit le localhost du conteneur job, pas l'hôte.
+        return !normalized.contains("localhost")
                 && !normalized.startsWith("http://127.")
                 && !normalized.startsWith("https://127.");
     }

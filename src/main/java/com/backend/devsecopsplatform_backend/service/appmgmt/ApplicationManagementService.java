@@ -62,6 +62,7 @@ public class ApplicationManagementService {
     private final UserRepository userRepository;
     private final AppConnectionUrlService connectionUrlService;
     private final AppDeploymentService deploymentService;
+    private final AppDeploymentValidationService deploymentValidationService;
     private final ImageTagAvailabilityService imageTagAvailability;
     private final K8sManifestApplyService k8sManifestApplyService;
     private final GitLabService gitLabService;
@@ -672,6 +673,19 @@ public class ApplicationManagementService {
         ManagedApplication app = loadOwnedApp(appId);
         AppDeployment deployment = deploymentService.deploy(app, ManagedDeployOptions.from(request));
         return mapDeployment(deployment, app);
+    }
+
+    /**
+     * Aperçu infos / warnings avant déploiement (sélection de services + TTL).
+     */
+    @Transactional(readOnly = true)
+    public DeployPreviewResponse previewDeploy(UUID appId, ManagedDeployRequest request) {
+        ManagedApplication app = loadOwnedApp(appId);
+        ManagedDeployOptions options = ManagedDeployOptions.from(request);
+        ManagedApplication target = options.hasServiceFilter()
+                ? deploymentValidationService.buildShadow(app, options.serviceIdsOrEmpty())
+                : app;
+        return deploymentValidationService.preview(target, options.ttlHours());
     }
 
     public List<AppDeploymentResponse> listDeployments(UUID appId) {

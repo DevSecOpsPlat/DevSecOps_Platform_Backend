@@ -183,7 +183,12 @@ public class AppDeploymentService {
     @Transactional
     public AppDeployment deploy(ManagedApplication app, ManagedDeployOptions options) {
         ManagedDeployOptions resolved = options != null ? options : ManagedDeployOptions.defaults(null);
-        List<String> warnings = validationService.validate(app);
+        // Sous-ensemble de services → vue mémoire (shadow) ; FK déploiement reste sur le vrai projet.
+        ManagedApplication target = resolved.hasServiceFilter()
+                ? validationService.buildShadow(app, resolved.serviceIdsOrEmpty())
+                : app;
+
+        List<String> warnings = validationService.validate(target);
         warnings.forEach(w -> log.info("⚠️ [deploy {}] {}", app.getId(), w));
 
         AppDeployment deployment = new AppDeployment();
@@ -196,7 +201,7 @@ public class AppDeploymentService {
         deployment.setNamespace(namespace);
 
         // §3.1 : générer et stocker les URLs de connexion des bases.
-        for (AppDatabase db : app.getDatabases()) {
+        for (AppDatabase db : target.getDatabases()) {
             db.setGeneratedConnectionUrl(connectionUrlService.buildConnectionUrl(db, namespace));
             databaseRepository.save(db);
         }
@@ -206,20 +211,20 @@ public class AppDeploymentService {
                 deployment.getId(), resolved.ttlHours(), null, app);
 
         // Les services sont générés après le build, lorsque toutes les images sont résolues.
-        String databasesB64 = b64(manifestService.generateDatabaseBundle(app, namespace, opts));
+        String databasesB64 = b64(manifestService.generateDatabaseBundle(target, namespace, opts));
         String servicesB64 = "";
 
-        Map<Integer, List<AppService>> waves = computeWaves(app);
-        String servicesJson = buildServicesJson(app, waves, imageTag);
+        Map<Integer, List<AppService>> waves = computeWaves(target);
+        String servicesJson = buildServicesJson(target, waves, imageTag);
 
-        deployment.setServicesState(buildInitialState(app, namespace, waves, resolved.ttlHours()));
+        deployment.setServicesState(buildInitialState(target, namespace, waves, resolved.ttlHours()));
 
         Map<String, String> variables = new LinkedHashMap<>();
         variables.put("ACTION", "deploy");
         variables.put("APP_ID", app.getId().toString());
         variables.put("APP_SLUG", app.getSlug());
         variables.put("DEPLOYMENT_ID", deployment.getId().toString());
-        AppService gitService = app.getServices().stream().findFirst()
+        AppService gitService = target.getServices().stream().findFirst()
                 .orElseThrow(() -> new AppValidationException("Aucun service dans le projet."));
         variables.put("SERVICE_NAME", AppNaming.k8sName(gitService.getName()));
         String deployBranch = resolved.resolveBranch(gitService.getGitBranch());

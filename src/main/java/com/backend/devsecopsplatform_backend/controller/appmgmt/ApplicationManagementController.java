@@ -124,6 +124,13 @@ public class ApplicationManagementController {
 
     // ---------- Déploiements ----------
 
+    @PostMapping("/{id}/deploy/preview")
+    public ResponseEntity<?> deployPreview(
+            @PathVariable UUID id,
+            @RequestBody(required = false) ManagedDeployRequest request) {
+        return handle(() -> ResponseEntity.ok(service.previewDeploy(id, request)));
+    }
+
     @PostMapping("/{id}/deploy")
     public ResponseEntity<?> deploy(
             @PathVariable UUID id,
