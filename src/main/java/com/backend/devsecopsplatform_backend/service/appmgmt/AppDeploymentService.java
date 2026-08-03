@@ -1780,9 +1780,9 @@ public class AppDeploymentService {
             return false;
         }
         String normalized = url.trim().toLowerCase();
-        // GitLab SaaS ne peut pas joindre le PC local
-        return !normalized.contains("host.docker.internal")
-                && !normalized.contains("localhost")
+        // localhost/127.x injoignables depuis un runner distant.
+        // host.docker.internal OK pour runner self-hosted Docker Desktop → backend local.
+        return !normalized.contains("localhost")
                 && !normalized.startsWith("http://127.")
                 && !normalized.startsWith("https://127.");
     }
