@@ -20,14 +20,16 @@ import com.backend.devsecopsplatform_backend.repository.ManagedApplicationReposi
 import com.backend.devsecopsplatform_backend.repository.ServiceEnvVarRepository;
 import com.backend.devsecopsplatform_backend.repository.UserRepository;
 import com.backend.devsecopsplatform_backend.service.GitLabService;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Instant;
 import java.time.LocalDateTime;
@@ -48,10 +50,11 @@ import java.util.stream.Collectors;
  */
 @Service
 @Slf4j
-@RequiredArgsConstructor
 public class ApplicationManagementService {
 
     private static final String MASK = AppConnectionUrlService.MASK;
+    /** Limite les sondes health pour ne pas saturer le pool HTTP/DB si tous les chemins échouent. */
+    private static final int MAX_HEALTH_PROBE_PATHS = 5;
 
     private final ManagedApplicationRepository appRepository;
     private final AppServiceRepository serviceRepository;
@@ -68,10 +71,48 @@ public class ApplicationManagementService {
     private final GitLabService gitLabService;
     private final DeploymentRuntimeAlertService deploymentRuntimeAlertService;
     private final DeploymentMetricsSamplerService deploymentMetricsSamplerService;
+    private final TransactionTemplate readOnlyTx;
 
     /** IP Traefik / master — sonde health des domaines custom via Host header. */
     @Value("${deployment.preview.nip.master-ip:192.168.92.10}")
     private String ingressProbeIp;
+
+    public ApplicationManagementService(
+            ManagedApplicationRepository appRepository,
+            AppServiceRepository serviceRepository,
+            AppDatabaseRepository databaseRepository,
+            ServiceEnvVarRepository envVarRepository,
+            AppDeploymentRepository deploymentRepository,
+            EphemeralEnvironmentRepository environmentRepository,
+            UserRepository userRepository,
+            AppConnectionUrlService connectionUrlService,
+            AppDeploymentService deploymentService,
+            AppDeploymentValidationService deploymentValidationService,
+            ImageTagAvailabilityService imageTagAvailability,
+            K8sManifestApplyService k8sManifestApplyService,
+            GitLabService gitLabService,
+            @Lazy DeploymentRuntimeAlertService deploymentRuntimeAlertService,
+            DeploymentMetricsSamplerService deploymentMetricsSamplerService,
+            PlatformTransactionManager transactionManager
+    ) {
+        this.appRepository = appRepository;
+        this.serviceRepository = serviceRepository;
+        this.databaseRepository = databaseRepository;
+        this.envVarRepository = envVarRepository;
+        this.deploymentRepository = deploymentRepository;
+        this.environmentRepository = environmentRepository;
+        this.userRepository = userRepository;
+        this.connectionUrlService = connectionUrlService;
+        this.deploymentService = deploymentService;
+        this.deploymentValidationService = deploymentValidationService;
+        this.imageTagAvailability = imageTagAvailability;
+        this.k8sManifestApplyService = k8sManifestApplyService;
+        this.gitLabService = gitLabService;
+        this.deploymentRuntimeAlertService = deploymentRuntimeAlertService;
+        this.deploymentMetricsSamplerService = deploymentMetricsSamplerService;
+        this.readOnlyTx = new TransactionTemplate(transactionManager);
+        this.readOnlyTx.setReadOnly(true);
+    }
 
     // =====================================================================
     // Applications
@@ -864,30 +905,25 @@ public class ApplicationManagementService {
 
     /**
      * Monitoring léger : métriques pods, alertes, health HTTP de l'URL publique.
+     * <p>Ne tient <b>pas</b> de transaction JPA pendant les appels K8s / HTTP
+     * (sinon le pool Hikari sature : active=10, waiting…).</p>
      */
-    @Transactional(readOnly = true)
     public Map<String, Object> getDeploymentMonitoring(UUID appId, UUID deploymentId) {
-        ManagedApplication app = loadOwnedApp(appId);
-        AppDeployment deployment = deploymentRepository.findByIdAndApplication_Id(deploymentId, appId)
-                .orElseThrow(() -> new AppValidationException("Déploiement introuvable."));
-        Map<String, Object> out = new java.util.LinkedHashMap<>();
-        out.put("namespace", deployment.getNamespace());
-        out.put("deploymentId", deployment.getId());
-        out.put("status", deployment.getStatus());
-        out.put("checkedAt", Instant.now().toString());
-        out.put("applicationName", app.getName());
-        out.put("applicationSlug", app.getSlug());
-        Instant expiresAt = null;
-        if (deployment.getEphemeralEnvironmentId() != null) {
-            EphemeralEnvironment env = environmentRepository.findById(deployment.getEphemeralEnvironmentId()).orElse(null);
-            if (env != null) {
-                expiresAt = toInstant(env.getExpiresAt());
-            }
+        MonitoringSnap snap = readOnlyTx.execute(status -> loadMonitoringSnap(appId, deploymentId));
+        if (snap == null) {
+            throw new AppValidationException("Déploiement introuvable.");
         }
-        out.put("expiresAt", expiresAt != null ? expiresAt.toString() : null);
 
-        if (deployment.getStatus() == AppDeploymentStatus.STOPPED
-                || deployment.getStatus() == AppDeploymentStatus.FAILED) {
+        Map<String, Object> out = new java.util.LinkedHashMap<>();
+        out.put("namespace", snap.namespace());
+        out.put("deploymentId", snap.deploymentId());
+        out.put("status", snap.status());
+        out.put("checkedAt", Instant.now().toString());
+        out.put("applicationName", snap.appName());
+        out.put("applicationSlug", snap.appSlug());
+        out.put("expiresAt", snap.expiresAtIso());
+
+        if (snap.inactive()) {
             out.put("pods", List.of());
             out.put("workloads", List.of());
             out.put("services", List.of());
@@ -900,15 +936,15 @@ public class ApplicationManagementService {
         if (!k8sManifestApplyService.isConfigured()) {
             throw new AppValidationException("Cluster K8s non configuré.");
         }
-        if (deployment.getNamespace() == null || deployment.getNamespace().isBlank()) {
+        if (snap.namespace() == null || snap.namespace().isBlank()) {
             throw new AppValidationException("Namespace absent pour ce déploiement.");
         }
 
         Map<String, Object> mon;
         try {
-            mon = k8sManifestApplyService.getNamespaceMonitoring(deployment.getNamespace());
+            mon = k8sManifestApplyService.getNamespaceMonitoring(snap.namespace());
         } catch (Exception e) {
-            log.warn("monitoring ns={}: {}", deployment.getNamespace(), e.getMessage());
+            log.warn("monitoring ns={}: {}", snap.namespace(), e.getMessage());
             mon = new java.util.LinkedHashMap<>();
             mon.put("pods", List.of());
             mon.put("alerts", new java.util.ArrayList<Map<String, Object>>());
@@ -922,42 +958,33 @@ public class ApplicationManagementService {
                 ? (List<Map<String, Object>>) list
                 : new java.util.ArrayList<>();
 
-        // Ingress flag
-        Map<String, Object> state = deployment.getServicesState();
-        if (state != null && Boolean.FALSE.equals(state.get("ingressApplied"))) {
+        if (Boolean.FALSE.equals(snap.ingressApplied())) {
             Map<String, Object> a = new java.util.LinkedHashMap<>();
             a.put("severity", "warn");
             a.put("pod", null);
             a.put("workload", null);
-            a.put("message", state.get("ingressError") != null
-                    ? "Ingress non appliqué : " + state.get("ingressError")
+            a.put("kind", "health");
+            a.put("reason", "IngressNotApplied");
+            a.put("message", snap.ingressError() != null
+                    ? "Ingress non appliqué : " + snap.ingressError()
                     : "Ingress non appliqué — URL publique indisponible");
             alerts.add(a);
         }
 
-        // Health HTTP — chemins issus des services + candidats multi-stack
-        String appUrl = null;
-        if (state != null && state.get("services") instanceof Map<?, ?> services) {
-            for (Object v : services.values()) {
-                if (v instanceof Map<?, ?> svc) {
-                    Object ext = svc.get("externalUrl");
-                    if (ext != null && !String.valueOf(ext).isBlank()) {
-                        appUrl = String.valueOf(ext);
-                        break;
-                    }
-                }
-            }
-        }
-        List<String> preferredPaths = collectHealthProbePaths(app);
-        Map<String, Object> health = probeHttpHealth(appUrl, preferredPaths);
+        Map<String, Object> health = probeHttpHealth(snap.appUrl(), snap.healthPaths());
         out.put("health", health);
-        out.put("appUrl", appUrl);
+        out.put("appUrl", snap.appUrl());
         if (Boolean.FALSE.equals(health.get("ok")) && Boolean.TRUE.equals(health.get("checked"))) {
             Map<String, Object> a = new java.util.LinkedHashMap<>();
             a.put("severity", "warn");
             a.put("pod", null);
             a.put("workload", null);
+            a.put("kind", "health");
+            a.put("reason", "HealthCheckFailed");
             a.put("message", "Health URL : " + health.get("message"));
+            if (health.get("url") != null) {
+                a.put("object", String.valueOf(health.get("url")));
+            }
             alerts.add(a);
         }
         out.put("alerts", alerts);
@@ -971,10 +998,71 @@ public class ApplicationManagementService {
         return out;
     }
 
+    /** Données DB nécessaires au monitoring — chargées en transaction courte. */
+    private MonitoringSnap loadMonitoringSnap(UUID appId, UUID deploymentId) {
+        ManagedApplication app = loadOwnedApp(appId);
+        AppDeployment deployment = deploymentRepository.findByIdAndApplication_Id(deploymentId, appId)
+                .orElseThrow(() -> new AppValidationException("Déploiement introuvable."));
+
+        Instant expiresAt = null;
+        if (deployment.getEphemeralEnvironmentId() != null) {
+            EphemeralEnvironment env = environmentRepository.findById(deployment.getEphemeralEnvironmentId()).orElse(null);
+            if (env != null) {
+                expiresAt = toInstant(env.getExpiresAt());
+            }
+        }
+
+        boolean inactive = deployment.getStatus() == AppDeploymentStatus.STOPPED
+                || deployment.getStatus() == AppDeploymentStatus.FAILED;
+
+        Map<String, Object> state = deployment.getServicesState();
+        Boolean ingressApplied = null;
+        Object ingressError = null;
+        if (state != null) {
+            if (state.get("ingressApplied") instanceof Boolean b) {
+                ingressApplied = b;
+            }
+            ingressError = state.get("ingressError");
+        }
+
+        // Touch lazy services while TX is open
+        List<String> healthPaths = collectHealthProbePaths(app);
+        String appUrl = inactive ? null : pickPublicAppUrl(app, deployment);
+
+        return new MonitoringSnap(
+                deployment.getId(),
+                deployment.getNamespace(),
+                deployment.getStatus() != null ? deployment.getStatus().name() : null,
+                app.getName(),
+                app.getSlug(),
+                expiresAt != null ? expiresAt.toString() : null,
+                inactive,
+                ingressApplied,
+                ingressError != null ? String.valueOf(ingressError) : null,
+                appUrl,
+                healthPaths
+        );
+    }
+
+    private record MonitoringSnap(
+            UUID deploymentId,
+            String namespace,
+            String status,
+            String appName,
+            String appSlug,
+            String expiresAtIso,
+            boolean inactive,
+            Boolean ingressApplied,
+            String ingressError,
+            String appUrl,
+            List<String> healthPaths
+    ) {}
+
     /**
      * Alertes runtime live + historique 24 h pour un déploiement.
+     * Pas de {@code @Transactional} ici : le live appelle le monitoring K8s/HTTP
+     * (ne doit pas retenir une connexion Hikari).
      */
-    @Transactional(readOnly = true)
     public Map<String, Object> listDeploymentAlerts(UUID appId, UUID deploymentId) {
         ManagedApplication app = loadOwnedApp(appId);
         AppDeployment deployment = deploymentRepository.findByIdAndApplication_Id(deploymentId, appId)
@@ -990,6 +1078,61 @@ public class ApplicationManagementService {
         deploymentRepository.findByIdAndApplication_Id(deploymentId, appId)
                 .orElseThrow(() -> new AppValidationException("Déploiement introuvable."));
         return deploymentMetricsSamplerService.history(appId, deploymentId, from, to);
+    }
+
+    /**
+     * URL à afficher / sonder pour l'app : FRONTEND d'abord, sinon URL « racine »
+     * (évite de prendre BACKEND …/api qui fausse le health et le bandeau).
+     */
+    private String pickPublicAppUrl(ManagedApplication app, AppDeployment deployment) {
+        Map<String, Object> state = deployment.getServicesState();
+        if (state == null || !(state.get("services") instanceof Map<?, ?> servicesRaw)) {
+            return null;
+        }
+        @SuppressWarnings("unchecked")
+        Map<String, Object> services = (Map<String, Object>) servicesRaw;
+
+        for (AppService svc : app.getServices()) {
+            if (svc.getRole() != AppServiceRole.FRONTEND) continue;
+            Object row = services.get(svc.getName());
+            String url = externalUrlOf(row);
+            if (url != null) return url;
+        }
+
+        String firstRoot = null;
+        String firstAny = null;
+        for (AppService svc : app.getServices()) {
+            Object row = services.get(svc.getName());
+            String url = externalUrlOf(row);
+            if (url == null) continue;
+            if (firstAny == null) firstAny = url;
+            if (svc.getRole() == AppServiceRole.BACKEND) continue;
+            String path = url.replaceFirst("^https?://[^/]+", "");
+            if (path.isEmpty() || "/".equals(path)) {
+                return url;
+            }
+            if (firstRoot == null && !path.equals("/api") && !path.startsWith("/api/")) {
+                firstRoot = url;
+            }
+        }
+        if (firstRoot != null) return firstRoot;
+
+        // Dernier recours : n'importe quelle URL non NodePort dans le state
+        for (Object v : services.values()) {
+            String url = externalUrlOf(v);
+            if (url != null && !url.matches("^https?://\\d+\\.\\d+\\.\\d+\\.\\d+:\\d+.*")) {
+                return url;
+            }
+        }
+        return firstAny;
+    }
+
+    private static String externalUrlOf(Object row) {
+        if (!(row instanceof Map<?, ?> m)) return null;
+        Object ext = m.get("externalUrl");
+        if (ext == null) return null;
+        String url = String.valueOf(ext).trim();
+        return url.isEmpty() ? null : url;
     }
 
     /**
@@ -1049,7 +1192,11 @@ public class ApplicationManagementService {
         )) {
             paths.add(p);
         }
-        return new ArrayList<>(paths);
+        List<String> ordered = new ArrayList<>(paths);
+        if (ordered.size() > MAX_HEALTH_PROBE_PATHS) {
+            return new ArrayList<>(ordered.subList(0, MAX_HEALTH_PROBE_PATHS));
+        }
+        return ordered;
     }
 
     private Map<String, Object> probeHttpHealth(String appUrl, List<String> preferredPaths) {
@@ -1396,6 +1543,7 @@ public class ApplicationManagementService {
         Instant expiresAt = null;
         Instant readyAt = null;
         Long remainingSeconds = null;
+        String gitBranch = null;
 
         UUID envId = deployment.getEphemeralEnvironmentId();
         if (envId != null) {
@@ -1404,6 +1552,9 @@ public class ApplicationManagementService {
                 ttlHours = env.getTtlHours();
                 readyAt = toInstant(env.getReadyAt());
                 expiresAt = toInstant(env.getExpiresAt());
+                if (env.getGitBranch() != null && !env.getGitBranch().isBlank()) {
+                    gitBranch = env.getGitBranch().trim();
+                }
 
                 // Déploiement RUNNING mais TTL jamais armé (onReady ignoré / env détruit trop tôt)
                 if (deployment.getStatus() == AppDeploymentStatus.RUNNING
@@ -1459,6 +1610,7 @@ public class ApplicationManagementService {
                 .createdAt(deployment.getCreatedAt())
                 .updatedAt(deployment.getUpdatedAt())
                 .databases(databases)
+                .gitBranch(gitBranch)
                 .ttlHours(ttlHours)
                 .expiresAt(expiresAt)
                 .readyAt(readyAt)

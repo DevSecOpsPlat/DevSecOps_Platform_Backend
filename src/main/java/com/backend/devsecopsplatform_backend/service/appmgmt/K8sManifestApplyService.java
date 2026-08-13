@@ -339,17 +339,22 @@ public class K8sManifestApplyService {
             if ("CrashLoopBackOff".equals(reason) || "ImagePullBackOff".equals(reason)
                     || "ErrImagePull".equals(reason)) {
                 alerts.add(alert("error", name, workload,
-                        reason + " — pod en panne de démarrage"));
+                        reason + " — pod en panne de démarrage", reason, "pod", "Pod/" + name));
             } else if ("OOMKilled".equals(reason)) {
-                alerts.add(alert("error", name, workload, "OOMKilled — mémoire insuffisante"));
+                alerts.add(alert("error", name, workload, "OOMKilled — mémoire insuffisante",
+                        "OOMKilled", "pod", "Pod/" + name));
             } else if ("Pending".equals(phase)) {
-                alerts.add(alert("warn", name, workload, "Pod Pending (scheduling / quota)"));
+                alerts.add(alert("warn", name, workload, "Pod Pending (scheduling / quota)",
+                        "Pending", "pod", "Pod/" + name));
             } else if ("Failed".equals(phase)) {
-                alerts.add(alert("error", name, workload, "Pod Failed"));
+                alerts.add(alert("error", name, workload, "Pod Failed",
+                        "PodFailed", "pod", "Pod/" + name));
             } else if ("Running".equals(phase) && !ready) {
-                alerts.add(alert("warn", name, workload, "Running mais pas Ready (probes ?)"));
+                alerts.add(alert("warn", name, workload, "Running mais pas Ready (probes ?)",
+                        "NotReady", "pod", "Pod/" + name));
             } else if (restarts >= 3) {
-                alerts.add(alert("warn", name, workload, "Restarts élevés : " + restarts));
+                alerts.add(alert("warn", name, workload, "Restarts élevés : " + restarts,
+                        "HighRestarts", "pod", "Pod/" + name));
             }
             pods.add(row);
         }
@@ -359,7 +364,9 @@ public class K8sManifestApplyService {
             workloads = deriveWorkloadsFromPods(pods);
         }
         List<Map<String, Object>> services = listServices(namespace);
-        List<Map<String, Object>> events = listRecentEvents(namespace, 25);
+        // Plus d'événements pour capturer les Warning (FailedCreate, FailedScheduling…).
+        List<Map<String, Object>> events = listRecentEvents(namespace, 80);
+        appendK8sWarningAlerts(alerts, events);
 
         double totalCpu = 0;
         long totalMem = 0;
@@ -663,12 +670,129 @@ public class K8sManifestApplyService {
     }
 
     private static Map<String, Object> alert(String severity, String pod, String workload, String message) {
+        return alert(severity, pod, workload, message, null, "pod", null);
+    }
+
+    private static Map<String, Object> alert(
+            String severity,
+            String pod,
+            String workload,
+            String message,
+            String reason,
+            String source,
+            String object
+    ) {
         Map<String, Object> a = new LinkedHashMap<>();
         a.put("severity", severity);
         a.put("pod", pod);
         a.put("workload", workload);
         a.put("message", message);
+        if (reason != null && !reason.isBlank()) {
+            a.put("reason", reason);
+        }
+        if (source != null && !source.isBlank()) {
+            a.put("kind", source);
+        }
+        if (object != null && !object.isBlank()) {
+            a.put("object", object);
+        }
         return a;
+    }
+
+    /**
+     * Transforme chaque événement K8s de type Warning en alerte runtime
+     * (FailedCreate, FailedScheduling, Unhealthy, BackOff, FailedMount…).
+     */
+    private static void appendK8sWarningAlerts(
+            List<Map<String, Object>> alerts,
+            List<Map<String, Object>> events
+    ) {
+        if (events == null || events.isEmpty()) {
+            return;
+        }
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        for (Map<String, Object> existing : alerts) {
+            String key = alertDedupeKey(
+                    String.valueOf(existing.getOrDefault("reason", "")),
+                    String.valueOf(existing.getOrDefault("pod", "")),
+                    String.valueOf(existing.getOrDefault("message", ""))
+            );
+            if (!key.isBlank()) {
+                seen.add(key);
+            }
+        }
+        for (Map<String, Object> ev : events) {
+            if (!"Warning".equalsIgnoreCase(String.valueOf(ev.getOrDefault("type", "")))) {
+                continue;
+            }
+            String reason = ev.get("reason") != null ? String.valueOf(ev.get("reason")).trim() : "";
+            String message = ev.get("message") != null ? String.valueOf(ev.get("message")).trim() : "";
+            String object = ev.get("object") != null ? String.valueOf(ev.get("object")).trim() : "";
+            if (reason.isBlank() && message.isBlank()) {
+                continue;
+            }
+            String pod = null;
+            String workload = null;
+            if (object.contains("/")) {
+                String[] parts = object.split("/", 2);
+                String kind = parts[0];
+                String name = parts.length > 1 ? parts[1] : "";
+                if ("Pod".equalsIgnoreCase(kind)) {
+                    pod = name;
+                    int idx = name.lastIndexOf('-');
+                    if (idx > 0) {
+                        int idx2 = name.lastIndexOf('-', idx - 1);
+                        workload = idx2 > 0 ? name.substring(0, idx2) : name.substring(0, idx);
+                    } else {
+                        workload = name;
+                    }
+                } else {
+                    workload = name.isBlank() ? kind : name;
+                }
+            }
+            String display = reason.isBlank()
+                    ? message
+                    : (message.isBlank() ? reason : reason + " — " + message);
+            if (display.length() > 400) {
+                display = display.substring(0, 397) + "…";
+            }
+            String key = alertDedupeKey(reason, pod != null ? pod : object, display);
+            if (!seen.add(key)) {
+                continue;
+            }
+            String severity = isCriticalK8sReason(reason) ? "error" : "warn";
+            Map<String, Object> row = alert(severity, pod, workload, display, reason, "k8s-event", object);
+            if (ev.get("lastTimestamp") != null) {
+                row.put("lastTimestamp", ev.get("lastTimestamp"));
+            }
+            if (ev.get("count") != null) {
+                row.put("count", ev.get("count"));
+            }
+            alerts.add(row);
+        }
+    }
+
+    private static String alertDedupeKey(String reason, String target, String message) {
+        return (reason + "|" + target + "|" + message).toLowerCase();
+    }
+
+    /** Raisons K8s typiquement bloquantes → severity error. */
+    private static boolean isCriticalK8sReason(String reason) {
+        if (reason == null || reason.isBlank()) {
+            return false;
+        }
+        String r = reason.toLowerCase();
+        return r.contains("failedcreate")
+                || r.contains("failedscheduling")
+                || r.contains("failedmount")
+                || r.contains("failedattach")
+                || r.contains("oom")
+                || r.contains("evicted")
+                || r.contains("crashloop")
+                || r.contains("errimage")
+                || r.contains("imagepull")
+                || r.contains("failedcreatepodsandbox")
+                || r.equals("failed");
     }
 
     private record ResourceRequests(

@@ -35,4 +35,15 @@ public class AiAnalysisController {
         );
         return ResponseEntity.ok(response);
     }
+
+    /**
+     * Explique les logs d'un job CI (causes probables + actions) pour un profil sans accès cluster.
+     * Corps : { logs, jobName, stageName, jobStatus, pipelineKind, stagesOverview, projectHint, userQuestion }
+     */
+    @PostMapping("/explain-pipeline-logs")
+    public ResponseEntity<ExplainPipelineLogsResponse> explainPipelineLogs(
+            @RequestBody ExplainPipelineLogsRequest request) {
+        log.info("Demande d'explication logs IA (job={}, stage={})", request.getJobName(), request.getStageName());
+        return ResponseEntity.ok(aiAnalysisService.explainPipelineLogs(request));
+    }
 }

@@ -22,7 +22,38 @@ public interface PipelineExecutionRepository extends JpaRepository<PipelineExecu
 
     List<PipelineExecution> findByEnvironmentOrderByCreatedAtDesc(EphemeralEnvironment environment);
 
-    Optional<PipelineExecution> findByGitlabPipelineId(Long gitlabPipelineId);
+    /**
+     * Historique / mono-exécution : au plus une ligne attendue avant les lots multi-services.
+     * Après D1, préférer {@link #findAllByGitlabPipelineId} ou
+     * {@link #findByGitlabPipelineIdAndApplicationId}.
+     */
+    Optional<PipelineExecution> findFirstByGitlabPipelineIdOrderByCreatedAtDesc(Long gitlabPipelineId);
+
+    /** @deprecated utiliser {@link #findFirstByGitlabPipelineIdOrderByCreatedAtDesc} ou findAll… */
+    default Optional<PipelineExecution> findByGitlabPipelineId(Long gitlabPipelineId) {
+        return findFirstByGitlabPipelineIdOrderByCreatedAtDesc(gitlabPipelineId);
+    }
+
+    List<PipelineExecution> findAllByGitlabPipelineIdOrderByCreatedAtAsc(Long gitlabPipelineId);
+
+    @Query("""
+            SELECT pe FROM PipelineExecution pe
+            JOIN FETCH pe.appService app
+            WHERE pe.scanBatch.id = :batchId
+            ORDER BY app.name ASC
+            """)
+    List<PipelineExecution> findByScanBatchIdWithService(@Param("batchId") UUID batchId);
+
+    @Query("""
+            SELECT pe FROM PipelineExecution pe
+            JOIN FETCH pe.appService app
+            JOIN FETCH pe.scanBatch
+            WHERE pe.scanBatch.id IN :batchIds
+            ORDER BY app.name ASC
+            """)
+    List<PipelineExecution> findByScanBatchIdInWithService(@Param("batchIds") Collection<UUID> batchIds);
+
+    List<PipelineExecution> findByScanBatchIdOrderByCreatedAtAsc(UUID scanBatchId);
 
     List<PipelineExecution> findByStatusIn(Collection<PipelineStatus> statuses);
 

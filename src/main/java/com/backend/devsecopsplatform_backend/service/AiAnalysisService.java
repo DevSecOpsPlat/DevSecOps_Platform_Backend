@@ -1,6 +1,8 @@
 package com.backend.devsecopsplatform_backend.service;
 
 import com.backend.devsecopsplatform_backend.controller.ai.AnalyzeArtifactResponse;
+import com.backend.devsecopsplatform_backend.controller.ai.ExplainPipelineLogsRequest;
+import com.backend.devsecopsplatform_backend.controller.ai.ExplainPipelineLogsResponse;
 import com.backend.devsecopsplatform_backend.controller.ai.VulnerabilityItem;
 import com.backend.devsecopsplatform_backend.controller.finding.FindingAiRemediationResponse;
 import com.backend.devsecopsplatform_backend.controller.finding.ReferenceItem;
@@ -214,6 +216,157 @@ public class AiAnalysisService {
                     .vulnerabilities(List.of())
                     .build();
         }
+    }
+
+    /**
+     * Assistant pipeline : répond à toute question (URL, statut, causes d'échec…)
+     * avec le contexte projet + stages + logs optionnels. Pas de kubectl.
+     */
+    public ExplainPipelineLogsResponse explainPipelineLogs(ExplainPipelineLogsRequest request) {
+        if (!aiEnabled) {
+            return explainError("Analyse IA désactivée (ai.enabled=true pour activer).");
+        }
+        String provider = (aiProvider != null) ? aiProvider.strip().toLowerCase() : "groq";
+        if (!isProviderConfigured(provider)) {
+            return explainError("Provider '" + provider + "' non configuré. " + getConfigHint(provider));
+        }
+        if (request == null) {
+            return explainError("Requête vide.");
+        }
+        boolean hasLogs = request.getLogs() != null && !request.getLogs().isBlank();
+        boolean hasQuestion = request.getUserQuestion() != null && !request.getUserQuestion().isBlank();
+        boolean hasContext = request.getProjectContext() != null && !request.getProjectContext().isBlank();
+        boolean hasStages = request.getStagesOverview() != null && !request.getStagesOverview().isBlank();
+        if (!hasLogs && !hasQuestion && !hasContext && !hasStages) {
+            return explainError("Pose une question ou sélectionne un job avec des logs.");
+        }
+
+        String logs = hasLogs ? request.getLogs() : "";
+        // Limite stricte pour Ollama CPU : gros logs → 504 nginx / réponse très lente
+        final int maxExplainLogs = 24_000;
+        if (logs.length() > maxExplainLogs) {
+            log.info("Logs explication tronqués de {} à {} caractères", logs.length(), maxExplainLogs);
+            int from = Math.max(0, logs.length() - maxExplainLogs);
+            logs = "[... début tronqué ...]\n" + logs.substring(from);
+        }
+
+        String prompt = buildExplainLogsPrompt(request, logs);
+        try {
+            String jsonResponse = callAiProviderWithFallbackResult(provider, prompt, null, null, groqModelFast).text();
+            return parseExplainLogsResponse(jsonResponse);
+        } catch (Exception e) {
+            log.error("Erreur explication logs IA ({}): {}", provider, e.getMessage());
+            return explainError(buildUserFriendlyErrorMessage(e, provider));
+        }
+    }
+
+    private ExplainPipelineLogsResponse explainError(String message) {
+        return ExplainPipelineLogsResponse.builder()
+                .answer(message)
+                .summary(message)
+                .probableCauses(List.of())
+                .suggestedActions(List.of())
+                .build();
+    }
+
+    private String buildExplainLogsPrompt(ExplainPipelineLogsRequest req, String logs) {
+        String question = (req.getUserQuestion() != null && !req.getUserQuestion().isBlank())
+                ? req.getUserQuestion().strip()
+                : "Fais le point : état du pipeline / job, causes si échec, infos utiles (URLs, services).";
+        StringBuilder sb = new StringBuilder();
+        sb.append("""
+                Tu es l'assistant EnviroTest (DevSecOps). Tu réponds à N'IMPORTE QUELLE question
+                sur le projet scanné/déployé et sur ce pipeline (URLs, services, statut, stages, logs, causes d'échec…).
+                L'utilisateur est un TESTEUR / développeur SANS accès cluster (pas de kubectl, pas de shell noeud).
+
+                Contexte job sélectionné :
+                """);
+        sb.append("- Job : ").append(nullToDash(req.getJobName())).append('\n');
+        sb.append("- Stage : ").append(nullToDash(req.getStageName())).append('\n');
+        sb.append("- Statut job : ").append(nullToDash(req.getJobStatus())).append('\n');
+        sb.append("- Type pipeline : ").append(nullToDash(req.getPipelineKind())).append('\n');
+        sb.append("- Vue stages : ").append(nullToDash(req.getStagesOverview())).append('\n');
+        sb.append("- Hint projet : ").append(nullToDash(req.getProjectHint())).append('\n');
+        sb.append("\nContexte projet / déploiement / scan (source de vérité pour URLs, namespace, services) :\n");
+        sb.append(nullToDash(req.getProjectContext())).append('\n');
+        sb.append("\nQuestion de l'utilisateur :\n").append(question).append('\n');
+        if (logs != null && !logs.isBlank()) {
+            sb.append("\nLogs du job (référence si la question porte sur l'échec / le log) :\n```\n")
+                    .append(logs)
+                    .append("\n```\n");
+        } else {
+            sb.append("\n(Aucun log job fourni — réponds avec le contexte projet/pipeline.)\n");
+        }
+        sb.append("""
+
+                Règles STRICTES :
+                1. Réponds en français, clair et CONCIS (answer ≤ 1200 caractères si possible).
+                2. Si on te demande une URL, un service, un namespace, un statut : utilise le « Contexte projet » en priorité.
+                3. Si on te demande d'expliquer un échec / un log : interprète les logs (timeout pods, ImagePullBackOff, CrashLoop, HTTP, artifacts…).
+                4. NE propose JAMAIS de commandes kubectl, helm, docker exec sur le cluster, ni d'accès SSH.
+                5. Tu peux suggérer : corriger code/Dockerfile/CI, relancer le pipeline, onglet Pods/Services de la plateforme, contacter un ops.
+                6. Distingue cause racine vs symptôme. Les WARNING artifacts secondaires ne sont pas forcément la cause principale.
+                7. Si l'info n'est pas dans le contexte, dis-le clairement (ne invente pas d'URL).
+                8. Pour une question factuelle simple (URL, statut), probableCauses/suggestedActions peuvent être des listes vides.
+                9. Max 3 causes et 3 actions.
+                10. Réponds UNIQUEMENT avec un JSON valide (pas de markdown hors JSON), schéma :
+                {
+                  "answer": "réponse conversationnelle complète à la question",
+                  "summary": "résumé court",
+                  "probableCauses": ["…"] ,
+                  "suggestedActions": ["…"]
+                }
+                """);
+        return sb.toString();
+    }
+
+    private static String nullToDash(String s) {
+        return (s == null || s.isBlank()) ? "—" : s.strip();
+    }
+
+    private ExplainPipelineLogsResponse parseExplainLogsResponse(String jsonText) {
+        String toParse = extractJsonFromResponse(jsonText);
+        try {
+            JsonNode root = objectMapper.readTree(toParse);
+            String answer = root.path("answer").asText("");
+            String summary = root.path("summary").asText("");
+            if (answer.isBlank() && !summary.isBlank()) {
+                answer = summary;
+            }
+            if (summary.isBlank() && !answer.isBlank()) {
+                summary = answer.length() > 280 ? answer.substring(0, 280) + "…" : answer;
+            }
+            return ExplainPipelineLogsResponse.builder()
+                    .answer(answer.isBlank() ? "Aucune explication fournie." : answer)
+                    .summary(summary.isBlank() ? answer : summary)
+                    .probableCauses(readStringList(root.path("probableCauses")))
+                    .suggestedActions(readStringList(root.path("suggestedActions")))
+                    .build();
+        } catch (Exception e) {
+            log.warn("Impossible de parser la réponse d'explication logs: {}", e.getMessage());
+            String fallback = toParse != null && toParse.length() > 800
+                    ? toParse.substring(0, 800) + "…"
+                    : toParse;
+            return ExplainPipelineLogsResponse.builder()
+                    .answer(fallback != null ? fallback : "Réponse IA illisible.")
+                    .summary("L'IA a répondu mais le format JSON n'a pas pu être parsé.")
+                    .probableCauses(List.of())
+                    .suggestedActions(List.of())
+                    .build();
+        }
+    }
+
+    private List<String> readStringList(JsonNode node) {
+        List<String> out = new ArrayList<>();
+        if (node != null && node.isArray()) {
+            for (JsonNode n : node) {
+                String t = n.asText("").strip();
+                if (!t.isBlank()) {
+                    out.add(t);
+                }
+            }
+        }
+        return out;
     }
 
     /**

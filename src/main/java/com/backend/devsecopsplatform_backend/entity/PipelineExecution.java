@@ -1,14 +1,16 @@
 package com.backend.devsecopsplatform_backend.entity;
 
+import com.backend.devsecopsplatform_backend.entity.appmgmt.ScanBatch;
 import com.fasterxml.jackson.annotation.JsonBackReference;
 import com.fasterxml.jackson.annotation.JsonFormat;
 import com.fasterxml.jackson.annotation.JsonManagedReference;
 import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
 import lombok.Data;
+import lombok.EqualsAndHashCode;
 import lombok.NoArgsConstructor;
+import lombok.ToString;
 import org.hibernate.annotations.CreationTimestamp;
-import org.hibernate.annotations.Type;
 import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
 import java.time.LocalDateTime;
@@ -25,7 +27,8 @@ import java.util.UUID;
         @Index(name = "idx_pipeline_env", columnList = "environment_id"),
         @Index(name = "idx_pipeline_app", columnList = "app_service_id"),
         @Index(name = "idx_pipeline_gitlab", columnList = "gitlab_pipeline_id"),
-        @Index(name = "idx_pipeline_status", columnList = "status")
+        @Index(name = "idx_pipeline_status", columnList = "status"),
+        @Index(name = "idx_pipeline_scan_batch", columnList = "scan_batch_id")
 })
 @Data
 @NoArgsConstructor
@@ -40,11 +43,27 @@ public class PipelineExecution {
     @OneToOne(fetch = FetchType.LAZY, optional = true)
     @JoinColumn(name = "environment_id", nullable = true, unique = true)
     @JsonBackReference("env-pipeline")
+    @ToString.Exclude
+    @EqualsAndHashCode.Exclude
     private EphemeralEnvironment environment;
 
     @ManyToOne(fetch = FetchType.LAZY, optional = false)
     @JoinColumn(name = "app_service_id", nullable = false)
+    @ToString.Exclude
+    @EqualsAndHashCode.Exclude
     private AppService appService;
+
+    /**
+     * Lot de scan application (nullable = historique pré-lot / exécutions hors batch).
+     * UNIQUE (gitlab_pipeline_id, app_service_id) posée en SQL si données propres —
+     * pas via Hibernate ddl-auto (évite plantage au démarrage).
+     */
+    @ManyToOne(fetch = FetchType.LAZY, optional = true)
+    @JoinColumn(name = "scan_batch_id")
+    @JsonBackReference("batch-executions")
+    @ToString.Exclude
+    @EqualsAndHashCode.Exclude
+    private ScanBatch scanBatch;
 
     @Enumerated(EnumType.STRING)
     @Column(name = "execution_kind", nullable = false, length = 30)
@@ -52,6 +71,21 @@ public class PipelineExecution {
 
     @Column(name = "git_branch", nullable = false, length = 255)
     private String gitBranch = "main";
+
+    /** SHA HEAD résolu au déclenchement (branche) — D2 / D6. */
+    @Column(name = "commit_sha", length = 64)
+    private String commitSha;
+
+    /**
+     * Dernier HEAD connu (cache posture) — rafraîchi au plus toutes les
+     * {@code scan.posture.head-check-ttl-ms} minutes côté {@code securityPosture}.
+     */
+    @Column(name = "checked_head_sha", length = 64)
+    private String checkedHeadSha;
+
+    @Column(name = "head_checked_at")
+    @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd'T'HH:mm:ss")
+    private LocalDateTime headCheckedAt;
 
     @Column(name = "gitlab_pipeline_id")
     private Long gitlabPipelineId;
@@ -84,8 +118,11 @@ public class PipelineExecution {
 
 
     @OneToMany(mappedBy = "pipelineExecution", cascade = CascadeType.ALL, orphanRemoval = true)
-    @JsonManagedReference("pipeline-scan") // Parent de Scan
+    @JsonManagedReference("pipeline-scan")
+    @ToString.Exclude
+    @EqualsAndHashCode.Exclude
     private List<SecurityScan> securityScans = new ArrayList<>();
+
     public boolean isFinished() {
         return status == PipelineStatus.SUCCESS ||
                 status == PipelineStatus.FAILED ||
@@ -95,7 +132,6 @@ public class PipelineExecution {
     public boolean isRunning() {
         return status == PipelineStatus.RUNNING;
     }
-
 
     public Long getDurationInSeconds() {
         if (startedAt != null && finishedAt != null) {

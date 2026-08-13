@@ -23,6 +23,9 @@ public class AppDeploymentResponse {
     /** Bases avec URL de connexion générée (mot de passe masqué), pour l'écran d'état. */
     private List<AppDatabaseResponse> databases;
 
+    /** Branche Git du déploiement — depuis l'environnement éphémère lié. */
+    private String gitBranch;
+
     /** TTL configuré (heures) — depuis l'environnement éphémère lié. */
     private Integer ttlHours;
     /** Instant d'expiration serveur (horloge backend). Null tant que non Ready. */

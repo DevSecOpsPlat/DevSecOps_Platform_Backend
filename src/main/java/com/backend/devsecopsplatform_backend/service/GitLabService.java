@@ -212,6 +212,29 @@ public class GitLabService {
         }
     }
 
+    /**
+     * Déclenche un pipeline CI avec un map de variables (scan lot / deploy-style).
+     * Injecte BACKEND_URL / Sonar / DefectDojo / PIPELINE_SECRET si absents.
+     */
+    public Pipeline triggerCiPipeline(Map<String, String> variables) {
+        try {
+            List<Map<String, String>> variablesList = new ArrayList<>();
+            if (variables != null) {
+                variables.forEach((k, v) -> addVar(variablesList, k, v));
+            }
+            boolean hasSecret = variables != null && variables.containsKey("PIPELINE_SECRET");
+            addBackendUrlIfConfigured(variablesList);
+            addScanToolUrlsIfConfigured(variablesList);
+            if (!hasSecret) {
+                addVar(variablesList, "PIPELINE_SECRET", pipelineSecret != null ? pipelineSecret : "");
+            }
+            return postPipeline(variablesList);
+        } catch (Exception e) {
+            log.error("❌ Erreur déclenchement pipeline CI: {}", e.getMessage());
+            throw new RuntimeException("Impossible de lancer le pipeline: " + e.getMessage(), e);
+        }
+    }
+
     private Pipeline postPipeline(List<Map<String, String>> variablesList) {
         try {
             String ref = defaultBranch;

@@ -38,5 +38,7 @@ public enum AlertType {
     /** Pod Failed. */
     DEPLOYMENT_POD_FAILED,
     /** Health URL publique KO. */
-    DEPLOYMENT_HEALTH_FAILED
+    DEPLOYMENT_HEALTH_FAILED,
+    /** Événement Kubernetes Warning (FailedCreate, FailedScheduling, Unhealthy…). */
+    DEPLOYMENT_K8S_WARNING
 }

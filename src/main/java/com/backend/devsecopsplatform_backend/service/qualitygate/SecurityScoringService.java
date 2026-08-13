@@ -317,12 +317,30 @@ public class SecurityScoringService {
         return String.format(Locale.ROOT, "%.1f %%", coverage);
     }
 
-    private static String scoreToGrade(int score) {
+    public static String scoreToGrade(int score) {
         if (score >= 90) return "A";
         if (score >= 75) return "B";
         if (score >= 60) return "C";
         if (score >= 40) return "D";
         return "E";
+    }
+
+    /**
+     * Même logique que {@code QualityGateService.resolveDeterministicVerdict} —
+     * exposée pour l'agrégation lot (Chantier 4) sans coupler au controller QG.
+     */
+    public String resolveDeterministicVerdict(HardGateEvaluation hardGates, SecurityScoreDto postureScore) {
+        if (hardGates != null && !hardGates.violations().isEmpty()) {
+            return "NOT_RECOMMENDED";
+        }
+        if (hardGates != null && (!hardGates.indeterminateSources().isEmpty()
+                || (hardGates.indeterminate() != null && !hardGates.indeterminate().isEmpty()))) {
+            return "INDETERMINE";
+        }
+        if (postureScore != null && postureScore.getDerivedVerdict() != null) {
+            return postureScore.getDerivedVerdict();
+        }
+        return "WITH_WARNINGS";
     }
 
     private static SecurityScoreDto emptyScore() {

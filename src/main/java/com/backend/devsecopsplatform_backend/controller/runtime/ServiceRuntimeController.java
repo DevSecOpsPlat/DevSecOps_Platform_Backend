@@ -15,6 +15,7 @@ import com.backend.devsecopsplatform_backend.service.appmgmt.AppDeploymentServic
 import com.backend.devsecopsplatform_backend.controller.appmgmt.ManagedDeployRequest;
 import com.backend.devsecopsplatform_backend.service.appmgmt.AppValidationException;
 import com.backend.devsecopsplatform_backend.service.appmgmt.ManagedDeployOptions;
+import com.backend.devsecopsplatform_backend.service.appmgmt.ManagedAppScanService;
 import com.backend.devsecopsplatform_backend.service.environment.EnvironmentService;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
@@ -53,6 +54,7 @@ public class ServiceRuntimeController {
     private final EnvironmentService environmentService;
     private final AppDeploymentService appDeploymentService;
     private final EncryptionService encryptionService;
+    private final ManagedAppScanService managedAppScanService;
 
     /**
      * Corps optionnel d'un scan : branche (défaut = branche du service, sinon "main").
@@ -131,16 +133,25 @@ public class ServiceRuntimeController {
     }
 
     /**
-     * Déclenche un scan pour un service dont l'ID est {@code applications.id}.
-     * Le repo et le token sont lus sur l'entité — aucun formulaire, aucune saisie utilisateur.
+     * Déclenche un scan pour un service. Si le service est rattaché à une application
+     * managée → lot d'un service (D3). Sinon → chemin legacy sans lot.
      */
     @PostMapping("/api/applications/{id}/scan")
-    public ResponseEntity<DeployResponse> scanService(
+    public ResponseEntity<?> scanService(
             @PathVariable UUID id,
             @RequestBody(required = false) ScanRunRequest body) {
         User currentUser = getCurrentUser();
         AppService svc = appServiceRepository.findByIdAndCreatedBy(id, currentUser)
                 .orElseThrow(() -> new AppValidationException("Service introuvable ou accès refusé."));
+
+        String branch = body != null && body.getBranch() != null && !body.getBranch().isBlank()
+                ? body.getBranch().trim()
+                : null;
+
+        if (svc.getManagedApplication() != null && svc.getManagedApplication().getId() != null) {
+            log.info("🔎 Scan service {} via lot application {}", svc.getId(), svc.getManagedApplication().getId());
+            return ResponseEntity.ok(managedAppScanService.scanSingleManagedService(svc, branch));
+        }
 
         String repoUrl = svc.getGitRepositoryUrl();
         if (repoUrl == null || repoUrl.isBlank()) {
@@ -148,17 +159,17 @@ public class ServiceRuntimeController {
         }
 
         String token = resolveDecryptedToken(svc);
-        String branch = body != null && body.getBranch() != null && !body.getBranch().isBlank()
-                ? body.getBranch().trim()
+        String resolvedBranch = branch != null ? branch
                 : (svc.getGitBranch() != null && !svc.getGitBranch().isBlank() ? svc.getGitBranch() : "main");
 
         DeployRequest req = new DeployRequest();
         req.setGitRepositoryUrl(repoUrl);
-        req.setBranch(branch);
+        req.setBranch(resolvedBranch);
         req.setGithubToken(token);
         req.setDockerfilePath(svc.getDockerfilePath() != null ? svc.getDockerfilePath() : "./Dockerfile");
 
-        log.info("🔎 Scan service {} (repo={}, branch={})", svc.getId(), repoUrl, branch);
+        log.info("🔎 Scan service orphelin {} (repo={}, branch={}) — legacy sans lot",
+                svc.getId(), repoUrl, resolvedBranch);
         DeployResponse response = environmentService.scan(req, svc);
         return ResponseEntity.ok(response);
     }

@@ -8,6 +8,7 @@ import com.backend.devsecopsplatform_backend.entity.PipelineStatus;
 import com.backend.devsecopsplatform_backend.entity.QualityGateSnapshot;
 import com.backend.devsecopsplatform_backend.entity.User;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDeployment;
+import com.backend.devsecopsplatform_backend.entity.appmgmt.ScanBatch;
 import com.backend.devsecopsplatform_backend.repository.AppDeploymentRepository;
 import com.backend.devsecopsplatform_backend.repository.AppServiceRepository;
 import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
@@ -15,6 +16,7 @@ import com.backend.devsecopsplatform_backend.repository.FindingOccurrenceReposit
 import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
 import com.backend.devsecopsplatform_backend.repository.QualityGateSnapshotRepository;
 import com.backend.devsecopsplatform_backend.repository.UserRepository;
+import com.backend.devsecopsplatform_backend.repository.appmgmt.ScanBatchRepository;
 import com.backend.devsecopsplatform_backend.service.AiAnalysisService;
 import com.backend.devsecopsplatform_backend.service.GitLabService;
 import com.backend.devsecopsplatform_backend.service.SonarBranchResolution;
@@ -93,6 +95,7 @@ public class QualityGateService {
     private final AiAnalysisService aiAnalysisService;
     private final SecurityScoringService securityScoringService;
     private final QualityGateSnapshotRepository qualityGateSnapshotRepository;
+    private final ScanBatchRepository scanBatchRepository;
     private final ObjectMapper objectMapper;
 
     @Transactional
@@ -192,9 +195,26 @@ public class QualityGateService {
         Optional<PipelineExecution> existing = pipelineExecutionRepository
                 .findByGitlabPipelineIdAndApplicationId(gitlabPipelineId, applicationId);
         if (existing.isPresent()) {
-            return existing.get();
+            PipelineExecution pe = existing.get();
+            attachBatchIfMissing(pe, request);
+            return pe;
         }
         return createScanExecutionIfMissing(applicationId, gitlabPipelineId, request);
+    }
+
+    @Transactional(readOnly = true)
+    public Optional<PipelineExecution> findExecutionForBatchHook(UUID executionId) {
+        return pipelineExecutionRepository.findById(executionId);
+    }
+
+    private void attachBatchIfMissing(PipelineExecution pe, SecurityGateIngestRequest request) {
+        if (pe.getScanBatch() != null || request.getScanBatchId() == null) {
+            return;
+        }
+        scanBatchRepository.findById(request.getScanBatchId()).ifPresent(batch -> {
+            pe.setScanBatch(batch);
+            pipelineExecutionRepository.save(pe);
+        });
     }
 
     /**
@@ -335,9 +355,12 @@ public class QualityGateService {
             execution.setStatus(PipelineStatus.SUCCESS);
             execution.setStartedAt(java.time.LocalDateTime.now());
             execution.setFinishedAt(java.time.LocalDateTime.now());
+            if (request.getScanBatchId() != null) {
+                scanBatchRepository.findById(request.getScanBatchId()).ifPresent(execution::setScanBatch);
+            }
             PipelineExecution saved = pipelineExecutionRepository.save(execution);
-            log.info("PipelineExecution créé depuis security-gate (sans webhook) app={} gitlab=#{}",
-                    applicationId, gitlabPipelineId);
+            log.info("PipelineExecution créé depuis security-gate (sans webhook) app={} gitlab=#{} batch={}",
+                    applicationId, gitlabPipelineId, request.getScanBatchId());
             return saved;
         }).orElseGet(() -> {
             log.warn("PipelineExecution non créé : application {} introuvable en base", applicationId);
@@ -965,7 +988,92 @@ public class QualityGateService {
         QualityGateResultDto result = buildResult(
                 resolvedApp, resolvedBranch, execution, dd, sonar, environmentId);
         persistDisplaySnapshot(execution, result, appendHistory);
+        freezeDefectDojoRollupFields(execution, resolvedApp, resolvedBranch, dd, result);
         saveSnapshotTable(resolvedApp.getId(), environmentId, execution, resolvedBranch, source, result);
+    }
+
+    /**
+     * Fige les compteurs / top findings DefectDojo dans {@code qualityGateJson}
+     * (source unique pour hard gate, score et rollup app — Option A).
+     */
+    @SuppressWarnings("unchecked")
+    private void freezeDefectDojoRollupFields(
+            PipelineExecution execution,
+            AppService app,
+            String branch,
+            DefectDojoDashboard2Response dd,
+            QualityGateResultDto result
+    ) {
+        if (execution == null) {
+            return;
+        }
+        Map<String, Object> gate = execution.getQualityGateJson();
+        if (gate == null) {
+            gate = new LinkedHashMap<>();
+        }
+
+        Map<String, Integer> bySev = new LinkedHashMap<>();
+        bySev.put("critical", 0);
+        bySev.put("high", 0);
+        bySev.put("medium", 0);
+        bySev.put("low", 0);
+        bySev.put("info", 0);
+        String source = "EMPTY";
+        if (dd != null && dd.getBySeverity() != null && !dd.getBySeverity().isEmpty()) {
+            bySev.put("critical", dd.getBySeverity().getOrDefault("Critical", 0));
+            bySev.put("high", dd.getBySeverity().getOrDefault("High", 0));
+            bySev.put("medium", dd.getBySeverity().getOrDefault("Medium", 0));
+            bySev.put("low", dd.getBySeverity().getOrDefault("Low", 0));
+            bySev.put("info", dd.getBySeverity().getOrDefault("Info", 0));
+            source = "DEFECTDOJO";
+        } else if (result != null && result.getMetrics() != null
+                && result.getMetrics().get("bySeverity") instanceof Map<?, ?> m) {
+            for (String k : List.of("critical", "high", "medium", "low", "info")) {
+                Object v = m.get(k);
+                if (v == null) {
+                    v = m.get(Character.toUpperCase(k.charAt(0)) + k.substring(1));
+                }
+                bySev.put(k, v instanceof Number n ? n.intValue() : 0);
+            }
+            source = "SNAPSHOT_METRICS";
+        }
+        gate.put("ddBySeverity", bySev);
+        gate.put("ddBySeveritySource", source);
+        gate.put("ddBySeverityFrozenAt", Instant.now().toString());
+
+        List<Map<String, Object>> top = new ArrayList<>();
+        if (app != null && app.getId() != null) {
+            try {
+                for (String severity : List.of("Critical", "High")) {
+                    if (top.size() >= 10) {
+                        break;
+                    }
+                    var page = defectDojoService.listFindings(
+                            app.getId(), branch, "open", severity, 0, 10, null, null, null, null);
+                    if (page == null || page.getContent() == null) {
+                        continue;
+                    }
+                    for (var item : page.getContent()) {
+                        if (top.size() >= 10) {
+                            break;
+                        }
+                        Map<String, Object> row = new LinkedHashMap<>();
+                        row.put("findingId", item.getId());
+                        row.put("title", item.getTitle());
+                        row.put("severity", item.getSeverity());
+                        row.put("scanType", item.getScanType());
+                        row.put("filePath", item.getFilePath());
+                        row.put("cve", item.getCve());
+                        top.add(row);
+                    }
+                }
+            } catch (Exception e) {
+                log.warn("Freeze top findings DD échoué (app={}): {}", app.getId(), e.getMessage());
+            }
+        }
+        gate.put("ddTopBlockingFindings", top);
+        execution.setQualityGateJson(gate);
+        pipelineExecutionRepository.save(execution);
     }
 
     private QualityGateResultDto loadSnapshotForPipelineExecution(PipelineExecution execution) {

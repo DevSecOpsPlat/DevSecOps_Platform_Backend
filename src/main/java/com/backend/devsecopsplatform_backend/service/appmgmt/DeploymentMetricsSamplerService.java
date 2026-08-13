@@ -46,11 +46,14 @@ public class DeploymentMetricsSamplerService {
         this.k8sManifestApplyService = k8sManifestApplyService;
     }
 
-    @Transactional
+    /**
+     * Échantillonne les métriques K8s hors transaction longue, puis persiste.
+     */
     public void sampleRunningDeployments() {
         if (!sampleEnabled || !k8sManifestApplyService.isConfigured()) {
             return;
         }
+        // EntityGraph application (findByStatus) — session courte via le repo
         List<AppDeployment> running = deploymentRepository.findByStatus(AppDeploymentStatus.RUNNING);
         Instant now = Instant.now();
         int n = 0;

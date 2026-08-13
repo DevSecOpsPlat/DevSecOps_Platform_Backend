@@ -91,7 +91,7 @@ public class AppDeploymentService {
     @Value("${deployment.registry.server:registry.gitlab.com}")
     private String registryServer;
 
-    @Value("${deployment.registry.username:gitlab-ci-token}")
+    @Value("${deployment.registry.username:oauth2}")
     private String registryUsername;
 
     @Value("${deployment.registry.password:${gitlab.token:}}")
@@ -1093,10 +1093,13 @@ public class AppDeploymentService {
             start = deployment.getUpdatedAt() != null
                     ? deployment.getUpdatedAt()
                     : deployment.getCreatedAt();
+        } else if (deployment.getDeployedAt() != null) {
+            start = deployment.getDeployedAt();
         } else {
-            // Pendant l'apply async deployedAt est null — timeout depuis createdAt
-            start = deployment.getDeployedAt() != null
-                    ? deployment.getDeployedAt()
+            // Re-trigger CI remet deployedAt=null : chrono depuis updatedAt (passage DEPLOYING),
+            // pas createdAt (sinon timeout immédiat sur retry du même deploymentId).
+            start = deployment.getUpdatedAt() != null
+                    ? deployment.getUpdatedAt()
                     : deployment.getCreatedAt();
         }
         if (start == null) {
@@ -1428,7 +1431,14 @@ public class AppDeploymentService {
                     if (ingressOk && svcState.get("externalUrl") == null) {
                         ManagedApplication shadow = buildShadowForDeployment(
                                 deployment, deployment.getApplication());
-                        String resolved = resolvePublicUrl(deployment, shadow);
+                        String svcName = String.valueOf(e.getKey());
+                        AppService match = shadow.getServices().stream()
+                                .filter(s -> svcName.equals(s.getName()))
+                                .findFirst()
+                                .orElse(null);
+                        String resolved = match != null
+                                ? ingressServiceUrl(deployment.getNamespace(), match, shadow)
+                                : resolvePublicUrl(deployment, shadow);
                         if (resolved != null) {
                             svcState.put("externalUrl", resolved);
                         }
@@ -1456,24 +1466,42 @@ public class AppDeploymentService {
         if (!isIngressApplied(deployment)) {
             return null;
         }
-        Map<String, Object> state = deployment.getServicesState();
-        if (state != null && state.get("services") instanceof Map<?, ?> services) {
-            for (Object v : services.values()) {
-                if (v instanceof Map<?, ?> svcState) {
-                    Object ext = svcState.get("externalUrl");
-                    if (ext != null && !String.valueOf(ext).isBlank()) {
-                        String url = String.valueOf(ext);
-                        // Ignorer d'anciennes URLs NodePort / IP:port — préférer Ingress host
-                        if (!url.matches("^https?://\\d+\\.\\d+\\.\\d+\\.\\d+:\\d+.*")) {
-                            return url;
-                        }
-                    }
+        // Entrée publique = FRONTEND (ou premier service exposé), pas le BACKEND /api
+        // (sinon le bandeau UI affiche l'API et le health sonde /api/api/…).
+        if (ingressEnabled && deployment.getNamespace() != null && shadow != null) {
+            AppService primary = findPrimaryExposed(shadow);
+            if (primary != null) {
+                String primaryUrl = ingressServiceUrl(deployment.getNamespace(), primary, shadow);
+                if (primaryUrl != null && !primaryUrl.isBlank()) {
+                    return primaryUrl;
                 }
             }
+            if (pathBasedRouting || normalizeCustomHostnameSafe(shadow.getCustomHostname()) != null) {
+                return applicationPublicBase(deployment.getNamespace(), shadow);
+            }
         }
-        if (!shadow.getServices().isEmpty() && ingressEnabled && pathBasedRouting
-                && deployment.getNamespace() != null) {
-            return applicationPublicBase(deployment.getNamespace(), shadow);
+        Map<String, Object> state = deployment.getServicesState();
+        if (state != null && state.get("services") instanceof Map<?, ?> services) {
+            String firstNonApi = null;
+            String firstAny = null;
+            for (Object v : services.values()) {
+                if (!(v instanceof Map<?, ?> svcState)) continue;
+                Object ext = svcState.get("externalUrl");
+                if (ext == null || String.valueOf(ext).isBlank()) continue;
+                String url = String.valueOf(ext).trim();
+                // Ignorer d'anciennes URLs NodePort / IP:port — préférer Ingress host
+                if (url.matches("^https?://\\d+\\.\\d+\\.\\d+\\.\\d+:\\d+.*")) {
+                    continue;
+                }
+                if (firstAny == null) firstAny = url;
+                String path = url.replaceFirst("^https?://[^/]+", "");
+                if (!path.equals("/api") && !path.startsWith("/api/") && !path.equals("api")) {
+                    firstNonApi = url;
+                    break;
+                }
+            }
+            if (firstNonApi != null) return firstNonApi;
+            if (firstAny != null) return firstAny;
         }
         if (nipPreviewEnabled && nipMasterIp != null && !nipMasterIp.isBlank()
                 && normalizeCustomHostnameSafe(shadow.getCustomHostname()) == null) {
@@ -1486,7 +1514,10 @@ public class AppDeploymentService {
             if (custom != null) {
                 return "http://" + custom;
             }
-            AppService svc = shadow.getServices().get(0);
+            AppService svc = findPrimaryExposed(shadow);
+            if (svc == null) {
+                svc = shadow.getServices().get(0);
+            }
             String k8sName = AppNaming.k8sName(svc.getName());
             return "http://" + k8sName + "-" + deployment.getNamespace() + "." + ingressDomain;
         }
@@ -1662,6 +1693,7 @@ public class AppDeploymentService {
             Map<String, Object> svcState = new LinkedHashMap<>();
             svcState.put("status", "NotReady");
             svcState.put("wave", waveOf(waves, svc));
+            svcState.put("role", svc.getRole() != null ? svc.getRole().name() : null);
             svcState.put("internalHost", k8sName + "." + namespace + ".svc.cluster.local");
             svcState.put("externalUrl", ingressServiceUrl(namespace, svc, app));
             services.put(svc.getName(), svcState);

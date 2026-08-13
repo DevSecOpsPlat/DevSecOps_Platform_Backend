@@ -2,6 +2,7 @@ package com.backend.devsecopsplatform_backend.controller.appmgmt;
 
 import com.backend.devsecopsplatform_backend.service.appmgmt.ApplicationManagementService;
 import com.backend.devsecopsplatform_backend.service.appmgmt.AppValidationException;
+import com.backend.devsecopsplatform_backend.service.appmgmt.ManagedAppScanService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -28,6 +29,7 @@ import java.util.UUID;
 public class ApplicationManagementController {
 
     private final ApplicationManagementService service;
+    private final ManagedAppScanService managedAppScanService;
 
     // ---------- Applications ----------
 
@@ -75,6 +77,31 @@ public class ApplicationManagementController {
     @DeleteMapping("/{id}/services/{sid}")
     public ResponseEntity<?> deleteService(@PathVariable UUID id, @PathVariable UUID sid) {
         return handle(() -> ResponseEntity.ok(service.deleteService(id, sid)));
+    }
+
+    // ---------- Scan lot (Chantier 2) ----------
+
+    @PostMapping("/{id}/scan")
+    public ResponseEntity<?> scanApp(
+            @PathVariable UUID id,
+            @RequestBody(required = false) ManagedAppScanRequest request) {
+        return handle(() -> ResponseEntity.ok(
+                managedAppScanService.scanApplication(id, request != null ? request : new ManagedAppScanRequest())));
+    }
+
+    @GetMapping("/{id}/scan-batches")
+    public ResponseEntity<?> listScanBatches(@PathVariable UUID id) {
+        return handle(() -> ResponseEntity.ok(managedAppScanService.listBatches(id)));
+    }
+
+    @GetMapping("/{id}/scan-batches/{batchId}")
+    public ResponseEntity<?> getScanBatch(@PathVariable UUID id, @PathVariable UUID batchId) {
+        return handle(() -> ResponseEntity.ok(managedAppScanService.getBatch(id, batchId)));
+    }
+
+    @GetMapping("/{id}/security-posture")
+    public ResponseEntity<?> securityPosture(@PathVariable UUID id) {
+        return handle(() -> ResponseEntity.ok(managedAppScanService.securityPosture(id)));
     }
 
     // ---------- Databases ----------
@@ -191,7 +218,7 @@ public class ApplicationManagementController {
         return handle(() -> ResponseEntity.ok(service.getDeploymentMonitoring(id, did)));
     }
 
-    /** Alertes runtime live + historique (CrashLoop, OOM, health KO…). */
+    /** Alertes runtime live + historique (CrashLoop, OOM, Warning K8s FailedCreate…). */
     @GetMapping("/{id}/deployments/{did}/alerts")
     public ResponseEntity<?> getDeploymentAlerts(@PathVariable UUID id, @PathVariable UUID did) {
         return handle(() -> ResponseEntity.ok(service.listDeploymentAlerts(id, did)));

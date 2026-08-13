@@ -1,6 +1,8 @@
 package com.backend.devsecopsplatform_backend.controller.qualitygate;
 
+import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
 import com.backend.devsecopsplatform_backend.service.PipelineStageSyncService;
+import com.backend.devsecopsplatform_backend.service.appmgmt.ScanBatchCompletionService;
 import com.backend.devsecopsplatform_backend.service.finding.FindingIngestionService;
 import com.backend.devsecopsplatform_backend.service.qualitygate.QualityGateService;
 import com.backend.devsecopsplatform_backend.service.qualitygate.dto.SecurityGateIngestRequest;
@@ -19,9 +21,6 @@ import java.util.concurrent.CompletableFuture;
 /**
  * Compatibilité avec le job CI security-validation (POST /api/security-gate).
  * Authentification via {@code X-Pipeline-Secret} (pas de JWT).
- *
- * <p>Ne dépend pas du webhook GitLab : à la fin du job CI, on synchronise les stages
- * via l'API GitLab et on ingère les findings (même rôle que le webhook pipeline).</p>
  */
 @RestController
 @RequestMapping("/api/security-gate")
@@ -33,6 +32,7 @@ public class SecurityGateCompatController {
     private final QualityGateService qualityGateService;
     private final PipelineStageSyncService pipelineStageSyncService;
     private final FindingIngestionService findingIngestionService;
+    private final ScanBatchCompletionService scanBatchCompletionService;
 
     @Value("${pipeline.secret}")
     private String pipelineSecret;
@@ -47,23 +47,36 @@ public class SecurityGateCompatController {
                     .body(Map.of("message", "Secret pipeline invalide ou manquant (header X-Pipeline-Secret)."));
         }
         try {
-            log.info("security-gate ingest kind={} app={} env={} deployment={} pipeline_id={}",
-                    request.getKind(), request.getApplicationId(), request.getEnvironmentId(),
-                    request.getDeploymentId(), request.getPipelineId());
+            if (request.getScanBatchId() != null && !request.hasExplicitServiceId()) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "message",
+                        "scan_batch_id présent : service_id explicite obligatoire (évite d'écraser le premier service)."));
+            }
+            UUID serviceId = request.getServiceId();
+            log.info("security-gate ingest kind={} app={} service={} batch={} env={} deployment={} pipeline_id={}",
+                    request.getKind(), request.getApplicationId(), serviceId, request.getScanBatchId(),
+                    request.getEnvironmentId(), request.getDeploymentId(), request.getPipelineId());
             Long gitlabPipelineId = resolveGitlabPipelineId(request);
+            PipelineExecution ensuredExec = null;
             if (gitlabPipelineId != null && gitlabPipelineId > 0) {
-                var ensured = request.isDeployKind()
+                ensuredExec = request.isDeployKind()
                         ? qualityGateService.ensureDeployPipelineExecution(
                                 request.getApplicationId(), gitlabPipelineId, request)
-                        : (request.getApplicationId() != null
-                                ? qualityGateService.ensureScanPipelineExecution(
-                                        request.getApplicationId(), gitlabPipelineId, request)
-                                : null);
+                        : qualityGateService.ensureScanPipelineExecution(
+                                serviceId != null ? serviceId : request.getApplicationId(),
+                                gitlabPipelineId, request);
                 log.info("pipeline_executions assuré pour GitLab #{} → exec {}",
-                        gitlabPipelineId, ensured != null ? ensured.getId() : null);
+                        gitlabPipelineId, ensuredExec != null ? ensuredExec.getId() : null);
             }
             qualityGateService.ingestFromPipeline(request);
-            schedulePostIngestSync(request, gitlabPipelineId, request.getApplicationId());
+            if (!request.isDeployKind() && ensuredExec != null && ensuredExec.getId() != null) {
+                PipelineExecution fresh = qualityGateService.findExecutionForBatchHook(ensuredExec.getId())
+                        .orElse(ensuredExec);
+                scanBatchCompletionService.onSecurityGateIngested(request, fresh);
+            }
+            schedulePostIngestSync(request, gitlabPipelineId,
+                    serviceId != null ? serviceId : request.getApplicationId(),
+                    ensuredExec != null ? ensuredExec.getId() : null);
             return ResponseEntity.ok(Map.of("status", "ok"));
         } catch (IllegalArgumentException e) {
             log.warn("security-gate ingest refusé: {}", e.getMessage());
@@ -74,7 +87,8 @@ public class SecurityGateCompatController {
     private void schedulePostIngestSync(
             SecurityGateIngestRequest request,
             Long gitlabPipelineId,
-            UUID applicationId
+            UUID applicationId,
+            UUID pipelineExecutionId
     ) {
         if (gitlabPipelineId == null || gitlabPipelineId <= 0) {
             return;
@@ -83,6 +97,14 @@ public class SecurityGateCompatController {
             qualityGateService.captureSnapshotAfterCiIngest(gitlabPipelineId, applicationId);
         } catch (Exception e) {
             log.warn("Snapshot QG après security-gate (#{}): {}", gitlabPipelineId, e.getMessage());
+        }
+        // Après freeze ddBySeverity : re-agréger verdict / rollup app (Option A)
+        if (pipelineExecutionId != null && !request.isDeployKind()) {
+            try {
+                scanBatchCompletionService.refreshAfterDefectDojoSnapshot(pipelineExecutionId);
+            } catch (Exception e) {
+                log.warn("Refresh rollup DD après snapshot (#{}): {}", gitlabPipelineId, e.getMessage());
+            }
         }
         try {
             pipelineStageSyncService.syncStagesForPipeline(gitlabPipelineId);
