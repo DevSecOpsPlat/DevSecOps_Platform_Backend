@@ -411,6 +411,11 @@ public class DefectDojoService {
         int closed = 0;
 
         Map<String, Integer> byStatus;
+        Map<String, Integer> dastBySeverity = null;
+        Map<String, Integer> containerBySeverity = null;
+        Map<String, Double> avgCvssBySeverity = null;
+        Map<String, Integer> cvssKnownCountBySeverity = null;
+        Set<String> toolsExecuted = null;
         if (filterTag != null) {
             bySeverity = parallelCountBySeverityForTaggedTests(engagementId, filterTag);
             byTool = aggregateToolsFromEngagementWithTag(engagementId, filterTag);
@@ -420,6 +425,16 @@ public class DefectDojoService {
                 byTool = aggregateToolsFromFindings(openSample);
             }
             byStatus = Map.of("active", open, "mitigated", closed);
+            dastBySeverity = parallelCountBySeverityForTaggedTestsByScanType(engagementId, filterTag, Set.of("zap", "dast"));
+            // Même principe que dastBySeverity ci-dessus, pour isoler le conteneur (Grype/Anchore)
+            // des buckets génériques -- voir QualityGateService.buildBySeverity et
+            // SecurityScoringService (diagnostic du 29/08/2026).
+            containerBySeverity = parallelCountBySeverityForTaggedTestsByScanType(
+                    engagementId, filterTag, Set.of("grype", "anchore", "container"));
+            toolsExecuted = toolsExecutedForTaggedTests(engagementId, filterTag);
+            CvssAggregate cvssAggregate = computeCvssAggregates(openSample);
+            avgCvssBySeverity = cvssAggregate.avgBySeverity();
+            cvssKnownCountBySeverity = cvssAggregate.knownCountBySeverity();
         } else {
             bySeverity = parallelCountBySeverity(engagementId, null);
             byStatus = parallelCountByStatusLight(engagementId, null);
@@ -449,6 +464,11 @@ public class DefectDojoService {
                 .bySeverity(bySeverity)
                 .byTool(byTool)
                 .byStatus(byStatus)
+                .dastBySeverity(dastBySeverity)
+                .containerBySeverity(containerBySeverity)
+                .toolsExecuted(toolsExecuted)
+                .avgCvssBySeverity(avgCvssBySeverity)
+                .cvssKnownCountBySeverity(cvssKnownCountBySeverity)
                 .totalOpen(open)
                 .totalClosed(closed)
                 .securityScore(computeSecurityScore(bySeverity))
@@ -2740,6 +2760,27 @@ public class DefectDojoService {
     }
 
     /** Tests DefectDojo tagués env-{uuid} (aligné import CI). */
+    /**
+     * Résout les Tests DefectDojo (id + scan_type) d'un pipeline précis -- utilisé pour isoler les
+     * findings d'UN outil (ex. "ZAP Scan") via {@code testId} plutôt qu'une page combinée
+     * plafonnée à 100 résultats où un outil plus verbeux (ex. Grype) peut noyer les autres.
+     */
+    public List<DefectDojoTestSummaryDto> listTestsForPipeline(UUID applicationId, String branch, long pipelineId) {
+        EngagementContext ctx = requireEngagement(applicationId, branch);
+        JsonNode page = fetchTestsWithTag(ctx.engagementId(), "pipeline-" + pipelineId);
+        List<DefectDojoTestSummaryDto> out = new ArrayList<>();
+        if (page == null || !page.has("results")) {
+            return out;
+        }
+        for (JsonNode t : page.path("results")) {
+            int testId = t.path("id").asInt();
+            if (testId <= 0) continue;
+            String scanType = resolveScanTypeFromTest(t);
+            out.add(new DefectDojoTestSummaryDto(testId, scanType != null ? scanType : "—"));
+        }
+        return out;
+    }
+
     private JsonNode fetchTestsWithTag(int engagementId, String tag) {
         if (tag == null || tag.isBlank()) {
             return null;
@@ -2757,6 +2798,18 @@ public class DefectDojoService {
         return aggregateToolsFromTestsPage(page, false);
     }
 
+    /**
+     * Liste des outils réellement exécutés pour ce pipeline, y compris ceux n'ayant rien trouvé
+     * (0 finding) -- contrairement à {@code byTool} (compteurs, ci-dessus) qui exclut délibérément
+     * les entrées à 0 et ne peut donc pas servir de signal "a tourné" (0 finding et "jamais lancé"
+     * y sont indiscernables). Ne fait aucun appel API supplémentaire : réutilise la même page de
+     * Tests déjà récupérée par {@link #fetchTestsWithTag}.
+     */
+    private Set<String> toolsExecutedForTaggedTests(int engagementId, String tag) {
+        JsonNode page = fetchTestsWithTag(engagementId, tag);
+        return aggregateToolsFromTestsPage(page, true).keySet();
+    }
+
     private Map<String, Integer> parallelCountBySeverityForTaggedTests(int engagementId, String tag) {
         JsonNode page = fetchTestsWithTag(engagementId, tag);
         Map<String, Integer> total = emptySeverityMap();
@@ -2770,6 +2823,73 @@ public class DefectDojoService {
                     total.merge(sev, count, Integer::sum));
         }
         return total;
+    }
+
+    /**
+     * Variante de {@link #parallelCountBySeverityForTaggedTests} restreinte aux Tests dont le
+     * scan_type contient un des mots-clés donnés (insensible à la casse, correspondance substring).
+     * Sert à isoler le DAST (ZAP) des autres outils au sein d'un même dashboard scopé pipeline,
+     * sans appel API supplémentaire : réutilise la même page de Tests déjà récupérée par
+     * {@link #fetchTestsWithTag}.
+     */
+    private Map<String, Integer> parallelCountBySeverityForTaggedTestsByScanType(
+            int engagementId, String tag, Set<String> scanTypeNeedles) {
+        JsonNode page = fetchTestsWithTag(engagementId, tag);
+        Map<String, Integer> total = emptySeverityMap();
+        if (page == null || !page.has("results")) {
+            return total;
+        }
+        for (JsonNode t : page.path("results")) {
+            String scanType = resolveScanTypeFromTest(t);
+            if (scanType == null) {
+                continue;
+            }
+            String lower = scanType.toLowerCase(Locale.ROOT);
+            if (scanTypeNeedles.stream().noneMatch(lower::contains)) {
+                continue;
+            }
+            int testId = t.path("id").asInt();
+            if (testId <= 0) continue;
+            countBySeverityForTest(testId, true).forEach((sev, count) ->
+                    total.merge(sev, count, Integer::sum));
+        }
+        return total;
+    }
+
+    /**
+     * CVSS moyen + nombre de findings avec CVSS connu, par sévérité, sur un échantillon de
+     * findings déjà récupéré (aucun appel API supplémentaire — réutilise l'échantillon déjà
+     * chargé pour {@code topRecurrent}, plafonné à 200 findings comme le reste du dashboard).
+     */
+    private record CvssAggregate(Map<String, Double> avgBySeverity, Map<String, Integer> knownCountBySeverity) {}
+
+    private CvssAggregate computeCvssAggregates(List<JsonNode> findings) {
+        Map<String, List<Double>> bySeverity = new LinkedHashMap<>();
+        for (JsonNode f : findings) {
+            // Les findings DAST sont exclus : ils sont retirés des buckets génériques que cette
+            // moyenne CVSS sert à pondérer (voir QualityGateService.buildBySeverity) -- les inclure
+            // ici fausserait la moyenne d'un bucket qui, lui, ne les compte plus.
+            String scanType = resolveScanTypeFromFinding(f);
+            if (scanType != null) {
+                String lower = scanType.toLowerCase(Locale.ROOT);
+                if (lower.contains("zap") || lower.contains("dast")) {
+                    continue;
+                }
+            }
+            JsonNode cvss = f.path("cvssv3_score");
+            if (!cvss.isNumber()) {
+                continue;
+            }
+            String sev = normalizeSeverity(f.path("severity").asText(null));
+            bySeverity.computeIfAbsent(sev, k -> new ArrayList<>()).add(cvss.asDouble());
+        }
+        Map<String, Double> avg = new LinkedHashMap<>();
+        Map<String, Integer> known = new LinkedHashMap<>();
+        bySeverity.forEach((sev, values) -> {
+            avg.put(sev, values.stream().mapToDouble(Double::doubleValue).average().orElse(0));
+            known.put(sev, values.size());
+        });
+        return new CvssAggregate(avg, known);
     }
 
     private List<JsonNode> fetchOpenFindingsSampleForTaggedTests(

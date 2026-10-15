@@ -6,6 +6,7 @@ import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
 import com.backend.devsecopsplatform_backend.entity.PipelineExecutionKind;
 import com.backend.devsecopsplatform_backend.entity.PipelineStatus;
 import com.backend.devsecopsplatform_backend.repository.AppServiceRepository;
+import com.backend.devsecopsplatform_backend.repository.ManagedApplicationRepository;
 import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
 import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
 import com.backend.devsecopsplatform_backend.repository.UserRepository;
@@ -42,6 +43,7 @@ public class PipelineController {
     private final EphemeralEnvironmentRepository environmentRepository;
     private final PipelineExecutionRepository pipelineExecutionRepository;
     private final AppServiceRepository appServiceRepository;
+    private final ManagedApplicationRepository managedApplicationRepository;
     private final UserRepository userRepository;
     private final GitLabService gitLabService;
     private final PipelineStageSyncService pipelineStageSyncService;
@@ -397,8 +399,13 @@ public class PipelineController {
             if (applicationId == null) {
                 return ResponseEntity.badRequest().build();
             }
-            appServiceRepository.findByIdAndCreatedBy(applicationId, user)
-                    .orElseThrow(() -> new RuntimeException("Application introuvable ou accès refusé"));
+            // applicationId peut être soit un service isolé (legacy), soit une appli managée
+            // (le pipeline n'est alors rattaché à aucun service en particulier).
+            boolean owns = appServiceRepository.findByIdAndCreatedBy(applicationId, user).isPresent()
+                    || managedApplicationRepository.findByIdAndCreatedBy(applicationId, user).isPresent();
+            if (!owns) {
+                throw new RuntimeException("Application introuvable ou accès refusé");
+            }
             return ResponseEntity.ok(fetchPipelineLiveFromGitLab(pipelineId, includeReports, refresh));
         }
 
@@ -566,6 +573,33 @@ public class PipelineController {
             return ResponseEntity.noContent().build();
         } catch (Exception e) {
             log.error("❌ Retry job {}: {}", jobId, e.getMessage());
+            return ResponseEntity.internalServerError().build();
+        }
+    }
+
+    /**
+     * POST /api/pipelines/jobs/{jobId}/cancel
+     * Annule un job en cours (running/pending) sans annuler tout le pipeline — « stopper un stage ».
+     */
+    @PostMapping("/jobs/{jobId}/cancel")
+    public ResponseEntity<Void> cancelJob(@PathVariable Long jobId) {
+        var user = getCurrentUser();
+        try {
+            var job = gitLabService.getJob(jobId);
+            if (job == null || job.getPipeline() == null || job.getPipeline().getId() == null) {
+                return ResponseEntity.notFound().build();
+            }
+            Long pipelineId = job.getPipeline().getId();
+            PipelineExecution execution = pipelineExecutionRepository.findByGitlabPipelineId(pipelineId)
+                    .orElseThrow(() -> new RuntimeException("Pipeline inconnu"));
+            if (!canAccessExecution(execution, user)) {
+                return ResponseEntity.status(403).build();
+            }
+            gitLabService.cancelJob(jobId);
+            maybeRefreshAsync(execution, true);
+            return ResponseEntity.noContent().build();
+        } catch (Exception e) {
+            log.error("❌ Cancel job {}: {}", jobId, e.getMessage());
             return ResponseEntity.internalServerError().build();
         }
     }

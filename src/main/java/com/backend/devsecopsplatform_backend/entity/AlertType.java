@@ -40,5 +40,7 @@ public enum AlertType {
     /** Health URL publique KO. */
     DEPLOYMENT_HEALTH_FAILED,
     /** Événement Kubernetes Warning (FailedCreate, FailedScheduling, Unhealthy…). */
-    DEPLOYMENT_K8S_WARNING
+    DEPLOYMENT_K8S_WARNING,
+    /** Application à chaud (env vars, ressources…) sans rebuild CI — traçabilité (audit-deploiement.md, chantier #5). */
+    DEPLOYMENT_SYNC_RUNTIME
 }

@@ -79,6 +79,10 @@ public class AppK8sManifestService {
         boolean resourceQuotaEnabled;
         String namespaceCpuQuota;
         String namespaceMemoryQuota;
+        /** Active la NetworkPolicy d'isolation inter-namespaces. */
+        boolean networkPolicyEnabled;
+        /** Namespace du contrôleur d'ingress (ex. kube-system sur K3s) — trafic autorisé en entrée. */
+        String networkPolicyIngressNamespace;
     }
 
     private String resolveServiceImage(String k8sName, ManifestOptions opts) {
@@ -107,6 +111,9 @@ public class AppK8sManifestService {
         if (opts.isResourceQuotaEnabled()) {
             docs.add(resourceQuotaManifest(namespace, opts));
             docs.add(limitRangeManifest(namespace));
+        }
+        if (opts.isNetworkPolicyEnabled()) {
+            docs.add(networkPolicyManifest(namespace, opts));
         }
 
         for (AppDatabase db : app.getDatabases()) {
@@ -258,6 +265,44 @@ public class AppK8sManifestService {
         return m;
     }
 
+    /**
+     * Isolation réseau inter-namespaces : par défaut, un namespace applicatif ne doit accepter
+     * du trafic entrant que (1) depuis ses propres pods (front → back → base, même namespace) et
+     * (2) depuis le contrôleur d'ingress (Traefik, namespace {@code kube-system} sur K3s), qui est
+     * le seul point d'entrée légitime pour le trafic externe. Tout autre namespace applicatif —
+     * y compris ceux d'autres équipes sur le même cluster partagé — est bloqué implicitement, car
+     * dès qu'une NetworkPolicy sélectionne un pod, tout trafic non explicitement autorisé est nié.
+     * Seul l'Ingress est restreint (pas l'Egress) : ça évite de casser la résolution DNS ou les
+     * appels sortants légitimes d'un service, tout en fermant la voie d'attaque principale
+     * (un pod compromis dans un namespace ne peut plus sonder ou atteindre directement les pods
+     * d'un autre namespace).
+     */
+    private Map<String, Object> networkPolicyManifest(String namespace, ManifestOptions opts) {
+        String ingressNamespace = opts.getNetworkPolicyIngressNamespace() != null
+                && !opts.getNetworkPolicyIngressNamespace().isBlank()
+                ? opts.getNetworkPolicyIngressNamespace().trim()
+                : "kube-system";
+
+        Map<String, Object> sameNamespaceRule = new LinkedHashMap<>();
+        sameNamespaceRule.put("from", List.of(Map.of("podSelector", Map.of())));
+
+        Map<String, Object> ingressControllerRule = new LinkedHashMap<>();
+        Map<String, Object> ingressNsSelector = Map.of(
+                "namespaceSelector", Map.of(
+                        "matchLabels", Map.of("kubernetes.io/metadata.name", ingressNamespace)));
+        ingressControllerRule.put("from", List.of(ingressNsSelector));
+
+        Map<String, Object> spec = new LinkedHashMap<>();
+        spec.put("podSelector", Map.of());
+        spec.put("policyTypes", List.of("Ingress"));
+        spec.put("ingress", List.of(sameNamespaceRule, ingressControllerRule));
+
+        Map<String, Object> m = base("networking.k8s.io/v1", "NetworkPolicy");
+        m.put("metadata", meta("default-isolation", namespace));
+        m.put("spec", spec);
+        return m;
+    }
+
     private Map<String, Object> imagePullSecretManifest(String namespace, ManifestOptions opts) {
         String server = opts.getRegistryServer();
         String user = opts.getRegistryUsername() != null ? opts.getRegistryUsername() : "";
@@ -387,6 +432,16 @@ public class AppK8sManifestService {
         container.put("readinessProbe", tcpProbe(containerListenPort, 10, 10));
         container.put("livenessProbe", tcpProbe(containerListenPort, 30, 20));
         container.put("resources", resources("100m", "1000m", "256Mi", "1Gi"));
+        // AUCUN securityContext ici, volontairement -- retiré le 6 septembre 2026 : même le
+        // sous-ensemble "sûr" (capabilities drop ALL) casse le démarrage des images officielles de
+        // base de données. L'entrypoint de l'image postgres officielle tourne d'abord en root pour
+        // chown $PGDATA puis droppe les privilèges lui-même (gosu) vers l'utilisateur postgres --
+        // ça exige CHOWN/SETUID/SETGID/FOWNER, précisément les capacités que "drop ALL" retire.
+        // Confirmé en direct : après l'ajout de ce securityContext, TOUT déploiement avec base
+        // (aoo-1/main-db, Postgres 16) est resté bloqué "tier=database" jusqu'au timeout de 900s,
+        // alors que les mêmes déploiements réussissaient avant. Reproductible, pas une coïncidence
+        // d'infra. Les conteneurs de service applicatif, eux, gardent le sous-ensemble sûr
+        // (containerSecurityContext) -- seule la base de données en est exemptée.
         return container;
     }
 
@@ -533,6 +588,12 @@ public class AppK8sManifestService {
                 orDefault(svc.getCpuLimit(), "500m"),
                 orDefault(svc.getMemoryRequest(), "128Mi"),
                 orDefault(svc.getMemoryLimit(), "256Mi")));
+        container.put("securityContext", containerSecurityContext(svc.isHardenedSecurityContext()));
+        if (svc.isHardenedSecurityContext()) {
+            // readOnlyRootFilesystem exige un chemin inscriptible pour les images qui écrivent des
+            // fichiers temporaires (la plupart) — scratch partagé, jamais persisté (pas de PVC).
+            container.put("volumeMounts", List.of(volumeMount("tmp-scratch", "/tmp")));
+        }
 
         Map<String, Object> podSpec = new LinkedHashMap<>();
         List<Map<String, Object>> initContainers = buildInitContainers(app, svc);
@@ -541,6 +602,9 @@ public class AppK8sManifestService {
         }
         podSpec.put("containers", List.of(container));
         podSpec.put("imagePullSecrets", List.of(Map.of("name", opts.getPullSecretName())));
+        if (svc.isHardenedSecurityContext()) {
+            podSpec.put("volumes", List.of(emptyDirVolume("tmp-scratch")));
+        }
 
         int replicas = svc.getReplicas() != null ? svc.getReplicas() : 1;
         Map<String, Object> m = base("apps/v1", "Deployment");
@@ -593,6 +657,17 @@ public class AppK8sManifestService {
         c.put("command", List.of("sh", "-c",
                 "until nc -z " + host + " " + port + "; do echo waiting for " + host + ":" + port
                         + "; sleep 3; done"));
+        // Sans ceci, le LimitRange du namespace (env-limits, default cpu=1) injecte 1 core ENTIER
+        // de limit sur ce conteneur d'attente — pour une boucle "nc -z" quasi gratuite. L'effet
+        // pod = max(somme des conteneurs applicatifs, plus gros init container), donc CE 1 core
+        // fantôme dominait souvent la vraie conso du pod et épuisait silencieusement le quota
+        // limits.cpu du namespace, sans jamais apparaître dans les ressources déclarées par les
+        // services (trouvé le 18 août 2026 : 2×front + back + db = exactement 4/4 limits.cpu,
+        // alors que les limites déclarées des services ne totalisaient que ~2.2 cores).
+        c.put("resources", Map.of(
+                "requests", Map.of("cpu", "50m", "memory", "32Mi"),
+                "limits", Map.of("cpu", "100m", "memory", "64Mi")
+        ));
         return c;
     }
 
@@ -1025,6 +1100,37 @@ public class AppK8sManifestService {
         pvc.put("claimName", claimName);
         v.put("persistentVolumeClaim", pvc);
         return v;
+    }
+
+    private Map<String, Object> emptyDirVolume(String name) {
+        Map<String, Object> v = new LinkedHashMap<>();
+        v.put("name", name);
+        v.put("emptyDir", Map.of());
+        return v;
+    }
+
+    /**
+     * Durcissement conteneur (chantier sécurité des apps déployées, 4 septembre 2026).
+     *
+     * <p>Sous-ensemble toujours actif, quelle que soit l'image : interdiction d'élévation de
+     * privilèges et suppression de toutes les capacités Linux — casse une image dans de très rares
+     * cas seulement (ex. besoin explicite de {@code NET_BIND_SERVICE} pour écouter sur un port
+     * privilégié &lt; 1024, ce que les images applicatives usuelles ne font pas).</p>
+     *
+     * <p>{@code hardened=true} ajoute {@code runAsNonRoot} et {@code readOnlyRootFilesystem} —
+     * plus protecteur mais plus susceptible de casser une image qui suppose tourner en root ou
+     * écrire hors de {@code /tmp} : opt-in par service ({@link AppService#isHardenedSecurityContext()}),
+     * jamais imposé par défaut.</p>
+     */
+    private Map<String, Object> containerSecurityContext(boolean hardened) {
+        Map<String, Object> sc = new LinkedHashMap<>();
+        sc.put("allowPrivilegeEscalation", false);
+        sc.put("capabilities", Map.of("drop", List.of("ALL")));
+        if (hardened) {
+            sc.put("runAsNonRoot", true);
+            sc.put("readOnlyRootFilesystem", true);
+        }
+        return sc;
     }
 
     private Map<String, Object> tcpProbe(int port, int initialDelay, int period) {

@@ -1,5 +1,6 @@
 package com.backend.devsecopsplatform_backend.service.appmgmt;
 
+import com.backend.devsecopsplatform_backend.controller.appmgmt.SecurityPostureResponse;
 import com.backend.devsecopsplatform_backend.entity.AppService;
 import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.ScanBatch;
@@ -8,6 +9,9 @@ import com.backend.devsecopsplatform_backend.repository.PipelineExecutionReposit
 import com.backend.devsecopsplatform_backend.repository.appmgmt.ScanBatchRepository;
 import com.backend.devsecopsplatform_backend.service.appmgmt.dto.ScanBatchStateDto;
 import com.backend.devsecopsplatform_backend.service.appmgmt.dto.ScanBatchStateDto.ScanBatchServiceStateDto;
+import com.backend.devsecopsplatform_backend.service.qualitygate.HardGateInput;
+import com.backend.devsecopsplatform_backend.service.qualitygate.SecurityScoringService;
+import com.backend.devsecopsplatform_backend.service.qualitygate.dto.HardGateViolationDto;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -31,6 +35,11 @@ public class ScanBatchStateService {
 
     private final ScanBatchRepository scanBatchRepository;
     private final PipelineExecutionRepository pipelineExecutionRepository;
+    private final SecurityScoringService securityScoringService;
+
+    /** Ids des 5 hard gates connus, dans l'ordre d'affichage -- même ensemble que le service unique. */
+    private static final List<String> HARD_GATE_IDS = List.of(
+            "secrets", "dd_critical", "sonar_blocker", "sonar_qg", "dast");
 
     @Transactional(readOnly = true)
     public Optional<ScanBatchStateDto> getState(UUID batchId) {
@@ -103,12 +112,14 @@ public class ScanBatchStateService {
                 batch.getVerdictPayloadJson(),
                 expected,
                 finished,
-                services
+                services,
+                ManagedAppScanService.extractQualityGates(batch, executions)
         );
     }
 
     private ScanBatchServiceStateDto toServiceState(PipelineExecution pe) {
         AppService svc = pe.getAppService();
+        Map<String, Object> gate = pe.getQualityGateJson() != null ? pe.getQualityGateJson() : Map.of();
         return new ScanBatchServiceStateDto(
                 pe.getId(),
                 svc != null ? svc.getId() : null,
@@ -118,7 +129,59 @@ public class ScanBatchStateService {
                 pe.getCommitSha(),
                 pe.getStatus(),
                 pe.isFinished(),
-                pe.getQualityGateJson()
+                pe.getQualityGateJson(),
+                buildQualityGates(gate)
         );
+    }
+
+    /**
+     * Checklist des hard gates pour un service, dérivée du même {@link HardGateInput} déjà
+     * corrigé pour l'agrégation multi-services ({@link ScanBatchAggregationService#buildHardGateInput}) --
+     * évite de réimplémenter une 3ᵉ fois la logique déjà correcte côté service unique et batch.
+     */
+    private List<SecurityPostureResponse.QualityGateItem> buildQualityGates(Map<String, Object> gate) {
+        HardGateInput hardIn = ScanBatchAggregationService.buildHardGateInput(gate);
+        SecurityScoringService.HardGateEvaluation hard = securityScoringService.evaluateHardGates(hardIn);
+
+        Map<String, HardGateViolationDto> violationsById = hard.violations().stream()
+                .collect(Collectors.toMap(HardGateViolationDto::getId, v -> v, (a, b) -> a));
+        Map<String, HardGateViolationDto> indeterminateById = hard.indeterminate().stream()
+                .collect(Collectors.toMap(HardGateViolationDto::getId, v -> v, (a, b) -> a));
+
+        List<SecurityPostureResponse.QualityGateItem> items = new ArrayList<>();
+        for (String id : HARD_GATE_IDS) {
+            if ("dast".equals(id) && !hardIn.isDastApplicable()) {
+                // Pipeline scan-only pour ce service : ZAP n'y tourne jamais, ne pas afficher
+                // l'item du tout (comme pour la vue service unique).
+                continue;
+            }
+            HardGateViolationDto violated = violationsById.get(id);
+            HardGateViolationDto indeterminate = indeterminateById.get(id);
+            if (violated != null) {
+                items.add(SecurityPostureResponse.QualityGateItem.builder()
+                        .id(id).label(violated.getLabel()).status("FAIL").message(violated.getMessage())
+                        .build());
+            } else if (indeterminate != null) {
+                items.add(SecurityPostureResponse.QualityGateItem.builder()
+                        .id(id).label(indeterminate.getLabel()).status("UNKNOWN").message(indeterminate.getMessage())
+                        .build());
+            } else {
+                items.add(SecurityPostureResponse.QualityGateItem.builder()
+                        .id(id).label(hardGateLabel(id)).status("PASS").message(null)
+                        .build());
+            }
+        }
+        return items;
+    }
+
+    private static String hardGateLabel(String id) {
+        return switch (id) {
+            case "secrets" -> "Secrets exposés (Gitleaks)";
+            case "dd_critical" -> "Vulnérabilités critiques";
+            case "sonar_blocker" -> "Issues Blocker (SonarQube)";
+            case "sonar_qg" -> "Quality Gate SonarQube";
+            case "dast" -> "Vulnérabilités élevées (DAST / ZAP)";
+            default -> id;
+        };
     }
 }

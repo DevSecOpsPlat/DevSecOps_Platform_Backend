@@ -52,6 +52,14 @@ public class K8sManifestApplyService {
 
     private volatile KubernetesClient kubernetesClient;
 
+    /**
+     * Appels kubelet /stats/summary (un par nœud, ~I/O bound) en parallèle plutôt que
+     * séquentiellement dans une boucle — voir {@link #getClusterCapacity()}. Pool dédié plutôt que
+     * le ForkJoinPool commun, pour ne pas interférer avec d'autres usages CPU-bound de l'appli.
+     */
+    private final java.util.concurrent.ExecutorService nodeStatsExecutor =
+            java.util.concurrent.Executors.newFixedThreadPool(8);
+
     public boolean isConfigured() {
         return apiUrl != null && !apiUrl.isBlank() && token != null && !token.isBlank();
     }
@@ -425,13 +433,52 @@ public class K8sManifestApplyService {
         out.put("alerts", alerts);
         out.put("summary", summary);
         out.put("quota", fetchResourceQuotaStatus(namespace, summary));
+        // Isolation réseau : la NetworkPolicy est appliquée au déploiement (AppK8sManifestService)
+        // mais, contrairement au quota, jamais relue depuis — un admin/utilisateur n'avait aucun
+        // moyen de vérifier après coup qu'elle est bien active sur un namespace donné (chantier
+        // sécurité des apps déployées, docs/audit-securite-apps-deployees.md).
+        out.put("networkPolicy", fetchNetworkPolicyStatus(namespace));
+        // Capacité réelle du nœud (allocatable - tous namespaces) — placement secondaire Runtime,
+        // même donnée que la modale Déployer, pour diagnostiquer un pod bloqué en Pending.
+        out.put("clusterCapacity", getClusterCapacity());
         return out;
+    }
+
+    /**
+     * Lit la NetworkPolicy "default-isolation" (AppK8sManifestService#networkPolicyManifest) pour
+     * confirmer qu'elle est réellement active sur ce namespace, plutôt que de se fier uniquement au
+     * fait qu'elle ait été envoyée lors du déploiement — utile en particulier pour un namespace créé
+     * avant l'introduction de cette protection, ou si l'application a échoué silencieusement.
+     */
+    Map<String, Object> fetchNetworkPolicyStatus(String namespace) {
+        Map<String, Object> np = new LinkedHashMap<>();
+        np.put("active", false);
+        np.put("name", "default-isolation");
+        try {
+            var policy = client().network().v1().networkPolicies()
+                    .inNamespace(namespace).withName("default-isolation").get();
+            if (policy == null || policy.getSpec() == null) {
+                return np;
+            }
+            np.put("active", true);
+            np.put("policyTypes", policy.getSpec().getPolicyTypes());
+            int ingressRuleCount = policy.getSpec().getIngress() != null
+                    ? policy.getSpec().getIngress().size() : 0;
+            np.put("ingressRuleCount", ingressRuleCount);
+        } catch (Exception e) {
+            log.debug("NetworkPolicy ns={}: {}", namespace, e.getMessage());
+            np.put("message", "NetworkPolicy inaccessible: " + e.getMessage());
+        }
+        return np;
     }
 
     /**
      * Lit ResourceQuota/env-quota (hard vs used alloué) + compare usage réel metrics-server.
      */
-    private Map<String, Object> fetchResourceQuotaStatus(String namespace, Map<String, Object> summary) {
+    // Package-visible (pas private) : réutilisé par ApplicationManagementService pour l'aperçu
+    // de capacité à l'ÉDITION d'un service déjà déployé, sans dupliquer la lecture ResourceQuota
+    // (audit-deploiement.md §8, retour utilisateur du 18 août 2026).
+    Map<String, Object> fetchResourceQuotaStatus(String namespace, Map<String, Object> summary) {
         Map<String, Object> quota = new LinkedHashMap<>();
         quota.put("enabled", false);
         quota.put("name", "env-quota");
@@ -488,6 +535,311 @@ public class K8sManifestApplyService {
             quota.put("message", "Quota inaccessible: " + e.getMessage());
         }
         return quota;
+    }
+
+    /**
+     * Capacité réelle du/des nœud(s) K8s : allocatable moins la somme des requests de TOUS les
+     * pods actifs, toutes namespaces confondues. Distinct du quota par namespace (qui protège
+     * chaque environnement individuellement mais ignore que la machine physique est partagée
+     * entre tous les namespaces) — audit-deploiement.md, capacité réelle du nœud.
+     */
+    public Map<String, Object> getClusterCapacity() {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("enabled", false);
+        if (!isConfigured()) {
+            return out;
+        }
+        try {
+            // Par nœud — un pod ne peut être planifié que sur UN SEUL nœud à la fois : l'agrégat
+            // cluster (ci-dessous) peut donner un faux sentiment de sécurité dès qu'il y a plus
+            // d'un nœud (2.3 cores libres au total peut vouloir dire 0.1 libre sur un nœud et 2.2
+            // sur l'autre — un pod demandant 1.5 core échouerait quand même). Calculé une fois
+            // ici, réutilisé par le garde-fou de capacité (previewDeploy /
+            // previewServiceResourceChange) qui doit vérifier le MEILLEUR nœud, pas la somme
+            // (retour utilisateur du 18 août 2026, cluster passé de 1 à 2 nœuds ce jour-là).
+            Map<String, Map<String, Object>> perNode = new LinkedHashMap<>();
+            for (var node : client().nodes().list().getItems()) {
+                String name = node.getMetadata() != null ? node.getMetadata().getName() : null;
+                if (name == null || node.getStatus() == null || node.getStatus().getAllocatable() == null) {
+                    continue;
+                }
+                var cpu = node.getStatus().getAllocatable().get("cpu");
+                var mem = node.getStatus().getAllocatable().get("memory");
+                var podsAlloc = node.getStatus().getAllocatable().get("pods");
+                var conditions = node.getStatus().getConditions();
+                boolean ready = conditions != null && conditions.stream()
+                        .anyMatch(c -> "Ready".equals(c.getType()) && "True".equals(c.getStatus()));
+                boolean diskPressure = conditions != null && conditions.stream()
+                        .anyMatch(c -> "DiskPressure".equals(c.getType()) && "True".equals(c.getStatus()));
+                boolean memoryPressure = conditions != null && conditions.stream()
+                        .anyMatch(c -> "MemoryPressure".equals(c.getType()) && "True".equals(c.getStatus()));
+                boolean pidPressure = conditions != null && conditions.stream()
+                        .anyMatch(c -> "PIDPressure".equals(c.getType()) && "True".equals(c.getStatus()));
+
+                Map<String, Object> n = new LinkedHashMap<>();
+                n.put("name", name);
+                n.put("ready", ready);
+                n.put("diskPressure", diskPressure);
+                n.put("memoryPressure", memoryPressure);
+                n.put("pidPressure", pidPressure);
+                n.put("allocatableCpuCores", cpu != null ? parseCpuToCores(cpu.toString()) : 0d);
+                n.put("allocatableMemoryBytes", mem != null ? parseMemoryToBytes(mem.toString()) : 0L);
+                n.put("podCapacity", podsAlloc != null ? (int) Double.parseDouble(podsAlloc.toString()) : 0);
+                n.put("podCount", 0);
+                n.put("usedCpuCores", 0d);
+                n.put("usedMemoryBytes", 0L);
+
+                // Rôle + version + OS — pure lecture métadonnées, aucun appel réseau supplémentaire.
+                var labels = node.getMetadata().getLabels();
+                boolean controlPlane = labels != null && (labels.containsKey("node-role.kubernetes.io/control-plane")
+                        || labels.containsKey("node-role.kubernetes.io/master"));
+                n.put("role", controlPlane ? "control-plane" : "worker");
+                if (node.getMetadata().getCreationTimestamp() != null) {
+                    n.put("createdAt", String.valueOf(node.getMetadata().getCreationTimestamp()));
+                }
+                if (node.getStatus().getNodeInfo() != null) {
+                    n.put("kubeletVersion", node.getStatus().getNodeInfo().getKubeletVersion());
+                    n.put("osImage", node.getStatus().getNodeInfo().getOsImage());
+                    n.put("architecture", node.getStatus().getNodeInfo().getArchitecture());
+                }
+
+                perNode.put(name, n);
+            }
+
+            // Disque + CPU/MEM RÉELS du nœud (équivalents df / top) — pas dans
+            // node.status.allocatable (qui n'a que cpu/memory/pods DEMANDÉS) : lus via le même
+            // endpoint kubelet /stats/summary déjà utilisé pour l'usage disque par pod, mais son
+            // champ racine "node" (jusqu'ici jamais lu) plutôt que "pods[]". Distinct de
+            // usedCpuCores/usedMemoryBytes ci-dessus, qui restent la somme des requests planifiées
+            // (ce qui est RÉSERVÉ, pas ce qui tourne réellement) — retour utilisateur du 19 août
+            // 2026 : les deux notions sont utiles et différentes, Grafana/node-exporter les sépare
+            // toujours. EN PARALLÈLE sur tous les nœuds (pas un appel kubelet séquentiel par nœud)
+            // — avec 2+ nœuds à ~6s de timeout chacun, l'aperçu mettait jusqu'à ~15-20s à répondre
+            // (retour utilisateur du 19 août 2026 : "20s avant que ça s'affiche").
+            Map<String, java.util.concurrent.CompletableFuture<NodeRealStats>> realStatsFutures = new LinkedHashMap<>();
+            for (String name : perNode.keySet()) {
+                realStatsFutures.put(name, java.util.concurrent.CompletableFuture.supplyAsync(
+                        () -> fetchNodeRealStats(name), nodeStatsExecutor));
+            }
+            for (var entry : realStatsFutures.entrySet()) {
+                NodeRealStats real;
+                try {
+                    real = entry.getValue().get(8, java.util.concurrent.TimeUnit.SECONDS);
+                } catch (Exception e) {
+                    real = new NodeRealStats(0, 0, 0, 0, 0);
+                }
+                Map<String, Object> n = perNode.get(entry.getKey());
+                n.put("realCpuUsageCores", real.cpuUsageCores());
+                n.put("realMemoryUsageBytes", real.memoryUsageBytes());
+                n.put("allocatableDiskBytes", real.diskCapacityBytes());
+                n.put("usedDiskBytes", real.diskUsedBytes());
+                n.put("availableDiskBytes", real.diskAvailableBytes());
+            }
+
+            double usedCpu = 0;
+            long usedMemBytes = 0;
+            for (var pod : client().pods().inAnyNamespace().list().getItems()) {
+                String phase = pod.getStatus() != null ? pod.getStatus().getPhase() : null;
+                if ("Succeeded".equalsIgnoreCase(phase) || "Failed".equalsIgnoreCase(phase)) {
+                    continue; // terminé : ne retient plus de capacité
+                }
+                double podCpu = sumPodRequestCpuCores(pod);
+                long podMem = sumPodRequestMemoryBytes(pod);
+                usedCpu += podCpu;
+                usedMemBytes += podMem;
+
+                String nodeName = pod.getSpec() != null ? pod.getSpec().getNodeName() : null;
+                Map<String, Object> n = nodeName != null ? perNode.get(nodeName) : null;
+                if (n != null) {
+                    n.put("usedCpuCores", ((Number) n.get("usedCpuCores")).doubleValue() + podCpu);
+                    n.put("usedMemoryBytes", ((Number) n.get("usedMemoryBytes")).longValue() + podMem);
+                    n.put("podCount", ((Number) n.get("podCount")).intValue() + 1);
+                }
+            }
+
+            double allocCpu = 0;
+            long allocMemBytes = 0;
+            double maxAvailCpu = 0;
+            long maxAvailMemBytes = 0;
+            long allocDiskBytes = 0;
+            long usedDiskBytes = 0;
+            long availDiskBytes = 0;
+            long maxAvailDiskBytes = 0;
+            List<Map<String, Object>> nodesOut = new ArrayList<>();
+            for (Map<String, Object> n : perNode.values()) {
+                double nAllocCpu = ((Number) n.get("allocatableCpuCores")).doubleValue();
+                long nAllocMem = ((Number) n.get("allocatableMemoryBytes")).longValue();
+                double nUsedCpu = ((Number) n.get("usedCpuCores")).doubleValue();
+                long nUsedMem = ((Number) n.get("usedMemoryBytes")).longValue();
+                double nAvailCpu = Math.max(0, nAllocCpu - nUsedCpu);
+                long nAvailMem = Math.max(0, nAllocMem - nUsedMem);
+                n.put("allocatableCpuCores", round4(nAllocCpu));
+                n.put("usedCpuCores", round4(nUsedCpu));
+                n.put("availableCpuCores", round4(nAvailCpu));
+                n.put("availableMemoryBytes", nAvailMem);
+                nodesOut.add(n);
+
+                allocCpu += nAllocCpu;
+                allocMemBytes += nAllocMem;
+                maxAvailCpu = Math.max(maxAvailCpu, nAvailCpu);
+                maxAvailMemBytes = Math.max(maxAvailMemBytes, nAvailMem);
+
+                long nAvailDisk = ((Number) n.get("availableDiskBytes")).longValue();
+                allocDiskBytes += ((Number) n.get("allocatableDiskBytes")).longValue();
+                usedDiskBytes += ((Number) n.get("usedDiskBytes")).longValue();
+                availDiskBytes += nAvailDisk;
+                maxAvailDiskBytes = Math.max(maxAvailDiskBytes, nAvailDisk);
+            }
+
+            double availCpu = Math.max(0, allocCpu - usedCpu);
+            long availMemBytes = Math.max(0, allocMemBytes - usedMemBytes);
+
+            out.put("enabled", true);
+            out.put("allocatableCpuCores", round4(allocCpu));
+            out.put("allocatableMemoryBytes", allocMemBytes);
+            out.put("usedCpuCores", round4(usedCpu));
+            out.put("usedMemoryBytes", usedMemBytes);
+            out.put("availableCpuCores", round4(availCpu));
+            out.put("availableMemoryBytes", availMemBytes);
+            // Le nœud le plus disponible — c'est CE chiffre, pas l'agrégat ci-dessus, qui répond
+            // à "un pod avec telle requête peut-il être planifié quelque part ?".
+            out.put("maxAvailableCpuCores", round4(maxAvailCpu));
+            out.put("maxAvailableMemoryBytes", maxAvailMemBytes);
+            out.put("allocatableDiskBytes", allocDiskBytes);
+            out.put("usedDiskBytes", usedDiskBytes);
+            out.put("availableDiskBytes", availDiskBytes);
+            out.put("maxAvailableDiskBytes", maxAvailDiskBytes);
+            out.put("nodeCount", nodesOut.size());
+            out.put("nodes", nodesOut);
+        } catch (Exception e) {
+            log.warn("getClusterCapacity: {}", e.getMessage(), e);
+            out.put("enabled", false);
+            out.put("message", "Capacité nœud indisponible: " + e.getMessage());
+        }
+        return out;
+    }
+
+    /** Stats RÉELLES d'un nœud (racine "node" du payload kubelet /stats/summary — pas "pods[]"). */
+    private record NodeRealStats(
+            double cpuUsageCores, long memoryUsageBytes,
+            long diskCapacityBytes, long diskUsedBytes, long diskAvailableBytes) {}
+
+    /**
+     * Lit l'usage RÉEL CPU/mémoire/disque d'un nœud (équivalent {@code top}/{@code df}) via le
+     * même endpoint kubelet proxy que {@link #enrichWithKubeletStats}, mais son champ racine
+     * {@code node} (jamais lu jusqu'ici — seul {@code pods[]} l'était, pour l'usage par pod).
+     * Distinct des requests planifiées (ce qui est réservé, pas ce qui tourne). Best-effort :
+     * zéros si le nœud/kubelet est injoignable, jamais d'exception propagée.
+     */
+    private NodeRealStats fetchNodeRealStats(String nodeName) {
+        try {
+            if (apiUrl == null || apiUrl.isBlank() || token == null || token.isBlank()) {
+                return new NodeRealStats(0, 0, 0, 0, 0);
+            }
+            String baseUrl = apiUrl.trim().replaceAll("/+$", "");
+            String url = baseUrl + "/api/v1/nodes/"
+                    + java.net.URLEncoder.encode(nodeName, java.nio.charset.StandardCharsets.UTF_8)
+                            .replace("+", "%20")
+                    + "/proxy/stats/summary";
+            java.net.http.HttpClient http = buildK8sHttpClient();
+            java.net.http.HttpRequest req = java.net.http.HttpRequest.newBuilder()
+                    .uri(java.net.URI.create(url))
+                    .timeout(java.time.Duration.ofSeconds(4))
+                    .header("Authorization", "Bearer " + token.trim())
+                    .header("Accept", "application/json")
+                    .GET()
+                    .build();
+            java.net.http.HttpResponse<String> resp = http.send(
+                    req, java.net.http.HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() < 200 || resp.statusCode() >= 300) {
+                log.debug("fetchNodeRealStats node={} HTTP {}", nodeName, resp.statusCode());
+                return new NodeRealStats(0, 0, 0, 0, 0);
+            }
+            com.fasterxml.jackson.databind.JsonNode root =
+                    new com.fasterxml.jackson.databind.ObjectMapper().readTree(resp.body());
+            var nodeStats = root.path("node");
+            long cpuNanoCores = nodeStats.path("cpu").path("usageNanoCores").asLong(0);
+            double cpuCores = cpuNanoCores / 1_000_000_000.0;
+            var memNode = nodeStats.path("memory");
+            long memUsage = memNode.path("workingSetBytes").asLong(memNode.path("usageBytes").asLong(0));
+            var fs = nodeStats.path("fs");
+            long cap = fs.path("capacityBytes").asLong(0);
+            long used = fs.path("usedBytes").asLong(0);
+            long avail = fs.path("availableBytes").asLong(Math.max(0, cap - used));
+            return new NodeRealStats(cpuCores, memUsage, cap, used, avail);
+        } catch (Exception e) {
+            log.debug("fetchNodeRealStats {}: {}", nodeName, e.getMessage());
+            return new NodeRealStats(0, 0, 0, 0, 0);
+        }
+    }
+
+    /**
+     * Résumé LÉGER d'un namespace — pods ready/total, nœuds hébergeants, alertes Warning — pour
+     * le tableau admin « tous les environnements » (une ligne par namespace, potentiellement des
+     * dizaines) : volontairement PAS le monitoring complet ({@link #getNamespaceMonitoring}), qui
+     * appelle en plus metrics-server et le proxy kubelet /stats/summary par pod — bien trop
+     * coûteux à répéter pour chaque ligne d'une liste. Le détail complet reste disponible au clic
+     * sur une ligne, via l'endpoint monitoring existant (admin console, chantier "monitoring
+     * persistant", 18 août 2026).
+     */
+    public Map<String, Object> getNamespacePodSummary(String namespace) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("podsReady", 0);
+        out.put("podsTotal", 0);
+        out.put("warningEventCount", 0);
+        out.put("nodes", new ArrayList<String>());
+        if (!isConfigured() || namespace == null || namespace.isBlank()) {
+            return out;
+        }
+        try {
+            var pods = client().pods().inNamespace(namespace).list().getItems();
+            int ready = 0;
+            java.util.Set<String> nodes = new java.util.LinkedHashSet<>();
+            for (var pod : pods) {
+                if (allContainersReady(pod)) {
+                    ready++;
+                }
+                String nodeName = pod.getSpec() != null ? pod.getSpec().getNodeName() : null;
+                if (nodeName != null) {
+                    nodes.add(nodeName);
+                }
+            }
+            long warnCount = listRecentEvents(namespace, 100).stream()
+                    .filter(e -> "Warning".equalsIgnoreCase(String.valueOf(e.get("type"))))
+                    .count();
+            out.put("podsReady", ready);
+            out.put("podsTotal", pods.size());
+            out.put("warningEventCount", (int) warnCount);
+            out.put("nodes", new ArrayList<>(nodes));
+        } catch (Exception e) {
+            log.debug("getNamespacePodSummary {}: {}", namespace, e.getMessage());
+            out.put("message", "Namespace inaccessible: " + e.getMessage());
+        }
+        return out;
+    }
+
+    private double sumPodRequestCpuCores(io.fabric8.kubernetes.api.model.Pod pod) {
+        double total = 0;
+        if (pod.getSpec() != null && pod.getSpec().getContainers() != null) {
+            for (var c : pod.getSpec().getContainers()) {
+                if (c.getResources() == null || c.getResources().getRequests() == null) continue;
+                var cpu = c.getResources().getRequests().get("cpu");
+                if (cpu != null) total += parseCpuToCores(cpu.toString());
+            }
+        }
+        return total;
+    }
+
+    private long sumPodRequestMemoryBytes(io.fabric8.kubernetes.api.model.Pod pod) {
+        long total = 0;
+        if (pod.getSpec() != null && pod.getSpec().getContainers() != null) {
+            for (var c : pod.getSpec().getContainers()) {
+                if (c.getResources() == null || c.getResources().getRequests() == null) continue;
+                var mem = c.getResources().getRequests().get("memory");
+                if (mem != null) total += parseMemoryToBytes(mem.toString());
+            }
+        }
+        return total;
     }
 
     private static String firstNonBlank(Map<String, String> map, String... keys) {
@@ -1021,7 +1373,8 @@ public class K8sManifestApplyService {
         return httpBuilder.build();
     }
 
-    private static double parseCpuToCores(String raw) {
+    /** Visibilité package : réutilisé par AppDeploymentValidationService (aperçu ressources vs quota). */
+    static double parseCpuToCores(String raw) {
         if (raw == null || raw.isBlank() || "0".equals(raw)) {
             return 0;
         }
@@ -1042,7 +1395,8 @@ public class K8sManifestApplyService {
         }
     }
 
-    private static long parseMemoryToBytes(String raw) {
+    /** Visibilité package : réutilisé par AppDeploymentValidationService (aperçu ressources vs quota). */
+    static long parseMemoryToBytes(String raw) {
         if (raw == null || raw.isBlank() || "0".equals(raw)) {
             return 0;
         }
@@ -1803,16 +2157,115 @@ public class K8sManifestApplyService {
                 log.warn("Namespace {} introuvable ou déjà supprimé", namespace);
                 return;
             }
+            boolean gone = true;
             try {
                 client().namespaces().withName(namespace)
                         .waitUntilCondition(Objects::isNull, 120, TimeUnit.SECONDS);
             } catch (Exception e) {
+                gone = false;
                 log.warn("Timeout attente suppression namespace {}: {}", namespace, e.getMessage());
             }
-            log.info("Fabric8 delete namespace {} OK", namespace);
+            if (!gone) {
+                forceDeleteStuckNamespace(namespace);
+            } else {
+                log.info("Fabric8 delete namespace {} OK", namespace);
+            }
         } catch (Exception e) {
             throw new IOException("Fabric8 delete namespace échoué : " + e.getMessage(), e);
         }
+    }
+
+    /**
+     * Filet de sécurité quand un namespace reste bloqué en Terminating au-delà du délai normal --
+     * observé en pratique (28 août 2026, aoo 1) : un pod qui refuse de mourir bloque la suppression
+     * du namespace indéfiniment (aucune relance automatique ensuite). L'Ingress et les
+     * EndpointSlices de ce namespace fantôme restent alors actifs et entrent en conflit avec le
+     * PROCHAIN déploiement qui réutilise le même hostname personnalisé -- Traefik peut router vers
+     * une adresse de pod déjà morte ("no available server") au lieu du nouveau déploiement, cassant
+     * silencieusement une app qui vient d'être redéployée avec succès.
+     * Force la suppression des pods restants (grace period 0, comme {@code kubectl delete --force})
+     * puis retente une suppression du namespace, courte et best-effort -- ne lève jamais, le TTL
+     * scheduler ou un prochain déploiement récupérera de toute façon l'état si ça échoue encore.
+     */
+    private void forceDeleteStuckNamespace(String namespace) {
+        try {
+            var pods = client().pods().inNamespace(namespace).list().getItems();
+            if (pods.isEmpty()) {
+                log.info("Namespace {} toujours Terminating mais aucun pod restant — laissé au contrôleur K8s", namespace);
+                return;
+            }
+            log.warn("Namespace {} bloqué en Terminating — suppression forcée de {} pod(s) restant(s)",
+                    namespace, pods.size());
+            for (var pod : pods) {
+                String podName = pod.getMetadata() != null ? pod.getMetadata().getName() : null;
+                if (podName == null) continue;
+                try {
+                    client().pods().inNamespace(namespace).withName(podName)
+                            .withGracePeriod(0).delete();
+                    log.info("Pod {}/{} supprimé de force (grace-period=0)", namespace, podName);
+                } catch (Exception e) {
+                    log.warn("Suppression forcée pod {}/{} échouée: {}", namespace, podName, e.getMessage());
+                }
+            }
+            try {
+                client().namespaces().withName(namespace)
+                        .waitUntilCondition(Objects::isNull, 30, TimeUnit.SECONDS);
+                log.info("Namespace {} supprimé après nettoyage forcé", namespace);
+            } catch (Exception e) {
+                log.warn("Namespace {} toujours présent après nettoyage forcé — sera réessayé plus tard: {}",
+                        namespace, e.getMessage());
+            }
+        } catch (Exception e) {
+            log.warn("Nettoyage forcé du namespace {} échoué: {}", namespace, e.getMessage());
+        }
+    }
+
+    /**
+     * Balayage proactif de TOUS les namespaces gérés par la plateforme, cluster-wide -- filet de
+     * sécurité complémentaire à {@link #deleteNamespace}. Ce dernier ne déclenche un nettoyage
+     * forcé qu'au moment précis où CET appel-là fait le teardown (échec/timeout observé alors, en
+     * mémoire) -- un namespace resté bloqué par un tout autre chemin (process backend interrompu
+     * en cours de teardown, appel de suppression jamais reçu, etc.) resterait sinon bloqué
+     * indéfiniment, ce qu'on a observé en pratique (28 août 2026, aoo 1 : namespace bloqué 29h+,
+     * conflit d'Ingress/EndpointSlices avec CHAQUE nouveau déploiement réutilisant le même hostname
+     * personnalisé, jusqu'à intervention manuelle). Appelé périodiquement par
+     * {@link StuckNamespaceCleanupScheduler}, pas depuis une requête HTTP.
+     *
+     * @param minStuckDuration ancienneté minimale en Terminating avant nettoyage forcé (laisse le
+     *                         temps à une suppression normale de se terminer d'elle-même).
+     * @return nombre de namespaces nettoyés.
+     */
+    public int sweepStuckNamespaces(java.time.Duration minStuckDuration) {
+        if (!isConfigured()) {
+            return 0;
+        }
+        int cleaned = 0;
+        try {
+            var namespaces = client().namespaces()
+                    .withLabel("app.kubernetes.io/managed-by", "devsecops-platform")
+                    .list().getItems();
+            for (var ns : namespaces) {
+                var meta = ns.getMetadata();
+                if (meta == null || meta.getDeletionTimestamp() == null) {
+                    continue; // pas en cours de suppression
+                }
+                try {
+                    var deletedAt = java.time.OffsetDateTime.parse(meta.getDeletionTimestamp()).toInstant();
+                    if (java.time.Duration.between(deletedAt, java.time.Instant.now()).compareTo(minStuckDuration) < 0) {
+                        continue; // Terminating depuis peu -- laisser le temps à la suppression normale
+                    }
+                } catch (Exception parseIgnored) {
+                    // Timestamp illisible : traiter comme suspect plutôt que de bloquer le balayage.
+                }
+                log.warn("Balayage : namespace {} bloqué en Terminating depuis plus de {} -- nettoyage forcé",
+                        meta.getName(), minStuckDuration);
+                forceDeleteStuckNamespace(meta.getName());
+                cleaned++;
+            }
+        } catch (Exception e) {
+            log.warn("Balayage des namespaces bloqués échoué: {}", e.getMessage());
+        }
+        return cleaned;
     }
 
     @PreDestroy
@@ -1821,6 +2274,7 @@ public class K8sManifestApplyService {
             kubernetesClient.close();
             kubernetesClient = null;
         }
+        nodeStatsExecutor.shutdown();
     }
 
     private KubernetesClient client() {

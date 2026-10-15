@@ -64,6 +64,38 @@ public class EnvironmentLifecycleService {
     transition(environmentId, EnvironmentStatus.BUILDING, null, false);
   }
 
+  /**
+   * Un déploiement CI vient d'être (re)planifié pour cet environnement -- typiquement un retry
+   * GitLab sur un job {@code deploy:trigger-backend} qui avait échoué (timeout d'attente Ready).
+   * Contrairement à {@link #onBuilding}, résiste explicitement à un état FAILED/EXPIRED/DESTROYED :
+   * un tel retry réutilise le même environnement et le même namespace, et un nouvel apply K8s
+   * vient de le repeupler -- il ne doit plus être ramassé par {@code cleanupDeadEnvironments()}
+   * (qui balaie les environnements FAILED/EXPIRED sans savoir qu'un apply vient de les repeupler).
+   *
+   * <p>Bug réel trouvé en direct le 4 septembre 2026 : l'apply K8s réussissait (namespace, données
+   * recréés), mais {@code onBuilding()} refusait la transition FAILED → BUILDING (machine à états
+   * volontairement monotone pour tout le reste), laissant l'environnement FAILED en base malgré la
+   * ressource fraîchement recréée -- le passage TTL suivant (dans les ~2 minutes) détruisait alors
+   * le namespace tout juste réappliqué, sans qu'aucune erreur ne soit levée nulle part.</p>
+   */
+  @Transactional
+  public void onRetryScheduled(UUID environmentId) {
+    EphemeralEnvironment env = load(environmentId);
+    EnvironmentStatus from = env.getStatus();
+    if (from == EnvironmentStatus.FAILED
+        || from == EnvironmentStatus.EXPIRED
+        || from == EnvironmentStatus.DESTROYED) {
+      log.warn("onRetryScheduled: env {} était {} — résurrection BUILDING (retry CI)", environmentId, from);
+      env.setStatus(EnvironmentStatus.BUILDING);
+      env.setStatusReason(null);
+      env.setTerminatedAt(null);
+      env.setDestroyedAt(null);
+      environmentRepository.save(env);
+      return;
+    }
+    transition(environmentId, EnvironmentStatus.BUILDING, null, false);
+  }
+
   @Transactional
   public void onReady(UUID environmentId, String publicUrl) {
     EphemeralEnvironment env = load(environmentId);

@@ -225,18 +225,7 @@ public class ManagedAppScanService {
                     batch = candidate;
                     isComplete = st == ScanBatchStatus.COMPLETE;
                 } else if (st == ScanBatchStatus.PENDING || st == ScanBatchStatus.RUNNING) {
-                    return SecurityPostureResponse.builder()
-                            .managedApplicationId(appId)
-                            .hasCompleteBatch(false)
-                            .batchStatus(st.name())
-                            .batchId(candidate.getId())
-                            .gitlabPipelineId(candidate.getGitlabPipelineId())
-                            .expectedServiceCount(candidate.getExpectedServiceCount())
-                            .finishedServiceCount(0)
-                            .obsolete(false)
-                            .obsoleteServices(List.of())
-                            .message("Scan en cours — verdict disponible à la fin du lot.")
-                            .build();
+                    return pendingBatchPlaceholder(appId, candidate, st);
                 }
             }
         }
@@ -251,13 +240,55 @@ public class ManagedAppScanService {
                     .build();
         }
 
+        return buildPosture(app, batch, isComplete);
+    }
+
+    /**
+     * Variante scopée à un lot précis (sélecteur de lot, page Quality Gate application) --
+     * réutilise la même construction que {@link #securityPosture(UUID)}, seule la résolution
+     * du lot change (lookup direct au lieu de "dernier lot").
+     */
+    public SecurityPostureResponse securityPosture(UUID appId, UUID batchId) {
+        User user = currentUser();
+        ManagedApplication app = appRepository.findByIdAndCreatedBy(appId, user)
+                .orElseThrow(() -> new AppValidationException("Application introuvable ou accès refusé."));
+
+        ScanBatch batch = scanBatchRepository.findByIdAndAppIdWithDetails(batchId, appId)
+                .orElseThrow(() -> new AppValidationException("Lot de scan introuvable pour cette application."));
+
+        ScanBatchStatus st = batch.getStatus();
+        if (st == ScanBatchStatus.PENDING || st == ScanBatchStatus.RUNNING) {
+            return pendingBatchPlaceholder(appId, batch, st);
+        }
+        boolean isComplete = st == ScanBatchStatus.COMPLETE;
+        return buildPosture(app, batch, isComplete);
+    }
+
+    private SecurityPostureResponse pendingBatchPlaceholder(UUID appId, ScanBatch batch, ScanBatchStatus status) {
+        return SecurityPostureResponse.builder()
+                .managedApplicationId(appId)
+                .hasCompleteBatch(false)
+                .batchStatus(status.name())
+                .batchId(batch.getId())
+                .gitlabPipelineId(batch.getGitlabPipelineId())
+                .expectedServiceCount(batch.getExpectedServiceCount())
+                .finishedServiceCount(0)
+                .obsolete(false)
+                .obsoleteServices(List.of())
+                .message("Scan en cours — verdict disponible à la fin du lot.")
+                .build();
+    }
+
+    /** Corps commun aux deux surcharges de {@code securityPosture} -- construction complète à partir d'un lot déjà résolu. */
+    private SecurityPostureResponse buildPosture(ManagedApplication app, ScanBatch batch, boolean isComplete) {
         ScanBatchStateDto state = scanBatchStateService.getState(batch.getId()).orElse(null);
+        // Le cache du commit HEAD (checkedHeadSha/headCheckedAt) n'est plus rafraîchi ici en
+        // synchrone -- ça bloquait la page sur un appel GitHub live, en boucle séquentielle,
+        // jusqu'à 10s par service. Il est désormais rafraîchi en arrière-plan par
+        // HeadCacheRefreshScheduler ; on lit ici la valeur en base, même si elle a quelques
+        // minutes de retard -- acceptable pour un badge "obsolète" informatif, pas un hard gate.
         List<PipelineExecution> executions =
                 pipelineExecutionRepository.findByScanBatchIdWithService(batch.getId());
-
-        refreshHeadCacheIfStale(executions);
-
-        executions = pipelineExecutionRepository.findByScanBatchIdWithService(batch.getId());
         List<SecurityPostureResponse.ObsoleteService> obsolete = new ArrayList<>();
         for (PipelineExecution pe : executions) {
             AppService svc = pe.getAppService();
@@ -318,7 +349,7 @@ public class ManagedAppScanService {
     }
 
     @SuppressWarnings("unchecked")
-    private Map<String, Integer> extractAggregatedSeverity(ScanBatch batch, List<PipelineExecution> executions) {
+    static Map<String, Integer> extractAggregatedSeverity(ScanBatch batch, List<PipelineExecution> executions) {
         Map<String, Object> payload = batch.getVerdictPayloadJson();
         if (payload != null && payload.get("aggregatedBySeverity") instanceof Map<?, ?> m) {
             Map<String, Integer> out = new LinkedHashMap<>();
@@ -474,7 +505,13 @@ public class ManagedAppScanService {
      * Checklist quality gate app : agrège les hard gates des services + contexte Sonar.
      * Sonar indisponible → UNKNOWN (pas FAIL) ; Critical DefectDojo → FAIL.
      */
-    private List<SecurityPostureResponse.QualityGateItem> extractQualityGates(
+    /**
+     * Package-private (pas {@code private}) : réutilisée telle quelle par
+     * {@link ScanBatchStateService#toState} pour l'historique des scans, afin de ne pas
+     * réimplémenter cette dérivation une 3ᵉ fois (les deux services vivent dans le même
+     * package -- pas besoin d'injection, pas de risque de dépendance circulaire).
+     */
+    static List<SecurityPostureResponse.QualityGateItem> extractQualityGates(
             ScanBatch batch, List<PipelineExecution> executions
     ) {
         Map<String, Object> payload = batch.getVerdictPayloadJson();
@@ -512,6 +549,7 @@ public class ManagedAppScanService {
         boolean anySonarAvailable = false;
         int secretsTotal = 0;
         boolean secretsKnown = false;
+        boolean anyDastApplicable = false;
         for (PipelineExecution pe : executions) {
             Map<String, Object> gate = pe.getQualityGateJson() != null ? pe.getQualityGateJson() : Map.of();
             if (ScanBatchAggregationService.isSonarAvailableFromGate(gate)) {
@@ -521,6 +559,9 @@ public class ManagedAppScanService {
                 secretsKnown = true;
                 Object s = gate.get("secrets");
                 if (s instanceof Number n) secretsTotal += n.intValue();
+            }
+            if (Boolean.TRUE.equals(gate.get("dastApplicable"))) {
+                anyDastApplicable = true;
             }
         }
 
@@ -616,10 +657,56 @@ public class ManagedAppScanService {
                 .scope("application")
                 .build());
 
+        // DAST (ZAP) — uniquement si au moins un service du lot est un déploiement réel ;
+        // un lot entièrement scan-only ne montre pas cet item du tout (ZAP n'y tourne jamais).
+        if (anyDastApplicable) {
+            boolean dastUnknown = unknownSources.stream().anyMatch(s -> s.toLowerCase().contains("dast"));
+            if (failedIds.contains("dast")) {
+                items.add(SecurityPostureResponse.QualityGateItem.builder()
+                        .id("dast")
+                        .label("Vulnérabilités élevées (DAST / ZAP)")
+                        .status("FAIL")
+                        .message("Trop de findings élevés détectés par l'analyse dynamique sur au moins un service déployé")
+                        .scope(failedServices.isEmpty() ? "application" : String.join(", ", failedServices))
+                        .build());
+            } else if (dastUnknown) {
+                items.add(SecurityPostureResponse.QualityGateItem.builder()
+                        .id("dast")
+                        .label("Vulnérabilités élevées (DAST / ZAP)")
+                        .status("UNKNOWN")
+                        .message("Scan DAST non exécuté ou incomplet sur au moins un service déployé")
+                        .scope("application")
+                        .build());
+            } else {
+                items.add(SecurityPostureResponse.QualityGateItem.builder()
+                        .id("dast")
+                        .label("Vulnérabilités élevées (DAST / ZAP)")
+                        .status("PASS")
+                        .message("Pas de dépassement de seuil détecté par l'analyse dynamique")
+                        .scope("application")
+                        .build());
+            }
+        }
+
         return items;
     }
 
-    private void refreshHeadCacheIfStale(List<PipelineExecution> executions) {
+    /**
+     * Package-private (pas {@code private}) : appelée en synchrone nulle part -- réutilisée par
+     * {@link HeadCacheRefreshScheduler}, en arrière-plan, pour ne jamais bloquer une requête HTTP
+     * sur un appel GitHub live (jusqu'à 10s par service, en boucle séquentielle).
+     * {@code @Transactional} nécessaire ici : {@code pe.getAppService()} est un lazy-load JPA --
+     * quand cette méthode tournait en synchrone dans {@code securityPosture()} (requête HTTP,
+     * session OSIV ouverte), ça passait implicitement ; appelée depuis un {@code @Scheduled} (pas
+     * de requête, pas de session), il faut une transaction explicite sous peine de
+     * LazyInitializationException ("no session"). Pas {@code readOnly = true} : cette méthode
+     * écrit via {@code scanBatchWriteService.updateHeadCache} (PROPAGATION_REQUIRED rejoint CETTE
+     * transaction physique -- si elle était readOnly, Postgres rejetterait l'UPDATE avec
+     * "cannot execute UPDATE in a read-only transaction", le readOnly de l'appel imbriqué
+     * n'ayant aucun effet une fois la transaction externe déjà readOnly).
+     */
+    @Transactional
+    void refreshHeadCacheIfStale(List<PipelineExecution> executions) {
         LocalDateTime cutoff = LocalDateTime.now().minus(Duration.ofMillis(Math.max(headCheckTtlMs, 30_000)));
         for (PipelineExecution pe : executions) {
             if (pe.getHeadCheckedAt() != null && pe.getHeadCheckedAt().isAfter(cutoff)) {

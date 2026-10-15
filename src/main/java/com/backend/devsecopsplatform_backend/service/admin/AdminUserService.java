@@ -5,6 +5,7 @@ import com.backend.devsecopsplatform_backend.controller.admin.CreateUserResponse
 import com.backend.devsecopsplatform_backend.dto.complaint.ComplaintApiDto;
 import com.backend.devsecopsplatform_backend.entity.AccountStatus;
 import com.backend.devsecopsplatform_backend.entity.AppService;
+import com.backend.devsecopsplatform_backend.entity.appmgmt.ManagedApplication;
 import com.backend.devsecopsplatform_backend.entity.EnvironmentStatus;
 import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
 import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
@@ -22,6 +23,7 @@ import com.backend.devsecopsplatform_backend.repository.ManagedApplicationReposi
 import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
 import com.backend.devsecopsplatform_backend.repository.UserActivityLogRepository;
 import com.backend.devsecopsplatform_backend.repository.UserRepository;
+import com.backend.devsecopsplatform_backend.service.admin.dto.AdminAppServiceSummary;
 import com.backend.devsecopsplatform_backend.service.admin.dto.AdminEnvironmentStatusBreakdown;
 import com.backend.devsecopsplatform_backend.service.admin.dto.AdminPipelineCounts;
 import com.backend.devsecopsplatform_backend.service.admin.dto.AdminUserApplicationDetail;
@@ -46,12 +48,15 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.util.Comparator;
 import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 @Service
 @RequiredArgsConstructor
@@ -385,7 +390,6 @@ public class AdminUserService {
         long activeEnvs = ephemeralEnvironmentRepository
                 .countByRequestedByAndStatus(u, EnvironmentStatus.RUNNING);
         long pipelines = pipelineExecutionRepository.countByUser(u);
-        long applications = applicationRepository.countByCreatedBy(u);
 
         List<String> roles = (u.getRoles() == null)
                 ? List.of()
@@ -397,28 +401,45 @@ public class AdminUserService {
         AdminPipelineCounts globalPipelineCounts =
                 buildPipelineCounts(pipelineExecutionRepository.countByUserGroupByStatus(u));
 
-        Map<UUID, AdminPipelineCounts> pipelineByApp =
+        // Clé = id du SERVICE (AppService) : c'est le niveau réel auquel pipelines et environnements
+        // sont rattachés en base (un build/scan cible un service précis, cf. PipelineExecution.appService).
+        // Agrégée ensuite au niveau application dans toManagedApplicationDetail() — voir
+        // docs/audit-dashboard-admin.md §0/§5 pour l'explication complète de la distinction
+        // AppService (service) / ManagedApplication (application multi-services).
+        Map<UUID, AdminPipelineCounts> pipelineByService =
                 buildApplicationPipelineCountsMap(pipelineExecutionRepository.countByUserGroupByApplicationAndStatus(u));
 
-        Map<UUID, Long> envCountByAppId = envs.stream()
+        Map<UUID, Long> envCountByServiceId = envs.stream()
                 .collect(Collectors.groupingBy(e -> e.getService().getId(), Collectors.counting()));
 
-        List<AppService> appList = applicationRepository.findByCreatedByOrderByCreatedAtDesc(u);
-        List<AdminUserApplicationDetail> appDetails = appList.stream()
-                .map(app -> new AdminUserApplicationDetail(
-                        app.getId(),
-                        app.getName(),
-                        app.getDescription(),
-                        app.getGitRepositoryUrl(),
-                        app.getCreatedAt(),
-                        envCountByAppId.getOrDefault(app.getId(), 0L),
-                        pipelineByApp.getOrDefault(app.getId(), AdminPipelineCounts.empty())
-                ))
+        List<AppService> allServices = applicationRepository.findByCreatedByOrderByCreatedAtDesc(u);
+
+        List<ManagedApplication> managedApps = managedApplicationRepository.findByCreatedByOrderByCreatedAtDesc(u);
+        List<AdminUserApplicationDetail> managedAppDetails = managedApps.stream()
+                .map(app -> toManagedApplicationDetail(app, envCountByServiceId, pipelineByService))
+                .toList();
+
+        // Services sans application parente : projets mono-service historiques, où le service EST
+        // l'application du point de vue admin (cf. §0 de l'audit).
+        List<AdminUserApplicationDetail> standaloneAppDetails = allServices.stream()
+                .filter(s -> s.getManagedApplication() == null)
+                .map(s -> toStandaloneApplicationDetail(s, envCountByServiceId, pipelineByService))
+                .toList();
+
+        List<AdminUserApplicationDetail> appDetails = Stream
+                .concat(managedAppDetails.stream(), standaloneAppDetails.stream())
+                .sorted(Comparator.comparing(
+                        AdminUserApplicationDetail::createdAt,
+                        Comparator.nullsLast(Comparator.reverseOrder())))
                 .toList();
 
         List<AdminUserEnvironmentDetail> envDetails = envs.stream()
                 .map(this::toEnvironmentDetail)
                 .toList();
+
+        // Nombre réel d'applications : une ManagedApplication multi-services compte pour une seule
+        // application, pas une par service membre (cf. docs/audit-dashboard-admin.md §1).
+        long applications = appDetails.size();
 
         int recentFailures = (int) loginAuditService.countRecentFailuresSinceLastSuccess(u);
         LocalDateTime lastPwdChange = findLastPasswordChange(u);
@@ -445,13 +466,21 @@ public class AdminUserService {
     }
 
     private AdminUserEnvironmentDetail toEnvironmentDetail(EphemeralEnvironment e) {
-        AppService app = e.getService();
+        AppService service = e.getService();
+        // L'environnement est physiquement rattaché au service (colonne app_service_id), mais côté
+        // admin on veut afficher le nom de la vraie application quand ce service en fait partie
+        // (cf. docs/audit-dashboard-admin.md §1 — avant ce correctif, applicationName portait
+        // toujours le nom du service, jamais celui de la ManagedApplication parente).
+        ManagedApplication managedApp = service.getManagedApplication();
+        UUID applicationId = managedApp != null ? managedApp.getId() : service.getId();
+        String applicationName = managedApp != null ? managedApp.getName() : service.getName();
         PipelineExecution pe = e.getPipelineExecution();
         return new AdminUserEnvironmentDetail(
                 e.getId(),
-                app.getId(),
-                app.getName(),
+                applicationId,
+                applicationName,
                 e.getEnvironmentName(),
+                e.getNamespace(),
                 e.getGitBranch(),
                 e.getStatus().name(),
                 e.getUrl(),
@@ -462,6 +491,102 @@ public class AdminUserService {
                 pe != null && pe.getStatus() != null ? pe.getStatus().name() : null,
                 pe != null ? pe.getStartedAt() : null,
                 pe != null ? pe.getFinishedAt() : null
+        );
+    }
+
+    /**
+     * Ligne "Application" pour une {@code ManagedApplication} réelle (multi-services) : agrège les
+     * compteurs d'environnements et de pipelines de tous ses services membres, et expose leur
+     * composition (cf. docs/audit-dashboard-admin.md §6, "cliquer pour voir la composition").
+     */
+    private AdminUserApplicationDetail toManagedApplicationDetail(
+            ManagedApplication app,
+            Map<UUID, Long> envCountByServiceId,
+            Map<UUID, AdminPipelineCounts> pipelineByService
+    ) {
+        List<AppService> services = app.getServices();
+
+        long envCount = services.stream()
+                .mapToLong(s -> envCountByServiceId.getOrDefault(s.getId(), 0L))
+                .sum();
+
+        AdminPipelineCounts pipelineCounts = services.stream()
+                .map(s -> pipelineByService.getOrDefault(s.getId(), AdminPipelineCounts.empty()))
+                .reduce(AdminPipelineCounts.empty(), AdminUserService::sumPipelineCounts);
+
+        List<AdminAppServiceSummary> serviceSummaries = services.stream()
+                .map(s -> new AdminAppServiceSummary(
+                        s.getId(),
+                        s.getName(),
+                        s.getRole() != null ? s.getRole().name() : null,
+                        s.getGitRepositoryUrl(),
+                        s.getGitBranch()
+                ))
+                .toList();
+
+        // Pas de dépôt unique pour une application multi-services : on retient celui du premier
+        // service déclaré, à défaut mieux vaut un dépôt indicatif que rien (le détail par service
+        // reste de toute façon disponible dans `services`).
+        String repositoryHint = services.isEmpty() ? null : services.get(0).getGitRepositoryUrl();
+
+        LocalDateTime createdAt = app.getCreatedAt() != null
+                ? LocalDateTime.ofInstant(app.getCreatedAt(), ZoneId.systemDefault())
+                : null;
+
+        return new AdminUserApplicationDetail(
+                app.getId(),
+                app.getName(),
+                app.getDescription(),
+                repositoryHint,
+                createdAt,
+                envCount,
+                pipelineCounts,
+                false,
+                serviceSummaries,
+                app.getDatabases() != null ? app.getDatabases().size() : 0
+        );
+    }
+
+    /**
+     * Ligne "Application" pour un {@code AppService} autonome (sans {@code ManagedApplication}
+     * parente) : projet mono-service historique, où le service EST l'application du point de vue
+     * admin. Représenté avec une composition à un seul élément pour rester sur la même forme de
+     * DTO que les applications multi-services.
+     */
+    private AdminUserApplicationDetail toStandaloneApplicationDetail(
+            AppService service,
+            Map<UUID, Long> envCountByServiceId,
+            Map<UUID, AdminPipelineCounts> pipelineByService
+    ) {
+        AdminAppServiceSummary onlyService = new AdminAppServiceSummary(
+                service.getId(),
+                service.getName(),
+                service.getRole() != null ? service.getRole().name() : null,
+                service.getGitRepositoryUrl(),
+                service.getGitBranch()
+        );
+        return new AdminUserApplicationDetail(
+                service.getId(),
+                service.getName(),
+                service.getDescription(),
+                service.getGitRepositoryUrl(),
+                service.getCreatedAt(),
+                envCountByServiceId.getOrDefault(service.getId(), 0L),
+                pipelineByService.getOrDefault(service.getId(), AdminPipelineCounts.empty()),
+                true,
+                List.of(onlyService),
+                0
+        );
+    }
+
+    private static AdminPipelineCounts sumPipelineCounts(AdminPipelineCounts a, AdminPipelineCounts b) {
+        return new AdminPipelineCounts(
+                a.success() + b.success(),
+                a.failed() + b.failed(),
+                a.running() + b.running(),
+                a.pending() + b.pending(),
+                a.canceled() + b.canceled(),
+                a.skipped() + b.skipped()
         );
     }
 

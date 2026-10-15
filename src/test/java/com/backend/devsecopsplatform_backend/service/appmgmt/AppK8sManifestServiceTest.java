@@ -152,6 +152,40 @@ class AppK8sManifestServiceTest {
                 .contains(internalUrl + "/v1");
     }
 
+    @Test
+    void includesDefaultDenyNetworkPolicyWhenEnabled() {
+        ManagedApplication app = app(service("api-fast", AppServiceRole.BACKEND, 8000));
+        AppK8sManifestService.ManifestOptions options =
+                AppK8sManifestService.ManifestOptions.builder()
+                        .pullSecretName("gitlab-registry")
+                        .networkPolicyEnabled(true)
+                        .networkPolicyIngressNamespace("kube-system")
+                        .build();
+
+        String yaml = manifestService.generateDatabaseBundle(app, "env-demo", options);
+
+        assertThat(yaml)
+                .contains("kind: NetworkPolicy")
+                .contains("name: default-isolation")
+                .contains("namespace: env-demo")
+                .contains("- Ingress")
+                .contains("kubernetes.io/metadata.name: kube-system");
+    }
+
+    @Test
+    void omitsNetworkPolicyWhenDisabled() {
+        ManagedApplication app = app(service("api-fast", AppServiceRole.BACKEND, 8000));
+        AppK8sManifestService.ManifestOptions options =
+                AppK8sManifestService.ManifestOptions.builder()
+                        .pullSecretName("gitlab-registry")
+                        .networkPolicyEnabled(false)
+                        .build();
+
+        String yaml = manifestService.generateDatabaseBundle(app, "env-demo", options);
+
+        assertThat(yaml).doesNotContain("kind: NetworkPolicy");
+    }
+
     private static AppService service(String name, AppServiceRole role, int port) {
         AppService service = new AppService();
         service.setId(UUID.randomUUID());

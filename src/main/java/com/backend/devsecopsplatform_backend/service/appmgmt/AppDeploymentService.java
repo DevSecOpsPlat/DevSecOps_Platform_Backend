@@ -26,6 +26,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -81,6 +82,18 @@ public class AppDeploymentService {
     private final K8sManifestApplyService k8sManifestApplyService;
     private final EnvironmentLifecycleService environmentLifecycleService;
     private final TransactionTemplate transactionTemplate;
+    /** @Lazy : casse le cycle avec DeploymentRuntimeAlertService → ApplicationManagementService → AppDeploymentService. */
+    @Lazy
+    private final DeploymentRuntimeAlertService deploymentRuntimeAlertService;
+
+    /**
+     * Cycle direct ApplicationManagementService ↔ AppDeploymentService : injection par champ
+     * (pas via le constructeur @RequiredArgsConstructor) car Lombok ne recopie pas @Lazy sur le
+     * paramètre généré ici — seule l'injection @Autowired @Lazy sur le champ brise le cycle.
+     */
+    @org.springframework.beans.factory.annotation.Autowired
+    @Lazy
+    private ApplicationManagementService applicationManagementService;
 
     /** Pool pour applies CI concurrents (plusieurs apps / rebuilds en parallèle). */
     private ExecutorService ciDeployExecutor;
@@ -115,6 +128,18 @@ public class AppDeploymentService {
     @Value("${deployment.ingress.class-name:traefik}")
     private String ingressClassName;
 
+    /**
+     * Domaine perso automatique : une app SANS "Domaine personnalisé" explicite obtient
+     * <slug-app>.<ce-domaine> automatiquement — plus besoin de le taper à chaque déploiement.
+     * Vide = comportement d'origine (fallback nip.io).
+     */
+    @Value("${deployment.ingress.custom-base-domain:}")
+    private String customBaseDomain;
+
+    /** Schéma des URLs pour un hostname personnalisé (auto ou tapé) — https par défaut. */
+    @Value("${deployment.ingress.custom-scheme:https}")
+    private String customHostnameScheme;
+
     /** Secret partagé validé par le callback (même valeur que le job GitLab). */
     @Value("${pipeline.secret:}")
     private String pipelineSecret;
@@ -146,6 +171,12 @@ public class AppDeploymentService {
 
     @Value("${deployment.namespace.memory-quota:8Gi}")
     private String namespaceMemoryQuota;
+
+    @Value("${deployment.network-policy.enabled:true}")
+    private boolean networkPolicyEnabled;
+
+    @Value("${deployment.network-policy.ingress-namespace:kube-system}")
+    private String networkPolicyIngressNamespace;
 
     @PostConstruct
     void initCiDeployExecutor() {
@@ -191,6 +222,32 @@ public class AppDeploymentService {
         List<String> warnings = validationService.validate(target);
         warnings.forEach(w -> log.info("⚠️ [deploy {}] {}", app.getId(), w));
 
+        AppService gitService = target.getServices().stream().findFirst()
+                .orElseThrow(() -> new AppValidationException("Aucun service dans le projet."));
+        String deployBranch = resolved.resolveBranch(gitService.getGitBranch());
+
+        // Un déploiement RUNNING de cette MÊME app sur cette MÊME branche devient orphelin dès
+        // qu'on en recrée un nouveau : l'ancien garde le même hostname auto-généré (<slug> ou
+        // <slug>-<branche>), plus aucun bouton dans l'UI ne peut plus l'arrêter (elle ne pilote
+        // que app.lastDeployment), et Traefik tranche de façon non déterministe entre les deux
+        // Ingress qui réclament le même host — l'app "marche" par intermittence selon celui qui
+        // gagne. On le remplace donc proprement ici, plutôt que de le laisser tourner en double
+        // pour rien (bug réel constaté le 18 août 2026, cf. audit-deploiement.md §8). Toujours
+        // le MÊME propriétaire (même app) : jamais l'environnement d'un autre utilisateur.
+        deploymentRepository.findByApplication_IdOrderByCreatedAtDesc(app.getId()).stream()
+                .filter(d -> d.getStatus() == AppDeploymentStatus.RUNNING)
+                .filter(d -> sameBranch(deployBranch, resolveDeploymentBranch(d.getId())))
+                .forEach(old -> {
+                    log.info("deploy({}) : remplace le déploiement RUNNING existant {} (même branche {})",
+                            app.getId(), old.getId(), deployBranch);
+                    try {
+                        teardown(old);
+                    } catch (Exception e) {
+                        log.warn("Teardown de l'ancien déploiement {} avant redeploy : {}",
+                                old.getId(), e.getMessage());
+                    }
+                });
+
         AppDeployment deployment = new AppDeployment();
         deployment.setApplication(app);
         deployment.setStatus(AppDeploymentStatus.PENDING);
@@ -208,7 +265,7 @@ public class AppDeploymentService {
 
         String imageTag = AppNaming.shortId(deployment.getId());
         AppK8sManifestService.ManifestOptions opts = buildManifestOptions(
-                deployment.getId(), resolved.ttlHours(), null, app);
+                deployment.getId(), resolved.ttlHours(), null, app, deployBranch);
 
         // Les services sont générés après le build, lorsque toutes les images sont résolues.
         String databasesB64 = b64(manifestService.generateDatabaseBundle(target, namespace, opts));
@@ -221,13 +278,15 @@ public class AppDeploymentService {
 
         Map<String, String> variables = new LinkedHashMap<>();
         variables.put("ACTION", "deploy");
+        // Sans ça, deploy:defectdojo-import (.gitlab-ci.yml) ne tourne jamais (rules exige
+        // DD_IMPORT_ENABLED=true, défaut "false" dans le fichier) -- ZAP + Grype du flux deploy
+        // ne remontaient jamais dans DefectDojo. Passé au déclenchement plutôt qu'écrit dans le
+        // fichier (convention du projet : .gitlab-ci.yml n'est pas modifié par l'outil).
+        variables.put("DD_IMPORT_ENABLED", "true");
         variables.put("APP_ID", app.getId().toString());
         variables.put("APP_SLUG", app.getSlug());
         variables.put("DEPLOYMENT_ID", deployment.getId().toString());
-        AppService gitService = target.getServices().stream().findFirst()
-                .orElseThrow(() -> new AppValidationException("Aucun service dans le projet."));
         variables.put("SERVICE_NAME", AppNaming.k8sName(gitService.getName()));
-        String deployBranch = resolved.resolveBranch(gitService.getGitBranch());
         addGitPipelineVariables(variables, gitService, deployBranch);
         variables.put("APPLICATION_ID", gitService.getId().toString());
         variables.put("NAMESPACE", namespace);
@@ -250,6 +309,21 @@ public class AppDeploymentService {
         deployment.setStatus(pipelineId != null ? AppDeploymentStatus.DEPLOYING : AppDeploymentStatus.FAILED);
         deployment.setDeployedAt(Instant.now());
         linkDeployPipelineExecution(gitService, env, pipelineId, deployBranch);
+        // Déploiement multi-services : gitService n'est que le "1er service de la liste", pas
+        // forcément le seul déployé (target.getServices() peut en contenir plusieurs -- toutes
+        // partagent le même pipelineId/namespace/environnement, un seul pipeline GitLab pour
+        // toute l'app). Sans cette boucle, seul gitService recevait une PipelineExecution DEPLOY
+        // -- les autres services (ex. "back" quand gitService="front") n'avaient alors JAMAIS
+        // d'environnement de déploiement associé : leur page Quality Gate / Post-déploiement
+        // restait bloquée sur leur dernier SCAN, indéfiniment, même après de multiples
+        // redéploiements de l'app entière (bug réel constaté le 28 août 2026, aoo 1).
+        for (AppService svc : target.getServices()) {
+            if (svc.getId().equals(gitService.getId())) {
+                continue;
+            }
+            String svcBranch = resolved.resolveBranch(svc.getGitBranch());
+            linkDeployPipelineExecution(svc, env, pipelineId, svcBranch, false);
+        }
 
         return deploymentRepository.save(deployment);
     }
@@ -332,6 +406,7 @@ public class AppDeploymentService {
 
         Map<String, String> variables = new LinkedHashMap<>();
         variables.put("ACTION", "deploy");
+        variables.put("DD_IMPORT_ENABLED", "true"); // voir commentaire au 1er site d'appel
         variables.put("APP_ID", realApp.getId().toString());
         variables.put("APP_SLUG", realApp.getSlug());
         variables.put("SERVICE_ID", target.getId().toString());
@@ -486,6 +561,35 @@ public class AppDeploymentService {
     }
 
     /**
+     * Résumé Grype (scan de l'image construite) poussé par le job deploy:grype-scan — stocké
+     * dans servicesState pour affichage plateforme (audit-deploiement.md, chantier #9).
+     */
+    @SuppressWarnings("unchecked")
+    public void applyContainerScanCallback(
+            UUID deploymentId,
+            com.backend.devsecopsplatform_backend.controller.appmgmt.ContainerScanCallbackRequest request
+    ) {
+        AppDeployment deployment = deploymentRepository.findById(deploymentId)
+                .orElseThrow(() -> new AppValidationException("Déploiement introuvable."));
+        Map<String, Object> state = deployment.getServicesState();
+        if (state == null) {
+            state = new LinkedHashMap<>();
+        }
+        Map<String, Object> scan = new LinkedHashMap<>();
+        scan.put("critical", request.getCritical() != null ? request.getCritical() : 0);
+        scan.put("high", request.getHigh() != null ? request.getHigh() : 0);
+        scan.put("medium", request.getMedium() != null ? request.getMedium() : 0);
+        scan.put("low", request.getLow() != null ? request.getLow() : 0);
+        scan.put("imageName", request.getImageName());
+        scan.put("checkedAt", Instant.now().toString());
+        state.put("containerScan", scan);
+        deployment.setServicesState(state);
+        deploymentRepository.save(deployment);
+        log.info("Container scan (Grype) enregistré — deployment={} critical={} high={}",
+                deploymentId, scan.get("critical"), scan.get("high"));
+    }
+
+    /**
      * Accepte un déploiement CI et lance l'apply K8s en arrière-plan (réponse HTTP immédiate).
      */
     public Map<String, Object> scheduleCiDeploy(CiDeployRequest request) {
@@ -506,7 +610,10 @@ public class AppDeploymentService {
         deploymentRepository.save(deployment);
 
         if (environmentId != null) {
-            environmentLifecycleService.onBuilding(environmentId);
+            // onRetryScheduled (pas onBuilding) : un retry GitLab sur un job échoué réutilise le
+            // même environnement/namespace, potentiellement déjà FAILED en base — voir le
+            // commentaire de la méthode pour la race trouvée en direct le 4 septembre 2026.
+            environmentLifecycleService.onRetryScheduled(environmentId);
         }
 
         CompletableFuture.runAsync(() -> {
@@ -678,19 +785,32 @@ public class AppDeploymentService {
         ManagedApplication shadow = prepared.shadow();
         UUID environmentId = prepared.environmentId();
 
+        boolean hasIngressStep = prepared.ingressYaml() != null && !prepared.ingressYaml().isBlank();
+        initDeploySteps(deployment, prepared.waitForDatabases(), prepared.serviceWaves(), hasIngressStep);
+
         try {
+            setDeployPhase(deployment, "Préparation du namespace");
             k8sManifestApplyService.ensureNamespaceReadyForApply(namespace);
+            advanceDeployStep(deployment, "namespace");
 
             if (!prepared.partialRebuild()) {
+                setDeployPhase(deployment, "Bases de données — apply");
                 k8sManifestApplyService.applyManifests(prepared.databasesYaml());
                 markDatabasesDeploying(deployment);
 
                 if (prepared.waitForDatabases()) {
+                    setDeployPhase(deployment, "Bases de données — en attente Ready");
                     k8sManifestApplyService.waitUntilDatabasesReady(namespace);
+                    advanceDeployStep(deployment, "databases");
                 }
+                setDeployPhase(deployment, "Bases de données prêtes");
             }
 
+            int waveCount = prepared.serviceWaves().size();
+            int waveIdx = 0;
             for (ServiceWaveManifest wave : prepared.serviceWaves()) {
+                waveIdx++;
+                setDeployPhase(deployment, "Vague " + waveIdx + "/" + waveCount + " — apply");
                 k8sManifestApplyService.applyManifests(wave.yaml());
                 // SSA ignore souvent spec.replicas — forcer le scale voulu
                 if (wave.replicaByName() != null) {
@@ -703,11 +823,15 @@ public class AppDeploymentService {
                         }
                     }
                 }
+                setDeployPhase(deployment, "Vague " + waveIdx + "/" + waveCount + " — en attente Ready");
                 k8sManifestApplyService.waitUntilNamedDeploymentsReady(namespace, wave.deploymentNames());
+                setDeployPhase(deployment, "Vague " + waveIdx + "/" + waveCount + " prête");
+                advanceDeployStep(deployment, "wave-" + waveIdx);
             }
 
             // Ingress / Middleware après Ready — soft-fail si CRD Traefik bloque
-            if (prepared.ingressYaml() != null && !prepared.ingressYaml().isBlank()) {
+            if (hasIngressStep) {
+                setDeployPhase(deployment, "Ingress — apply");
                 String ingressError = null;
                 boolean ingressOk = false;
                 try {
@@ -723,13 +847,17 @@ public class AppDeploymentService {
                             namespace, ingressEx.getMessage());
                 }
                 persistIngressState(deployment, ingressOk, ingressError);
+                setDeployPhase(deployment, ingressOk ? "Terminé — Ingress appliqué" : "Terminé — Ingress indisponible (non bloquant)");
+                advanceDeployStep(deployment, "ingress");
             } else {
                 // Ingress désactivé ou bundle vide
                 persistIngressState(deployment, !ingressEnabled,
                         ingressEnabled ? "Bundle Ingress vide" : null);
+                setDeployPhase(deployment, "Terminé");
             }
 
         } catch (Exception e) {
+            markCurrentDeployStepFailed(deployment);
             log.error("CI deploy async échoué — deployment={}: {}", deploymentId, e.getMessage(), e);
             handleCiDeployFailure(deployment, environmentId, namespace, e.getMessage());
             return;
@@ -817,13 +945,30 @@ public class AppDeploymentService {
 
         if (ready) {
             maybeRetryIngress(deployment, shadow, namespace);
-            if (deployment.getDeployedAt() == null) {
+            boolean firstReady = deployment.getDeployedAt() == null;
+            if (firstReady) {
                 deployment.setDeployedAt(Instant.now());
             }
             deployment.setStatus(AppDeploymentStatus.RUNNING);
             markServicesReady(deployment);
             clearPendingRebuild(deployment);
             deploymentRepository.save(deployment);
+            // Retenter tant qu'aucun résultat n'est encore écrit (pas seulement au 1er "ready") --
+            // runSmokeTest() ne fait rien si aucun service n'a encore d'externalUrl (Ingress
+            // appliqué APRÈS readiness, en soft-fail -- markServicesReady() peut retomber sur
+            // ingressOk=false à ce tick précis et mettre externalUrl à null). Avec le déclenchement
+            // limité à "firstReady", ce cas de figure faisait échouer le smoke test en silence,
+            // pour toujours, sur ce déploiement (constaté le 24 et 27 août 2026 : servicesState
+            // sans clé "smokeTest" du tout). deploy:trigger-backend (.gitlab-ci.yml) continue de
+            // toute façon à sonder ce endpoint tant que appUrl est vide, donc ça retente à chaque
+            // poll suivant jusqu'à ce qu'Ingress soit prêt, sans appel GitLab supplémentaire.
+            if (!hasSmokeTestResult(deployment)) {
+                try {
+                    runSmokeTest(deployment, shadow);
+                } catch (Exception smokeEx) {
+                    log.debug("Smoke test post-déploiement non exécuté: {}", smokeEx.getMessage());
+                }
+            }
             UUID environmentId = resolveEnvironmentId(null, deployment);
             boolean ingressOk = isIngressApplied(deployment);
             String appUrl = ingressOk ? resolvePublicUrl(deployment, shadow) : null;
@@ -990,7 +1135,218 @@ public class AppDeploymentService {
         if (svcState != null && svcState.get("ingressError") != null) {
             out.put("ingressError", svcState.get("ingressError"));
         }
+        if (svcState != null && svcState.get("deployPhase") != null) {
+            out.put("deployPhase", svcState.get("deployPhase"));
+        }
         return out;
+    }
+
+    /** Un résultat de smoke test (même en échec) a déjà été écrit pour ce déploiement. */
+    private boolean hasSmokeTestResult(AppDeployment deployment) {
+        Map<String, Object> state = deployment.getServicesState();
+        return state != null && state.get("smokeTest") != null;
+    }
+
+    /**
+     * Smoke test post-déploiement : sonde une fois l'URL publique de chaque service exposé,
+     * dès que l'environnement passe Ready (audit-deploiement.md, chantier #8). Réutilise le
+     * même probe HTTP que le health check du Monitoring (résolution ingress/.local incluse) —
+     * best-effort, ne doit jamais faire échouer le passage à RUNNING.
+     */
+    @SuppressWarnings("unchecked")
+    private void runSmokeTest(AppDeployment deployment, ManagedApplication shadow) {
+        Map<String, Object> state = deployment.getServicesState();
+        if (state == null || !(state.get("services") instanceof Map<?, ?> servicesRaw)) {
+            return;
+        }
+        Map<String, Object> results = new LinkedHashMap<>();
+        boolean allOk = true;
+        boolean anyChecked = false;
+        for (Map.Entry<?, ?> e : servicesRaw.entrySet()) {
+            String name = String.valueOf(e.getKey());
+            if (!(e.getValue() instanceof Map)) {
+                continue;
+            }
+            Map<String, Object> svc = (Map<String, Object>) e.getValue();
+            Object urlObj = svc.get("externalUrl");
+            String url = urlObj != null ? String.valueOf(urlObj).trim() : "";
+            if (url.isBlank()) {
+                continue;
+            }
+            Map<String, Object> health = applicationManagementService.probeHttpHealth(url, null);
+            anyChecked = true;
+            Map<String, Object> probe = new LinkedHashMap<>();
+            boolean ok = Boolean.TRUE.equals(health.get("ok"));
+            probe.put("ok", ok);
+            probe.put("statusCode", health.get("statusCode"));
+            probe.put("message", health.get("message"));
+            probe.put("probedUrl", health.get("probedUrl") != null ? health.get("probedUrl") : url);
+            results.put(name, probe);
+            if (!ok) {
+                allOk = false;
+            }
+        }
+        if (!anyChecked) {
+            return;
+        }
+        Map<String, Object> smoke = new LinkedHashMap<>();
+        smoke.put("checkedAt", Instant.now().toString());
+        smoke.put("allOk", allOk);
+        smoke.put("results", results);
+        state.put("smokeTest", smoke);
+        deployment.setServicesState(state);
+        transactionTemplate.executeWithoutResult(s -> deploymentRepository.save(deployment));
+        log.info("Smoke test post-déploiement — ns={} allOk={} services={}",
+                deployment.getNamespace(), allOk, results.keySet());
+    }
+
+    private AppDeployment requireRunningDeployment(ManagedApplication realApp, UUID serviceId, String actionLabel) {
+        if (realApp == null || realApp.getId() == null) {
+            throw new AppValidationException("Application requise.");
+        }
+        boolean hasService = realApp.getServices().stream().anyMatch(s -> serviceId.equals(s.getId()));
+        if (!hasService) {
+            throw new AppValidationException("Service introuvable dans ce projet.");
+        }
+        return deploymentRepository.findByApplication_IdOrderByCreatedAtDesc(realApp.getId()).stream()
+                .filter(d -> d.getStatus() == AppDeploymentStatus.RUNNING)
+                .findFirst()
+                .orElseThrow(() -> new AppValidationException(
+                        "Aucun environnement RUNNING — impossible de relancer le " + actionLabel + "."));
+    }
+
+    /**
+     * Relance manuelle du smoke test (Objectif 3, post-deploy §5 : bouton "Relancer" sans
+     * restriction, coût quasi nul) — contourne délibérément hasSmokeTestResult(), qui n'existe
+     * QUE pour éviter de re-sonder à chaque poll automatique de deploy:trigger-backend pendant les
+     * ~5 min où le CI attend RUNNING (voir commentaire au 1er site d'appel, ligne ~953). Un
+     * déclenchement manuel explicite n'a pas cette contrainte : c'est exactement le comportement
+     * que corrige cet objectif (avant : un seul résultat enregistré, jamais rafraîchi ensuite).
+     */
+    @SuppressWarnings("unchecked")
+    public Map<String, Object> rerunSmokeTestForService(ManagedApplication realApp, UUID serviceId) {
+        AppDeployment deployment = requireRunningDeployment(realApp, serviceId, "smoke test");
+        ManagedApplication shadow = buildShadowForDeployment(deployment, deployment.getApplication());
+        runSmokeTest(deployment, shadow);
+        Map<String, Object> state = deployment.getServicesState();
+        Object smoke = state != null ? state.get("smokeTest") : null;
+        if (smoke == null) {
+            throw new AppValidationException(
+                    "Aucun service n'a d'URL publique sur ce déploiement — rien à sonder.");
+        }
+        return (Map<String, Object>) smoke;
+    }
+
+    /**
+     * Progression fine pendant l'apply K8s (namespace → BD → vague N/total → ingress), exposée
+     * via getCiDeployStatus()/getDeployment() pour que la page pipeline n'affiche plus une boîte
+     * noire pendant les ~5 min de polling de deploy:trigger-backend (audit-deploiement.md, #6).
+     */
+    @SuppressWarnings("unchecked")
+    private void setDeployPhase(AppDeployment deployment, String phase) {
+        Map<String, Object> state = deployment.getServicesState();
+        if (state == null) {
+            state = new LinkedHashMap<>();
+        }
+        state.put("deployPhase", phase);
+        deployment.setServicesState(state);
+        transactionTemplate.executeWithoutResult(s -> deploymentRepository.save(deployment));
+    }
+
+    /**
+     * Liste ordonnée des étapes de déploiement (namespace → BD → vague N → ingress), chacune avec
+     * son statut (pending/running/done/failed) et — pour les vagues — les services concernés.
+     * Complète {@code deployPhase} (texte fin, une phrase à la fois) par une checklist stable que
+     * la page pipeline peut afficher sans avoir à parser du texte (audit-deploiement.md, retour
+     * utilisateur du 17 août 2026 : « liste les services qui vont être faits un après l'autre »).
+     */
+    @SuppressWarnings("unchecked")
+    private void initDeploySteps(AppDeployment deployment, boolean includeDatabases,
+                                  List<ServiceWaveManifest> waves, boolean includeIngress) {
+        List<Map<String, Object>> steps = new ArrayList<>();
+        steps.add(deployStepOf("namespace", "Namespace", null));
+        if (includeDatabases) {
+            steps.add(deployStepOf("databases", "Bases de données", null));
+        }
+        for (int i = 0; i < waves.size(); i++) {
+            int waveNo = i + 1;
+            steps.add(deployStepOf("wave-" + waveNo, "Vague " + waveNo + "/" + waves.size(),
+                    waves.get(i).deploymentNames()));
+        }
+        if (includeIngress) {
+            steps.add(deployStepOf("ingress", "Ingress (URL publique)", null));
+        }
+        if (!steps.isEmpty()) {
+            steps.get(0).put("status", "running");
+        }
+        Map<String, Object> state = deployment.getServicesState();
+        if (state == null) {
+            state = new LinkedHashMap<>();
+        }
+        state.put("deploySteps", steps);
+        deployment.setServicesState(state);
+        transactionTemplate.executeWithoutResult(s -> deploymentRepository.save(deployment));
+    }
+
+    private Map<String, Object> deployStepOf(String key, String label, List<String> services) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("key", key);
+        m.put("label", label);
+        if (services != null && !services.isEmpty()) {
+            m.put("services", services);
+        }
+        m.put("status", "pending");
+        return m;
+    }
+
+    /** Marque une étape "done" et promeut la suivante en "running". */
+    @SuppressWarnings("unchecked")
+    private void advanceDeployStep(AppDeployment deployment, String completedKey) {
+        Map<String, Object> state = deployment.getServicesState();
+        if (state == null || !(state.get("deploySteps") instanceof List<?> rawList)) {
+            return;
+        }
+        boolean justCompleted = false;
+        for (Object o : rawList) {
+            if (!(o instanceof Map<?, ?> mRaw)) continue;
+            Map<String, Object> m = (Map<String, Object>) mRaw;
+            if (completedKey.equals(m.get("key"))) {
+                m.put("status", "done");
+                justCompleted = true;
+            } else if (justCompleted && "pending".equals(m.get("status"))) {
+                m.put("status", "running");
+                justCompleted = false;
+            }
+        }
+        deployment.setServicesState(state);
+        transactionTemplate.executeWithoutResult(s -> deploymentRepository.save(deployment));
+    }
+
+    /** En cas d'erreur : marque l'étape en cours (running, ou 1ère pending à défaut) "failed". */
+    @SuppressWarnings("unchecked")
+    private void markCurrentDeployStepFailed(AppDeployment deployment) {
+        Map<String, Object> state = deployment.getServicesState();
+        if (state == null || !(state.get("deploySteps") instanceof List<?> rawList)) {
+            return;
+        }
+        Map<String, Object> target = null;
+        for (Object o : rawList) {
+            if (!(o instanceof Map<?, ?> mRaw)) continue;
+            Map<String, Object> m = (Map<String, Object>) mRaw;
+            if ("running".equals(m.get("status"))) {
+                target = m;
+                break;
+            }
+            if (target == null && "pending".equals(m.get("status"))) {
+                target = m;
+            }
+        }
+        if (target == null) {
+            return;
+        }
+        target.put("status", "failed");
+        deployment.setServicesState(state);
+        transactionTemplate.executeWithoutResult(s -> deploymentRepository.save(deployment));
     }
 
     private UUID resolveEnvironmentId(CiDeployRequest request, AppDeployment deployment) {
@@ -1212,7 +1568,22 @@ public class AppDeploymentService {
             Map<String, String> resolvedImages,
             ManagedApplication app
     ) {
-        String customHost = app != null ? normalizeCustomHostname(app.getCustomHostname()) : null;
+        // Résout la branche depuis le déploiement déjà persisté (sync/rebuild/reapply sur un
+        // déploiement EXISTANT) — indisponible pour un tout nouveau deploy() dont l'environnement
+        // n'existe pas encore à cet instant, cf. l'overload avec branche explicite ci-dessous.
+        return buildManifestOptions(deploymentId, ttlHours, resolvedImages, app,
+                resolveDeploymentBranch(deploymentId));
+    }
+
+    /** Variante avec branche explicite — utilisée par {@code deploy()} avant que l'environnement existe. */
+    private AppK8sManifestService.ManifestOptions buildManifestOptions(
+            UUID deploymentId,
+            Integer ttlHours,
+            Map<String, String> resolvedImages,
+            ManagedApplication app,
+            String branch
+    ) {
+        String customHost = effectiveCustomHostname(app, branch);
         return AppK8sManifestService.ManifestOptions.builder()
                 .registryServer(registryServer)
                 .registryUsername(registryUsername)
@@ -1230,7 +1601,89 @@ public class AppDeploymentService {
                 .resourceQuotaEnabled(namespaceResourceQuotaEnabled)
                 .namespaceCpuQuota(namespaceCpuQuota)
                 .namespaceMemoryQuota(namespaceMemoryQuota)
+                .networkPolicyEnabled(networkPolicyEnabled)
+                .networkPolicyIngressNamespace(networkPolicyIngressNamespace)
                 .build();
+    }
+
+    /**
+     * Hostname personnalisé effectif d'une app : celui tapé explicitement s'il existe (validé,
+     * lève une erreur si invalide, jamais suffixé par la branche — l'utilisateur l'a choisi
+     * volontairement), sinon <slug>.<custom-base-domain> généré automatiquement si ce domaine de
+     * base est configuré, sinon {@code null} (fallback nip.io inchangé).
+     *
+     * <p>Le hostname auto-généré est suffixé par la branche quand elle diffère de la branche de
+     * référence de l'app (celle du premier service) — deux déploiements RUNNING de branches
+     * différentes de la même app obtiennent ainsi deux URLs distinctes au lieu d'entrer en
+     * collision sur <slug>.<domaine> (bug réel constaté le 18 août 2026 : deux environnements
+     * RUNNING simultanés, un seul Ingress "gagne" côté Traefik de façon non déterministe, l'autre
+     * tourne en double pour rien sans jamais être joignable de façon fiable).</p>
+     */
+    private String effectiveCustomHostname(ManagedApplication app, String branch) {
+        if (app == null) {
+            return null;
+        }
+        String raw = app.getCustomHostname();
+        if (raw != null && !raw.isBlank()) {
+            return normalizeCustomHostname(raw);
+        }
+        if (customBaseDomain != null && !customBaseDomain.isBlank()
+                && app.getSlug() != null && !app.getSlug().isBlank()) {
+            String slug = AppNaming.k8sName(app.getSlug());
+            String suffix = branchSuffix(app, branch);
+            return slug + suffix + "." + customBaseDomain.trim().toLowerCase();
+        }
+        return null;
+    }
+
+    /** Compat : sans branche connue → pas de suffixe (comportement historique). */
+    private String effectiveCustomHostname(ManagedApplication app) {
+        return effectiveCustomHostname(app, null);
+    }
+
+    /** Variante non bloquante de {@link #effectiveCustomHostname} — jamais d'exception. */
+    private String effectiveCustomHostnameSafe(ManagedApplication app) {
+        return effectiveCustomHostnameSafe(app, null);
+    }
+
+    private String effectiveCustomHostnameSafe(ManagedApplication app, String branch) {
+        try {
+            return effectiveCustomHostname(app, branch);
+        } catch (AppValidationException e) {
+            return null;
+        }
+    }
+
+    /**
+     * "-" + slug DNS-safe de la branche, vide si {@code branch} est vide/inconnue ou correspond
+     * à la branche de référence de l'app (premier service — même logique de fallback que
+     * {@code ManagedDeployOptions.resolveBranch}). Ne lève jamais.
+     */
+    private String branchSuffix(ManagedApplication app, String branch) {
+        if (branch == null || branch.isBlank()) {
+            return "";
+        }
+        String reference = app.getServices() != null ? app.getServices().stream()
+                .findFirst()
+                .map(AppService::getGitBranch)
+                .orElse(null) : null;
+        if (reference != null && reference.equalsIgnoreCase(branch.trim())) {
+            return "";
+        }
+        String slug = branchSlug(branch);
+        return slug.isEmpty() ? "" : "-" + slug;
+    }
+
+    /** DNS-label-safe : minuscules, non-alphanumérique → "-", tronqué à 20 caractères. */
+    private static String branchSlug(String branch) {
+        String s = branch.trim().toLowerCase().replaceAll("[^a-z0-9]+", "-")
+                .replaceAll("^-+|-+$", "");
+        return s.length() > 20 ? s.substring(0, 20) : s;
+    }
+
+    /** Comparaison prudente : jamais "égales" si l'une des deux branches est inconnue (null). */
+    private static boolean sameBranch(String a, String b) {
+        return a != null && b != null && a.trim().equalsIgnoreCase(b.trim());
     }
 
     static String normalizeCustomHostname(String raw) {
@@ -1255,20 +1708,49 @@ public class AppDeploymentService {
         return h;
     }
 
-    private String applicationPublicBase(String namespace, ManagedApplication app) {
-        String custom = app != null ? normalizeCustomHostnameSafe(app.getCustomHostname()) : null;
-        if (custom != null) {
-            return "http://" + custom;
-        }
-        return "http://app-" + namespace + "." + ingressDomain;
-    }
-
-    private static String normalizeCustomHostnameSafe(String raw) {
-        try {
-            return normalizeCustomHostname(raw);
-        } catch (AppValidationException e) {
+    /**
+     * Branche connue d'un déploiement déjà persisté (via son EphemeralEnvironment) — pour que les
+     * flux qui réappliquent l'Ingress d'un déploiement EXISTANT (sync service, rebuild, TTL…)
+     * régénèrent le MÊME hostname que celui utilisé au déploiement initial, plutôt que de revenir
+     * silencieusement à l'URL sans suffixe. Best-effort : {@code null} si indisponible.
+     */
+    private String resolveDeploymentBranch(UUID deploymentId) {
+        if (deploymentId == null) {
             return null;
         }
+        try {
+            return deploymentRepository.findById(deploymentId)
+                    .map(AppDeployment::getEphemeralEnvironmentId)
+                    .flatMap(environmentRepository::findById)
+                    .map(EphemeralEnvironment::getGitBranch)
+                    .orElse(null);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Même chose que {@link #resolveDeploymentBranch(UUID)}, à partir du namespace. */
+    private String resolveBranchByNamespace(String namespace) {
+        if (namespace == null || namespace.isBlank()) {
+            return null;
+        }
+        try {
+            return deploymentRepository.findByNamespace(namespace)
+                    .map(AppDeployment::getEphemeralEnvironmentId)
+                    .flatMap(environmentRepository::findById)
+                    .map(EphemeralEnvironment::getGitBranch)
+                    .orElse(null);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private String applicationPublicBase(String namespace, ManagedApplication app) {
+        String custom = effectiveCustomHostnameSafe(app, resolveBranchByNamespace(namespace));
+        if (custom != null) {
+            return customHostnameScheme.trim().toLowerCase() + "://" + custom;
+        }
+        return "http://app-" + namespace + "." + ingressDomain;
     }
 
     private ManagedApplication buildShadowForDeployment(AppDeployment deployment, ManagedApplication realApp) {
@@ -1476,7 +1958,7 @@ public class AppDeploymentService {
                     return primaryUrl;
                 }
             }
-            if (pathBasedRouting || normalizeCustomHostnameSafe(shadow.getCustomHostname()) != null) {
+            if (pathBasedRouting || effectiveCustomHostnameSafe(shadow) != null) {
                 return applicationPublicBase(deployment.getNamespace(), shadow);
             }
         }
@@ -1504,15 +1986,15 @@ public class AppDeploymentService {
             if (firstAny != null) return firstAny;
         }
         if (nipPreviewEnabled && nipMasterIp != null && !nipMasterIp.isBlank()
-                && normalizeCustomHostnameSafe(shadow.getCustomHostname()) == null) {
+                && effectiveCustomHostnameSafe(shadow) == null) {
             String scheme = nipScheme != null && !nipScheme.isBlank() ? nipScheme.trim().toLowerCase() : "http";
             String id = deployment.getId().toString().toLowerCase();
             return scheme + "://app-" + id + "." + nipMasterIp.trim() + ".nip.io";
         }
         if (!shadow.getServices().isEmpty() && ingressEnabled) {
-            String custom = normalizeCustomHostnameSafe(shadow.getCustomHostname());
+            String custom = effectiveCustomHostnameSafe(shadow, resolveDeploymentBranch(deployment.getId()));
             if (custom != null) {
-                return "http://" + custom;
+                return customHostnameScheme.trim().toLowerCase() + "://" + custom;
             }
             AppService svc = findPrimaryExposed(shadow);
             if (svc == null) {
@@ -1528,7 +2010,7 @@ public class AppDeploymentService {
         if (!ingressEnabled || !isExternallyExposedService(svc)) {
             return null;
         }
-        boolean usePath = pathBasedRouting || normalizeCustomHostnameSafe(app != null ? app.getCustomHostname() : null) != null;
+        boolean usePath = pathBasedRouting || effectiveCustomHostnameSafe(app, resolveBranchByNamespace(namespace)) != null;
         if (usePath) {
             String base = applicationPublicBase(namespace, app);
             AppService primary = findPrimaryExposed(app);
@@ -1785,10 +2267,41 @@ public class AppDeploymentService {
             Long gitlabPipelineId,
             String branch
     ) {
+        linkDeployPipelineExecution(service, env, gitlabPipelineId, branch, true);
+    }
+
+    /**
+     * @param setAsEnvironmentPrimary Ne positionner {@code env.setPipelineExecution(execution)}
+     *                                (référence singulière) QUE pour un seul service par
+     *                                environnement -- le 1er/représentant, appelé avec {@code true}
+     *                                par les 3 call sites historiques (déploiement mono-service :
+     *                                deploySingleService/rebuildServiceInPlace, ou le "service
+     *                                représentant" du déploiement app entière). Les AUTRES services
+     *                                d'un déploiement multi-services (boucle ajoutée dans
+     *                                {@code deploy()}) passent {@code false} : ils doivent quand
+     *                                même avoir LEUR PROPRE PipelineExecution (sinon leur page
+     *                                Quality Gate / Post-déploiement ne voit jamais ce déploiement
+     *                                -- bug réel constaté le 28 août 2026, "back" ne recevait
+     *                                jamais de PipelineExecution DEPLOY lors d'un déploiement de
+     *                                toute l'app, seul le 1er service de la liste en recevait un),
+     *                                mais sans écraser la référence singulière du 1er service.
+     */
+    private void linkDeployPipelineExecution(
+            AppService service,
+            EphemeralEnvironment env,
+            Long gitlabPipelineId,
+            String branch,
+            boolean setAsEnvironmentPrimary
+    ) {
         if (service == null || env == null || gitlabPipelineId == null) {
             return;
         }
-        if (pipelineExecutionRepository.findByGitlabPipelineId(gitlabPipelineId).isPresent()) {
+        // Scopé par service ET pipeline -- pas seulement par pipeline (bug historique : un
+        // déploiement multi-services partage un seul gitlabPipelineId pour tous les services,
+        // donc un simple findByGitlabPipelineId() faisait croire qu'"une" exécution existait déjà
+        // dès que le 1er service de la boucle avait créé la sienne, empêchant les autres services
+        // d'obtenir la leur).
+        if (pipelineExecutionRepository.findByGitlabPipelineIdAndApplicationId(gitlabPipelineId, service.getId()).isPresent()) {
             return;
         }
         PipelineExecution execution = new PipelineExecution();
@@ -1798,8 +2311,19 @@ public class AppDeploymentService {
         execution.setGitBranch(branch != null && !branch.isBlank() ? branch : env.getGitBranch());
         execution.setStatus(PipelineStatus.fromGitLabStatus("running"));
         execution.setStartedAt(LocalDateTime.now());
-        execution.setEnvironment(env);
-        env.setPipelineExecution(execution);
+        // PipelineExecution.environment est un @OneToOne (unique=true côté DB, contrainte
+        // uk4o1klj2ky574ep8utyh6y2fvl) -- un seul PipelineExecution peut référencer un environment_id
+        // donné. Bug constaté le 30/08/2026 : execution.setEnvironment(env) était posé
+        // INCONDITIONNELLEMENT ici, alors que seul env.setPipelineExecution(execution) ci-dessous
+        // était protégé par setAsEnvironmentPrimary -- dès le 2e service de la boucle
+        // (setAsEnvironmentPrimary=false), l'insert violait la contrainte unique et faisait échouer
+        // tout le déploiement multi-services. Les deux doivent être protégés ensemble : les services
+        // non-représentants restent trouvables via findByGitlabPipelineIdAndApplicationId()
+        // (scopé service+pipeline, pas environment_id) -- inchangé, voir garde ligne ~2390.
+        if (setAsEnvironmentPrimary) {
+            execution.setEnvironment(env);
+            env.setPipelineExecution(execution);
+        }
         pipelineExecutionRepository.save(execution);
         environmentRepository.save(env);
         log.info("Deploy enregistré — env={} pipeline_exec gitlab=#{} service={}",
@@ -1892,6 +2416,7 @@ public class AppDeploymentService {
 
         Map<String, String> variables = new LinkedHashMap<>();
         variables.put("ACTION", "deploy");
+        variables.put("DD_IMPORT_ENABLED", "true"); // voir commentaire au 1er site d'appel
         variables.put("APP_ID", realApp.getId().toString());
         variables.put("APP_SLUG", realApp.getSlug());
         variables.put("SERVICE_ID", target.getId().toString());
@@ -2225,6 +2750,11 @@ public class AppDeploymentService {
                 restarted.add(k8sName);
                 log.info("Runtime sync OK — ns={} service={} replicas={} (ingress inclus)",
                         deployment.getNamespace(), k8sName, replicas);
+                try {
+                    deploymentRuntimeAlertService.recordSyncRuntime(realApp, deployment, target.getName());
+                } catch (Exception traceEx) {
+                    log.debug("Traçabilité sync runtime non enregistrée: {}", traceEx.getMessage());
+                }
             } catch (Exception e) {
                 throw new AppValidationException(
                         "Échec sync runtime sur " + deployment.getNamespace() + " : " + e.getMessage());
@@ -2322,7 +2852,7 @@ public class AppDeploymentService {
             }
         }
 
-        String host = normalizeCustomHostnameSafe(realApp.getCustomHostname());
+        String host = effectiveCustomHostnameSafe(realApp);
         return RuntimeSyncResponse.builder()
                 .synced(!namespaces.isEmpty())
                 .namespaces(namespaces)

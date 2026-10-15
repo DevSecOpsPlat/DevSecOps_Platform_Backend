@@ -1018,16 +1018,26 @@ public class GitLabService {
         return buildSonarUri(apiPath, params);
     }
 
+    /**
+     * ATTENTION : {@code metricKeys} est envoyé en un seul appel combiné (voir son usage plus bas).
+     * Si SonarQube rejette ne serait-ce qu'une seule clé de cette liste (HTTP 400 "metric key not
+     * found"), TOUT l'appel échoue et TOUTES les métriques sont perdues -- pas seulement la clé en
+     * cause. Vérifié le 2026-08-28 sur SonarQube 26.7.0 (api/server/version) : les clés à détail par
+     * sévérité pour les dimensions "software quality" (MQR) -- {@code software_quality_*_high_issues},
+     * {@code *_medium_issues}, {@code *_low_issues} -- ainsi que {@code software_quality_high_severity_issues}
+     * / {@code _medium_severity_issues} / {@code _low_severity_issues} n'existent PAS sur cette version
+     * (confirmé via GET /api/measures/component, réponse "metric keys are not found"), et faisaient donc
+     * échouer silencieusement la récupération de TOUTES les métriques Sonar (notes, comptages...) à
+     * chaque appel. Seuls les comptages globaux par dimension ({@code software_quality_*_issues}, sans
+     * détail par sévérité) existent réellement -- conservés ci-dessous. Avant de réintroduire une clé
+     * retirée ici, la vérifier d'abord avec un appel GET /api/measures/component isolé.
+     */
     private static final String SONAR_MEASURE_KEYS =
             "bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density,ncloc,security_hotspots,"
                     + "security_rating,reliability_rating,sqale_rating,"
                     + "blocker_violations,critical_violations,major_violations,minor_violations,info_violations,"
                     + "software_quality_security_issues,software_quality_reliability_issues,software_quality_maintainability_issues,"
-                    + "software_quality_security_rating,software_quality_reliability_rating,software_quality_maintainability_rating,"
-                    + "software_quality_high_severity_issues,software_quality_medium_severity_issues,software_quality_low_severity_issues,"
-                    + "software_quality_security_high_issues,software_quality_security_medium_issues,software_quality_security_low_issues,"
-                    + "software_quality_reliability_high_issues,software_quality_reliability_medium_issues,software_quality_reliability_low_issues,"
-                    + "software_quality_maintainability_high_issues,software_quality_maintainability_medium_issues,software_quality_maintainability_low_issues";
+                    + "software_quality_security_rating,software_quality_reliability_rating,software_quality_maintainability_rating";
 
     private HttpEntity<String> sonarAuthEntity() {
         HttpHeaders headers = sonarAuthHeaders();
@@ -2814,6 +2824,22 @@ public class GitLabService {
         } catch (GitLabApiException e) {
             log.error("❌ Erreur retry job {}: {}", jobId, e.getMessage());
             throw new RuntimeException("Impossible de relancer le job", e);
+        }
+    }
+
+    /**
+     * Annule un job GitLab en cours (running/pending) — utilisé pour « stopper un stage »
+     * sans annuler tout le pipeline (audit-deploiement.md, retour utilisateur du 17 août 2026).
+     *
+     * @param jobId ID du job
+     */
+    public void cancelJob(Long jobId) {
+        try {
+            log.info("🛑 Annulation job {}", jobId);
+            gitLabApi.getJobApi().cancelJob(gitlabProjectId, jobId);
+        } catch (GitLabApiException e) {
+            log.error("❌ Erreur annulation job {}: {}", jobId, e.getMessage());
+            throw new RuntimeException("Impossible d'annuler le job", e);
         }
     }
 

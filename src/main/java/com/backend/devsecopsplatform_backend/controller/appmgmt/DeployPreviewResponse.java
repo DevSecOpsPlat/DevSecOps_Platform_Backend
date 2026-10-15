@@ -31,4 +31,18 @@ public class DeployPreviewResponse {
     private int selectedDatabaseCount;
     @Builder.Default
     private List<UUID> resolvedServiceIds = new ArrayList<>();
+
+    /** Empreinte ressources demandée (services sélectionnés) vs quota namespace — audit Déploiement, quick win #3. */
+    private boolean quotaEnabled;
+    private int requestedCpuMillicores;
+    private long requestedMemoryBytes;
+    private int quotaCpuMillicores;
+    private long quotaMemoryBytes;
+
+    /** Capacité réelle du nœud K8s (allocatable - déjà utilisé par tous les namespaces). */
+    private boolean nodeCapacityEnabled;
+    private int nodeAvailableCpuMillicores;
+    private int nodeAllocatableCpuMillicores;
+    private long nodeAvailableMemoryBytes;
+    private long nodeAllocatableMemoryBytes;
 }

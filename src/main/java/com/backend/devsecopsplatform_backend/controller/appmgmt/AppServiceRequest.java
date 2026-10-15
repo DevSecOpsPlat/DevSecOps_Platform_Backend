@@ -68,5 +68,11 @@ public class AppServiceRequest {
     private String memoryRequest;
     private String memoryLimit;
 
+    /**
+     * Durcissement conteneur optionnel (runAsNonRoot + readOnlyRootFilesystem) — désactivé par
+     * défaut, à activer volontairement après avoir vérifié que l'image le supporte.
+     */
+    private boolean hardenedSecurityContext = false;
+
     private List<EnvVarRequest> envVars = new ArrayList<>();
 }

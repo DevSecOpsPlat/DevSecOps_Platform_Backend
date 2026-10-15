@@ -1,12 +1,22 @@
 package com.backend.devsecopsplatform_backend.controller.ai;
 
+import com.backend.devsecopsplatform_backend.service.AiAnalysisService;
 import lombok.Data;
+
+import java.util.List;
 
 /**
  * Assistant pipeline : question libre + contexte (projet, URLs, stages, logs optionnels).
  */
 @Data
 public class ExplainPipelineLogsRequest {
+
+    /**
+     * Historique de la conversation en cours (tours précédents, sans le dernier message —
+     * celui-ci reste dans {@code userQuestion}) — pour un vrai fil de discussion plutôt qu'une
+     * question isolée à chaque fois (retour utilisateur du 17 août 2026).
+     */
+    private List<AiAnalysisService.ChatTurn> history;
 
     /**
      * Logs du job sélectionné (optionnel — utile pour debug, pas obligatoire

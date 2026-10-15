@@ -216,6 +216,9 @@ public class ScanBatchAggregationService {
                 || gate.containsKey("critical") || gate.containsKey("high")
                 || (gate.get("summary") instanceof Map<?, ?>);
 
+        boolean dastApplicable = Boolean.TRUE.equals(gate.get("dastApplicable"));
+        boolean dastEvaluable = Boolean.TRUE.equals(gate.get("dastEvaluable"));
+
         return HardGateInput.builder()
                 .secrets(secrets)
                 .secretsEvaluable(secretsPresent)
@@ -225,6 +228,11 @@ public class ScanBatchAggregationService {
                 .sonarQgStatus(qg)
                 .defectDojoAvailable(ddAvailable)
                 .sonarAvailable(sonarAvailable)
+                .dastApplicable(dastApplicable)
+                .dastEvaluable(dastEvaluable)
+                .dastCritical(intVal(gate, "dastCritical"))
+                .dastHigh(intVal(gate, "dastHigh"))
+                .dastMedium(intVal(gate, "dastMedium"))
                 .build();
     }
 

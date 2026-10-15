@@ -5,6 +5,7 @@ import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDatabase;
 import com.backend.devsecopsplatform_backend.entity.AppService;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.AppServiceRole;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.ManagedApplication;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
@@ -24,6 +25,16 @@ import java.util.stream.Collectors;
  */
 @Service
 public class AppDeploymentValidationService {
+
+    // Mêmes clés de config que AppDeploymentService — quota namespace appliqué au déploiement.
+    @Value("${deployment.namespace.resource-quota.enabled:true}")
+    private boolean namespaceResourceQuotaEnabled;
+
+    @Value("${deployment.namespace.cpu-quota:4}")
+    private String namespaceCpuQuota;
+
+    @Value("${deployment.namespace.memory-quota:8Gi}")
+    private String namespaceMemoryQuota;
 
     /**
      * Valide l'application et renvoie la liste des avertissements non bloquants.
@@ -117,21 +128,11 @@ public class AppDeploymentValidationService {
             }
         }
 
-        // Infos toujours utiles
+        // Isolation namespace, TTL et ordre de démarrage : redondants avec le formulaire (TTL déjà
+        // saisi) et le panneau pipeline (progression détaillée, cf. deployPhase structuré) — retirés
+        // de la preview modale suite retour utilisateur (jugés inutiles ici, 17 août 2026).
         int ttl = Math.max(1, Math.min(ttlHours, 72));
-        infos.add("Isolation garantie : cet environnement est isolé des autres déploiements via un namespace dédié.");
-        infos.add("Expiration programmée : l'environnement sera détruit automatiquement après "
-                + ttl + " h (notification avant expiration si configurée).");
-        if (!databases.isEmpty()) {
-            String dbNames = databases.stream()
-                    .map(AppDatabase::getName)
-                    .filter(n -> n != null && !n.isBlank())
-                    .collect(Collectors.joining(", "));
-            infos.add("Ordre de démarrage : base(s) d'abord ("
-                    + (dbNames.isBlank() ? databases.size() + " BD" : dbNames)
-                    + "), puis les services. Attente Ready des pods BD (probes du moteur). "
-                    + "Le healthCheckPath des services applicatifs reste optionnel.");
-        } else if (services.stream().anyMatch(s -> s.getRole() == AppServiceRole.BACKEND
+        if (databases.isEmpty() && services.stream().anyMatch(s -> s.getRole() == AppServiceRole.BACKEND
                 || s.getRole() == AppServiceRole.WORKER)) {
             infos.add("Aucune base dans cette sélection — les services démarreront sans dépendance stockage.");
         }
@@ -145,6 +146,35 @@ public class AppDeploymentValidationService {
                 .map(AppService::getId)
                 .collect(Collectors.toList());
 
+        // Empreinte ressources demandée vs quota namespace — évite de confirmer un déploiement
+        // qui dépassera immédiatement le ResourceQuota (cf. audit-deploiement.md, quick win #3).
+        // Multiplié par replicas : un pod ne demande pas les ressources du Deployment, il en
+        // demande N fois plus si N replicas — un service à 3 replicas × 3 cores demande 9 cores,
+        // pas 3 (bug réel découvert le 18 août 2026 : le test utilisateur avait 3 replicas sur un
+        // nœud à 2 cores au total, largement sous-estimé par ce calcul avant correction).
+        double requestedCpuCores = services.stream()
+                .mapToDouble(s -> K8sManifestApplyService.parseCpuToCores(s.getCpuRequest())
+                        * replicasOrOne(s.getReplicas()))
+                .sum();
+        long requestedMemoryBytes = services.stream()
+                .mapToLong(s -> K8sManifestApplyService.parseMemoryToBytes(s.getMemoryRequest())
+                        * replicasOrOne(s.getReplicas()))
+                .sum();
+        double quotaCpuCores = namespaceResourceQuotaEnabled
+                ? K8sManifestApplyService.parseCpuToCores(namespaceCpuQuota) : 0;
+        long quotaMemoryBytes = namespaceResourceQuotaEnabled
+                ? K8sManifestApplyService.parseMemoryToBytes(namespaceMemoryQuota) : 0;
+        if (namespaceResourceQuotaEnabled && quotaCpuCores > 0 && requestedCpuCores > quotaCpuCores) {
+            warnings.add("Requests CPU demandées (" + formatCores(requestedCpuCores)
+                    + ") supérieures au quota namespace (" + formatCores(quotaCpuCores)
+                    + ") — le déploiement risque un FailedCreate faute de capacité.");
+        }
+        if (namespaceResourceQuotaEnabled && quotaMemoryBytes > 0 && requestedMemoryBytes > quotaMemoryBytes) {
+            warnings.add("Requests mémoire demandées (" + formatMi(requestedMemoryBytes)
+                    + ") supérieures au quota namespace (" + formatMi(quotaMemoryBytes)
+                    + ") — le déploiement risque un FailedCreate faute de capacité.");
+        }
+
         return DeployPreviewResponse.builder()
                 .infos(infos)
                 .warnings(warnings)
@@ -154,7 +184,31 @@ public class AppDeploymentValidationService {
                 .selectedServiceCount(services.size())
                 .selectedDatabaseCount(databases.size())
                 .resolvedServiceIds(resolvedIds)
+                .quotaEnabled(namespaceResourceQuotaEnabled)
+                .requestedCpuMillicores((int) Math.round(requestedCpuCores * 1000))
+                .requestedMemoryBytes(requestedMemoryBytes)
+                .quotaCpuMillicores((int) Math.round(quotaCpuCores * 1000))
+                .quotaMemoryBytes(quotaMemoryBytes)
                 .build();
+    }
+
+    private static int replicasOrOne(Integer replicas) {
+        return replicas != null && replicas > 0 ? replicas : 1;
+    }
+
+    private static String formatCores(double cores) {
+        if (cores < 1) {
+            return Math.round(cores * 1000) + "m";
+        }
+        return (Math.round(cores * 100) / 100.0) + " cores";
+    }
+
+    private static String formatMi(long bytes) {
+        double gi = bytes / (1024.0 * 1024.0 * 1024.0);
+        if (gi >= 1) {
+            return (Math.round(gi * 100) / 100.0) + "Gi";
+        }
+        return Math.round(bytes / (1024.0 * 1024.0)) + "Mi";
     }
 
     /**

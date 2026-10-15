@@ -16,4 +16,14 @@ public class HardGateInput {
     /** false tant que le job Gitleaks/secrets n'a pas terminé (success ou failed). */
     @Builder.Default
     private boolean secretsEvaluable = false;
+
+    /** DAST ne s'applique qu'aux pipelines de déploiement -- jamais en scan-only (ZAP n'y tourne pas). */
+    @Builder.Default
+    private boolean dastApplicable = false;
+    /** false tant que le job ZAP n'a pas terminé avec succès (déploiement en cours). */
+    @Builder.Default
+    private boolean dastEvaluable = false;
+    private int dastCritical;
+    private int dastHigh;
+    private int dastMedium;
 }
