@@ -20,14 +20,16 @@ import com.backend.devsecopsplatform_backend.repository.ManagedApplicationReposi
 import com.backend.devsecopsplatform_backend.repository.ServiceEnvVarRepository;
 import com.backend.devsecopsplatform_backend.repository.UserRepository;
 import com.backend.devsecopsplatform_backend.service.GitLabService;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Instant;
 import java.time.LocalDateTime;
@@ -48,10 +50,11 @@ import java.util.stream.Collectors;
  */
 @Service
 @Slf4j
-@RequiredArgsConstructor
 public class ApplicationManagementService {
 
     private static final String MASK = AppConnectionUrlService.MASK;
+    /** Limite les sondes health pour ne pas saturer le pool HTTP/DB si tous les chemins échouent. */
+    private static final int MAX_HEALTH_PROBE_PATHS = 5;
 
     private final ManagedApplicationRepository appRepository;
     private final AppServiceRepository serviceRepository;
@@ -62,15 +65,54 @@ public class ApplicationManagementService {
     private final UserRepository userRepository;
     private final AppConnectionUrlService connectionUrlService;
     private final AppDeploymentService deploymentService;
+    private final AppDeploymentValidationService deploymentValidationService;
     private final ImageTagAvailabilityService imageTagAvailability;
     private final K8sManifestApplyService k8sManifestApplyService;
     private final GitLabService gitLabService;
     private final DeploymentRuntimeAlertService deploymentRuntimeAlertService;
     private final DeploymentMetricsSamplerService deploymentMetricsSamplerService;
+    private final TransactionTemplate readOnlyTx;
 
     /** IP Traefik / master — sonde health des domaines custom via Host header. */
     @Value("${deployment.preview.nip.master-ip:192.168.92.10}")
     private String ingressProbeIp;
+
+    public ApplicationManagementService(
+            ManagedApplicationRepository appRepository,
+            AppServiceRepository serviceRepository,
+            AppDatabaseRepository databaseRepository,
+            ServiceEnvVarRepository envVarRepository,
+            AppDeploymentRepository deploymentRepository,
+            EphemeralEnvironmentRepository environmentRepository,
+            UserRepository userRepository,
+            AppConnectionUrlService connectionUrlService,
+            AppDeploymentService deploymentService,
+            AppDeploymentValidationService deploymentValidationService,
+            ImageTagAvailabilityService imageTagAvailability,
+            K8sManifestApplyService k8sManifestApplyService,
+            GitLabService gitLabService,
+            @Lazy DeploymentRuntimeAlertService deploymentRuntimeAlertService,
+            DeploymentMetricsSamplerService deploymentMetricsSamplerService,
+            PlatformTransactionManager transactionManager
+    ) {
+        this.appRepository = appRepository;
+        this.serviceRepository = serviceRepository;
+        this.databaseRepository = databaseRepository;
+        this.envVarRepository = envVarRepository;
+        this.deploymentRepository = deploymentRepository;
+        this.environmentRepository = environmentRepository;
+        this.userRepository = userRepository;
+        this.connectionUrlService = connectionUrlService;
+        this.deploymentService = deploymentService;
+        this.deploymentValidationService = deploymentValidationService;
+        this.imageTagAvailability = imageTagAvailability;
+        this.k8sManifestApplyService = k8sManifestApplyService;
+        this.gitLabService = gitLabService;
+        this.deploymentRuntimeAlertService = deploymentRuntimeAlertService;
+        this.deploymentMetricsSamplerService = deploymentMetricsSamplerService;
+        this.readOnlyTx = new TransactionTemplate(transactionManager);
+        this.readOnlyTx.setReadOnly(true);
+    }
 
     // =====================================================================
     // Applications
@@ -225,6 +267,7 @@ public class ApplicationManagementService {
         svc.setCpuLimit(orDefault(request.getCpuLimit(), "500m"));
         svc.setMemoryRequest(orDefault(request.getMemoryRequest(), "128Mi"));
         svc.setMemoryLimit(orDefault(request.getMemoryLimit(), "512Mi"));
+        svc.setHardenedSecurityContext(request.isHardenedSecurityContext());
     }
 
     private void validateServiceRequest(ManagedApplication app, AppServiceRequest request, UUID selfId) {
@@ -674,11 +717,255 @@ public class ApplicationManagementService {
         return mapDeployment(deployment, app);
     }
 
+    /**
+     * Aperçu infos / warnings avant déploiement (sélection de services + TTL).
+     */
+    @Transactional(readOnly = true)
+    public DeployPreviewResponse previewDeploy(UUID appId, ManagedDeployRequest request) {
+        ManagedApplication app = loadOwnedApp(appId);
+        ManagedDeployOptions options = ManagedDeployOptions.from(request);
+        ManagedApplication target = options.hasServiceFilter()
+                ? deploymentValidationService.buildShadow(app, options.serviceIdsOrEmpty())
+                : app;
+        DeployPreviewResponse preview = deploymentValidationService.preview(target, options.ttlHours());
+        boolean isRedeploy = deploymentRepository.findByApplication_IdOrderByCreatedAtDesc(appId).stream()
+                .anyMatch(d -> d.getStatus() == AppDeploymentStatus.RUNNING);
+        enrichWithClusterCapacity(preview, isRedeploy);
+        return preview;
+    }
+
+    /**
+     * Complète l'aperçu avec la capacité réelle du nœud K8s (allocatable - déjà utilisé par
+     * TOUS les namespaces) — distinct du quota namespace, qui à lui seul peut donner un faux
+     * sentiment de sécurité si la machine physique est déjà chargée par d'autres environnements.
+     * Best-effort : n'empêche jamais l'aperçu de répondre si le cluster est indisponible.
+     *
+     * @param isRedeploy true si l'application a déjà un déploiement RUNNING — dans ce cas ce
+     *                    clic sur « Déployer » déclenche une mise à jour (rolling update) et pas
+     *                    une création : ancien et nouveau pod coexistent brièvement, doublant la
+     *                    consommation avant que l'ancien ne soit retiré (confirmé en direct le 17
+     *                    août 2026, audit-deploiement.md §8) — précisé dans le message pour éviter
+     *                    de faire croire que « insuffisant » veut dire « restera bloqué durablement ».
+     */
+    private void enrichWithClusterCapacity(DeployPreviewResponse preview, boolean isRedeploy) {
+        if (!k8sManifestApplyService.isConfigured()) {
+            return;
+        }
+        try {
+            Map<String, Object> cap = k8sManifestApplyService.getClusterCapacity();
+            if (!Boolean.TRUE.equals(cap.get("enabled"))) {
+                return;
+            }
+            // maxAvailable* (le MEILLEUR nœud), pas la somme de tous les nœuds : un pod ne peut
+            // être planifié que sur un seul nœud à la fois, donc c'est ce chiffre — pas l'agrégat
+            // cluster — qui répond à "est-ce que ça va rentrer ?" (retour utilisateur du 18 août
+            // 2026, cluster passé de 1 à 2 nœuds ce jour-là : l'agrégat donnait un faux sentiment
+            // de sécurité dès que les nœuds ont des disponibilités très différentes).
+            double availCpu = ((Number) cap.getOrDefault("maxAvailableCpuCores", 0)).doubleValue();
+            double allocCpu = ((Number) cap.getOrDefault("allocatableCpuCores", 0)).doubleValue();
+            long availMemBytes = ((Number) cap.getOrDefault("maxAvailableMemoryBytes", 0L)).longValue();
+            long allocMemBytes = ((Number) cap.getOrDefault("allocatableMemoryBytes", 0L)).longValue();
+
+            preview.setNodeCapacityEnabled(true);
+            preview.setNodeAvailableCpuMillicores((int) Math.round(availCpu * 1000));
+            preview.setNodeAllocatableCpuMillicores((int) Math.round(allocCpu * 1000));
+            preview.setNodeAvailableMemoryBytes(availMemBytes);
+            preview.setNodeAllocatableMemoryBytes(allocMemBytes);
+
+            String rollingNote = isRedeploy
+                    ? " Cette application a déjà un déploiement actif : la mise à jour va créer l'ancien ET le"
+                    + " nouveau pod en parallèle quelques instants (rolling update), ce qui double brièvement"
+                    + " la consommation avant que l'ancien pod ne soit retiré."
+                    : "";
+            int requestedCpu = preview.getRequestedCpuMillicores();
+            long requestedMem = preview.getRequestedMemoryBytes();
+            if (requestedCpu > 0 && requestedCpu > preview.getNodeAvailableCpuMillicores()) {
+                String availStr = availCpu < 1 ? Math.round(availCpu * 1000) + "m" : String.format("%.2f cores", availCpu);
+                preview.getWarnings().add("Capacité réelle du nœud insuffisante : il ne reste que "
+                        + availStr + " de libre sur la machine (au-delà du quota namespace, qui lui a"
+                        + " encore de la marge) — le déploiement risque de rester bloqué en Pending." + rollingNote);
+            } else if (requestedMem > 0 && requestedMem > availMemBytes) {
+                double availGi = availMemBytes / (1024.0 * 1024.0 * 1024.0);
+                String availStr = availGi >= 1 ? String.format("%.2fGi", availGi)
+                        : Math.round(availMemBytes / (1024.0 * 1024.0)) + "Mi";
+                preview.getWarnings().add("Capacité mémoire réelle du nœud insuffisante : il ne reste que "
+                        + availStr + " de libre sur la machine (au-delà du quota namespace, qui lui a"
+                        + " encore de la marge) — le déploiement risque de rester bloqué en Pending." + rollingNote);
+            }
+        } catch (Exception e) {
+            log.debug("Capacité cluster indisponible pour l'aperçu déploiement: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Aperçu ressources avant ÉDITION d'un service déjà déployé — même garde-fou que
+     * {@link #previewDeploy}, mais pour le chemin qui l'a jusqu'ici contourné : modifier un
+     * service existant réapplique directement au cluster (syncServiceRuntime) sans jamais passer
+     * par la modale Déployer protégée (retour utilisateur du 18 août 2026, audit-deploiement.md §8).
+     *
+     * <p>Calculé à partir de l'état RÉEL du cluster (ResourceQuota K8s + capacité nœud), pas
+     * re-sommé depuis la base — évite toute dérive. La projection ajoute la NOUVELLE valeur du
+     * service à l'usage actuel du namespace (qui inclut encore l'ancien pod) : pendant une mise à
+     * jour, ancien et nouveau pod coexistent brièvement (confirmé en direct le 17 août 2026 :
+     * used=3, requested=4, quota=4 → FailedCreate), donc la vraie contrainte est used + new, pas
+     * un delta ancien→nouveau.</p>
+     *
+     * <p>Ne s'applique que si l'application a un déploiement RUNNING (namespace connu) : sinon
+     * rien n'est encore appliqué au cluster, la prochaine mise en ligne passera par la modale
+     * protégée. Best-effort : n'empêche jamais l'édition si le cluster est indisponible.</p>
+     */
+    @Transactional(readOnly = true)
+    public DeployPreviewResponse previewServiceResourceChange(UUID appId, UUID serviceId, AppServiceRequest request) {
+        loadOwnedApp(appId);
+        serviceRepository.findByIdAndManagedApplication_Id(serviceId, appId)
+                .orElseThrow(() -> new AppValidationException("Service introuvable dans cette application."));
+        DeployPreviewResponse.DeployPreviewResponseBuilder builder = DeployPreviewResponse.builder();
+
+        AppDeployment running = deploymentRepository.findByApplication_IdOrderByCreatedAtDesc(appId).stream()
+                .filter(d -> d.getStatus() == AppDeploymentStatus.RUNNING)
+                .findFirst()
+                .orElse(null);
+        if (running == null || running.getNamespace() == null || !k8sManifestApplyService.isConfigured()) {
+            return builder.build();
+        }
+
+        // Multiplié par replicas : un Deployment à N replicas demande N fois les ressources d'un
+        // pod, pas une fois (bug réel découvert le 18 août 2026 lors d'un test utilisateur — voir
+        // le même correctif sur AppDeploymentValidationService.buildPreview()).
+        int replicas = request.getReplicas() != null && request.getReplicas() > 0 ? request.getReplicas() : 1;
+        double newCpuCores = K8sManifestApplyService.parseCpuToCores(request.getCpuRequest()) * replicas;
+        long newMemBytes = K8sManifestApplyService.parseMemoryToBytes(request.getMemoryRequest()) * replicas;
+        List<String> warnings = new ArrayList<>();
+
+        try {
+            Map<String, Object> quota = k8sManifestApplyService.fetchResourceQuotaStatus(running.getNamespace(), Map.of());
+            if (Boolean.TRUE.equals(quota.get("enabled"))) {
+                Double hardCpu = (Double) quota.get("hardCpu");
+                Long hardMem = (Long) quota.get("hardMemoryBytes");
+                double usedCpu = ((Number) quota.getOrDefault("usedCpu", 0.0)).doubleValue();
+                long usedMem = ((Number) quota.getOrDefault("usedMemoryBytes", 0L)).longValue();
+                double projectedCpu = usedCpu + newCpuCores;
+                long projectedMem = usedMem + newMemBytes;
+
+                builder.quotaEnabled(true)
+                        .requestedCpuMillicores((int) Math.round(projectedCpu * 1000))
+                        .requestedMemoryBytes(projectedMem)
+                        .quotaCpuMillicores(hardCpu != null ? (int) Math.round(hardCpu * 1000) : 0)
+                        .quotaMemoryBytes(hardMem != null ? hardMem : 0);
+
+                if (hardCpu != null && hardCpu > 0 && projectedCpu > hardCpu) {
+                    warnings.add("Pendant la mise à jour, l'ancien et le nouveau pod coexistent brièvement : "
+                            + formatCores(projectedCpu) + " seraient nécessaires sur un quota namespace de "
+                            + formatCores(hardCpu) + " — risque de FailedCreate (le pod ne pourra pas être créé).");
+                }
+                if (hardMem != null && hardMem > 0 && projectedMem > hardMem) {
+                    warnings.add("Pendant la mise à jour, l'ancien et le nouveau pod coexistent brièvement : "
+                            + formatMi(projectedMem) + " seraient nécessaires sur un quota namespace de "
+                            + formatMi(hardMem) + " — risque de FailedCreate (le pod ne pourra pas être créé).");
+                }
+            }
+        } catch (Exception e) {
+            log.debug("Aperçu quota édition service indisponible: {}", e.getMessage());
+        }
+
+        try {
+            Map<String, Object> cap = k8sManifestApplyService.getClusterCapacity();
+            if (Boolean.TRUE.equals(cap.get("enabled"))) {
+                // maxAvailable* : voir enrichWithClusterCapacity() — le nœud le plus disponible,
+                // pas la somme de tous les nœuds.
+                double availCpu = ((Number) cap.getOrDefault("maxAvailableCpuCores", 0)).doubleValue();
+                double allocCpu = ((Number) cap.getOrDefault("allocatableCpuCores", 0)).doubleValue();
+                long availMem = ((Number) cap.getOrDefault("maxAvailableMemoryBytes", 0L)).longValue();
+                long allocMem = ((Number) cap.getOrDefault("allocatableMemoryBytes", 0L)).longValue();
+
+                builder.nodeCapacityEnabled(true)
+                        .nodeAvailableCpuMillicores((int) Math.round(availCpu * 1000))
+                        .nodeAllocatableCpuMillicores((int) Math.round(allocCpu * 1000))
+                        .nodeAvailableMemoryBytes(availMem)
+                        .nodeAllocatableMemoryBytes(allocMem);
+
+                if (newCpuCores > availCpu) {
+                    warnings.add("Capacité réelle du nœud insuffisante : il ne reste que "
+                            + formatCores(availCpu) + " de libre sur la machine (le nouveau pod a besoin de "
+                            + formatCores(newCpuCores) + ") — le service risque de rester en Pending.");
+                } else if (newMemBytes > availMem) {
+                    warnings.add("Capacité mémoire réelle du nœud insuffisante : il ne reste que "
+                            + formatMi(availMem) + " de libre sur la machine — le service risque de rester en Pending.");
+                }
+            }
+        } catch (Exception e) {
+            log.debug("Aperçu capacité nœud édition service indisponible: {}", e.getMessage());
+        }
+
+        return builder.warnings(warnings).build();
+    }
+
+    private static String formatCores(double cores) {
+        if (cores < 1) {
+            return Math.round(cores * 1000) + "m";
+        }
+        return (Math.round(cores * 100) / 100.0) + " cores";
+    }
+
+    private static String formatMi(long bytes) {
+        double gi = bytes / (1024.0 * 1024.0 * 1024.0);
+        if (gi >= 1) {
+            return (Math.round(gi * 100) / 100.0) + "Gi";
+        }
+        return Math.round(bytes / (1024.0 * 1024.0)) + "Mi";
+    }
+
     public List<AppDeploymentResponse> listDeployments(UUID appId) {
         ManagedApplication app = loadOwnedApp(appId);
         return deploymentRepository.findByApplication_IdOrderByCreatedAtDesc(appId).stream()
                 .map(d -> mapDeployment(d, app))
                 .collect(Collectors.toList());
+    }
+
+    /**
+     * Temps-machine cumulé (approximatif) : somme, sur tous les déploiements de l'application,
+     * de la durée Ready → arrêt (ou maintenant si toujours en cours). Proxy de coût, pas une
+     * facturation exacte — audit-deploiement.md, chantier #10.
+     */
+    @Transactional(readOnly = true)
+    public Map<String, Object> getMachineTimeUsage(UUID appId) {
+        loadOwnedApp(appId);
+        List<AppDeployment> deployments = deploymentRepository.findByApplication_IdOrderByCreatedAtDesc(appId);
+        Instant now = Instant.now();
+        double totalHours = 0;
+        List<Map<String, Object>> byDeployment = new ArrayList<>();
+        for (AppDeployment d : deployments) {
+            UUID envId = d.getEphemeralEnvironmentId();
+            if (envId == null) {
+                continue;
+            }
+            EphemeralEnvironment env = environmentRepository.findById(envId).orElse(null);
+            if (env == null || env.getReadyAt() == null) {
+                continue;
+            }
+            Instant readyAt = toInstant(env.getReadyAt());
+            Instant end = env.getTerminatedAt() != null ? toInstant(env.getTerminatedAt())
+                    : env.getDestroyedAt() != null ? toInstant(env.getDestroyedAt())
+                    : now;
+            if (readyAt == null || end == null || end.isBefore(readyAt)) {
+                continue;
+            }
+            double hours = java.time.Duration.between(readyAt, end).toMinutes() / 60.0;
+            totalHours += hours;
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("deploymentId", d.getId());
+            row.put("namespace", d.getNamespace());
+            row.put("status", d.getStatus());
+            row.put("readyAt", readyAt.toString());
+            row.put("stillRunning", d.getStatus() == AppDeploymentStatus.RUNNING);
+            row.put("hours", Math.round(hours * 100) / 100.0);
+            byDeployment.add(row);
+        }
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("totalHours", Math.round(totalHours * 100) / 100.0);
+        out.put("deploymentCount", byDeployment.size());
+        out.put("byDeployment", byDeployment);
+        return out;
     }
 
     @Transactional
@@ -812,6 +1099,14 @@ public class ApplicationManagementService {
         return mapDeployment(deployment, app);
     }
 
+    /** Relance manuelle du smoke test (Objectif 3, post-deploy §5) — voir AppDeploymentService. */
+    public Map<String, Object> rerunSmokeTest(UUID appId, UUID serviceId) {
+        ManagedApplication app = loadOwnedApp(appId);
+        serviceRepository.findByIdAndManagedApplication_Id(serviceId, appId)
+                .orElseThrow(() -> new AppValidationException("Service introuvable dans cette application."));
+        return deploymentService.rerunSmokeTestForService(app, serviceId);
+    }
+
     /**
      * Liste les pods du namespace d'un déploiement (observabilité cluster).
      */
@@ -850,30 +1145,25 @@ public class ApplicationManagementService {
 
     /**
      * Monitoring léger : métriques pods, alertes, health HTTP de l'URL publique.
+     * <p>Ne tient <b>pas</b> de transaction JPA pendant les appels K8s / HTTP
+     * (sinon le pool Hikari sature : active=10, waiting…).</p>
      */
-    @Transactional(readOnly = true)
     public Map<String, Object> getDeploymentMonitoring(UUID appId, UUID deploymentId) {
-        ManagedApplication app = loadOwnedApp(appId);
-        AppDeployment deployment = deploymentRepository.findByIdAndApplication_Id(deploymentId, appId)
-                .orElseThrow(() -> new AppValidationException("Déploiement introuvable."));
-        Map<String, Object> out = new java.util.LinkedHashMap<>();
-        out.put("namespace", deployment.getNamespace());
-        out.put("deploymentId", deployment.getId());
-        out.put("status", deployment.getStatus());
-        out.put("checkedAt", Instant.now().toString());
-        out.put("applicationName", app.getName());
-        out.put("applicationSlug", app.getSlug());
-        Instant expiresAt = null;
-        if (deployment.getEphemeralEnvironmentId() != null) {
-            EphemeralEnvironment env = environmentRepository.findById(deployment.getEphemeralEnvironmentId()).orElse(null);
-            if (env != null) {
-                expiresAt = toInstant(env.getExpiresAt());
-            }
+        MonitoringSnap snap = readOnlyTx.execute(status -> loadMonitoringSnap(appId, deploymentId));
+        if (snap == null) {
+            throw new AppValidationException("Déploiement introuvable.");
         }
-        out.put("expiresAt", expiresAt != null ? expiresAt.toString() : null);
 
-        if (deployment.getStatus() == AppDeploymentStatus.STOPPED
-                || deployment.getStatus() == AppDeploymentStatus.FAILED) {
+        Map<String, Object> out = new java.util.LinkedHashMap<>();
+        out.put("namespace", snap.namespace());
+        out.put("deploymentId", snap.deploymentId());
+        out.put("status", snap.status());
+        out.put("checkedAt", Instant.now().toString());
+        out.put("applicationName", snap.appName());
+        out.put("applicationSlug", snap.appSlug());
+        out.put("expiresAt", snap.expiresAtIso());
+
+        if (snap.inactive()) {
             out.put("pods", List.of());
             out.put("workloads", List.of());
             out.put("services", List.of());
@@ -886,15 +1176,15 @@ public class ApplicationManagementService {
         if (!k8sManifestApplyService.isConfigured()) {
             throw new AppValidationException("Cluster K8s non configuré.");
         }
-        if (deployment.getNamespace() == null || deployment.getNamespace().isBlank()) {
+        if (snap.namespace() == null || snap.namespace().isBlank()) {
             throw new AppValidationException("Namespace absent pour ce déploiement.");
         }
 
         Map<String, Object> mon;
         try {
-            mon = k8sManifestApplyService.getNamespaceMonitoring(deployment.getNamespace());
+            mon = k8sManifestApplyService.getNamespaceMonitoring(snap.namespace());
         } catch (Exception e) {
-            log.warn("monitoring ns={}: {}", deployment.getNamespace(), e.getMessage());
+            log.warn("monitoring ns={}: {}", snap.namespace(), e.getMessage());
             mon = new java.util.LinkedHashMap<>();
             mon.put("pods", List.of());
             mon.put("alerts", new java.util.ArrayList<Map<String, Object>>());
@@ -908,42 +1198,33 @@ public class ApplicationManagementService {
                 ? (List<Map<String, Object>>) list
                 : new java.util.ArrayList<>();
 
-        // Ingress flag
-        Map<String, Object> state = deployment.getServicesState();
-        if (state != null && Boolean.FALSE.equals(state.get("ingressApplied"))) {
+        if (Boolean.FALSE.equals(snap.ingressApplied())) {
             Map<String, Object> a = new java.util.LinkedHashMap<>();
             a.put("severity", "warn");
             a.put("pod", null);
             a.put("workload", null);
-            a.put("message", state.get("ingressError") != null
-                    ? "Ingress non appliqué : " + state.get("ingressError")
+            a.put("kind", "health");
+            a.put("reason", "IngressNotApplied");
+            a.put("message", snap.ingressError() != null
+                    ? "Ingress non appliqué : " + snap.ingressError()
                     : "Ingress non appliqué — URL publique indisponible");
             alerts.add(a);
         }
 
-        // Health HTTP — chemins issus des services + candidats multi-stack
-        String appUrl = null;
-        if (state != null && state.get("services") instanceof Map<?, ?> services) {
-            for (Object v : services.values()) {
-                if (v instanceof Map<?, ?> svc) {
-                    Object ext = svc.get("externalUrl");
-                    if (ext != null && !String.valueOf(ext).isBlank()) {
-                        appUrl = String.valueOf(ext);
-                        break;
-                    }
-                }
-            }
-        }
-        List<String> preferredPaths = collectHealthProbePaths(app);
-        Map<String, Object> health = probeHttpHealth(appUrl, preferredPaths);
+        Map<String, Object> health = probeHttpHealth(snap.appUrl(), snap.healthPaths());
         out.put("health", health);
-        out.put("appUrl", appUrl);
+        out.put("appUrl", snap.appUrl());
         if (Boolean.FALSE.equals(health.get("ok")) && Boolean.TRUE.equals(health.get("checked"))) {
             Map<String, Object> a = new java.util.LinkedHashMap<>();
             a.put("severity", "warn");
             a.put("pod", null);
             a.put("workload", null);
+            a.put("kind", "health");
+            a.put("reason", "HealthCheckFailed");
             a.put("message", "Health URL : " + health.get("message"));
+            if (health.get("url") != null) {
+                a.put("object", String.valueOf(health.get("url")));
+            }
             alerts.add(a);
         }
         out.put("alerts", alerts);
@@ -957,15 +1238,89 @@ public class ApplicationManagementService {
         return out;
     }
 
+    /** Données DB nécessaires au monitoring — chargées en transaction courte. */
+    private MonitoringSnap loadMonitoringSnap(UUID appId, UUID deploymentId) {
+        ManagedApplication app = loadOwnedApp(appId);
+        AppDeployment deployment = deploymentRepository.findByIdAndApplication_Id(deploymentId, appId)
+                .orElseThrow(() -> new AppValidationException("Déploiement introuvable."));
+
+        Instant expiresAt = null;
+        if (deployment.getEphemeralEnvironmentId() != null) {
+            EphemeralEnvironment env = environmentRepository.findById(deployment.getEphemeralEnvironmentId()).orElse(null);
+            if (env != null) {
+                expiresAt = toInstant(env.getExpiresAt());
+            }
+        }
+
+        boolean inactive = deployment.getStatus() == AppDeploymentStatus.STOPPED
+                || deployment.getStatus() == AppDeploymentStatus.FAILED;
+
+        Map<String, Object> state = deployment.getServicesState();
+        Boolean ingressApplied = null;
+        Object ingressError = null;
+        if (state != null) {
+            if (state.get("ingressApplied") instanceof Boolean b) {
+                ingressApplied = b;
+            }
+            ingressError = state.get("ingressError");
+        }
+
+        // Touch lazy services while TX is open
+        List<String> healthPaths = collectHealthProbePaths(app);
+        String appUrl = inactive ? null : pickPublicAppUrl(app, deployment);
+
+        return new MonitoringSnap(
+                deployment.getId(),
+                deployment.getNamespace(),
+                deployment.getStatus() != null ? deployment.getStatus().name() : null,
+                app.getName(),
+                app.getSlug(),
+                expiresAt != null ? expiresAt.toString() : null,
+                inactive,
+                ingressApplied,
+                ingressError != null ? String.valueOf(ingressError) : null,
+                appUrl,
+                healthPaths
+        );
+    }
+
+    private record MonitoringSnap(
+            UUID deploymentId,
+            String namespace,
+            String status,
+            String appName,
+            String appSlug,
+            String expiresAtIso,
+            boolean inactive,
+            Boolean ingressApplied,
+            String ingressError,
+            String appUrl,
+            List<String> healthPaths
+    ) {}
+
     /**
      * Alertes runtime live + historique 24 h pour un déploiement.
+     * Pas de {@code @Transactional} ici : le live appelle le monitoring K8s/HTTP
+     * (ne doit pas retenir une connexion Hikari).
      */
-    @Transactional(readOnly = true)
     public Map<String, Object> listDeploymentAlerts(UUID appId, UUID deploymentId) {
         ManagedApplication app = loadOwnedApp(appId);
         AppDeployment deployment = deploymentRepository.findByIdAndApplication_Id(deploymentId, appId)
                 .orElseThrow(() -> new AppValidationException("Déploiement introuvable."));
         return deploymentRuntimeAlertService.listForDeployment(app, deployment);
+    }
+
+    /**
+     * Historique des alertes de l'application, tous environnements confondus, filtrable
+     * par plage de dates (défaut : 30 derniers jours) et par namespace.
+     */
+    public Map<String, Object> listAppAlertsHistory(UUID appId, Instant from, Instant to, String namespace) {
+        ManagedApplication app = loadOwnedApp(appId);
+        LocalDateTime toDt = to != null ? LocalDateTime.ofInstant(to, ZoneId.systemDefault()) : LocalDateTime.now();
+        LocalDateTime fromDt = from != null
+                ? LocalDateTime.ofInstant(from, ZoneId.systemDefault())
+                : toDt.minusDays(30);
+        return deploymentRuntimeAlertService.listAppAlertsHistory(app, fromDt, toDt, namespace);
     }
 
     /** Historique métriques namespace (échantillons DB). */
@@ -976,6 +1331,61 @@ public class ApplicationManagementService {
         deploymentRepository.findByIdAndApplication_Id(deploymentId, appId)
                 .orElseThrow(() -> new AppValidationException("Déploiement introuvable."));
         return deploymentMetricsSamplerService.history(appId, deploymentId, from, to);
+    }
+
+    /**
+     * URL à afficher / sonder pour l'app : FRONTEND d'abord, sinon URL « racine »
+     * (évite de prendre BACKEND …/api qui fausse le health et le bandeau).
+     */
+    private String pickPublicAppUrl(ManagedApplication app, AppDeployment deployment) {
+        Map<String, Object> state = deployment.getServicesState();
+        if (state == null || !(state.get("services") instanceof Map<?, ?> servicesRaw)) {
+            return null;
+        }
+        @SuppressWarnings("unchecked")
+        Map<String, Object> services = (Map<String, Object>) servicesRaw;
+
+        for (AppService svc : app.getServices()) {
+            if (svc.getRole() != AppServiceRole.FRONTEND) continue;
+            Object row = services.get(svc.getName());
+            String url = externalUrlOf(row);
+            if (url != null) return url;
+        }
+
+        String firstRoot = null;
+        String firstAny = null;
+        for (AppService svc : app.getServices()) {
+            Object row = services.get(svc.getName());
+            String url = externalUrlOf(row);
+            if (url == null) continue;
+            if (firstAny == null) firstAny = url;
+            if (svc.getRole() == AppServiceRole.BACKEND) continue;
+            String path = url.replaceFirst("^https?://[^/]+", "");
+            if (path.isEmpty() || "/".equals(path)) {
+                return url;
+            }
+            if (firstRoot == null && !path.equals("/api") && !path.startsWith("/api/")) {
+                firstRoot = url;
+            }
+        }
+        if (firstRoot != null) return firstRoot;
+
+        // Dernier recours : n'importe quelle URL non NodePort dans le state
+        for (Object v : services.values()) {
+            String url = externalUrlOf(v);
+            if (url != null && !url.matches("^https?://\\d+\\.\\d+\\.\\d+\\.\\d+:\\d+.*")) {
+                return url;
+            }
+        }
+        return firstAny;
+    }
+
+    private static String externalUrlOf(Object row) {
+        if (!(row instanceof Map<?, ?> m)) return null;
+        Object ext = m.get("externalUrl");
+        if (ext == null) return null;
+        String url = String.valueOf(ext).trim();
+        return url.isEmpty() ? null : url;
     }
 
     /**
@@ -1035,10 +1445,15 @@ public class ApplicationManagementService {
         )) {
             paths.add(p);
         }
-        return new ArrayList<>(paths);
+        List<String> ordered = new ArrayList<>(paths);
+        if (ordered.size() > MAX_HEALTH_PROBE_PATHS) {
+            return new ArrayList<>(ordered.subList(0, MAX_HEALTH_PROBE_PATHS));
+        }
+        return ordered;
     }
 
-    private Map<String, Object> probeHttpHealth(String appUrl, List<String> preferredPaths) {
+    /** Visibilité package : réutilisé par AppDeploymentService pour le smoke test post-déploiement. */
+    Map<String, Object> probeHttpHealth(String appUrl, List<String> preferredPaths) {
         Map<String, Object> health = new java.util.LinkedHashMap<>();
         if (appUrl == null || appUrl.isBlank()) {
             health.put("checked", false);
@@ -1066,7 +1481,13 @@ public class ApplicationManagementService {
         // Domaine custom / .local : le backend Docker ne résout pas le hosts Windows.
         // On sonde Traefik (IP master) avec le header Host = hostname public.
         boolean rewriteViaIngressIp = shouldProbeViaIngressIp(publicHost);
-        String probeScheme = publicUri.getScheme() != null ? publicUri.getScheme() : "http";
+        // Traefik n'écoute qu'en HTTP en interne (Ingress "router.entrypoints: web", TLS terminé
+        // par Cloudflare Tunnel en amont, jamais par Traefik lui-même -- architecture documentée
+        // dans audit-deploiement.md §6). Sonder l'IP interne en https:// (le schéma de l'URL
+        // PUBLIQUE, pas le bon ici) frappe un tout autre listener/certificat par défaut et échoue
+        // systématiquement en "certificate_unknown / No SAN matching <IP>" -- constaté en direct
+        // le 28 août 2026, smoke test en échec malgré une appli parfaitement saine et joignable.
+        String probeScheme = rewriteViaIngressIp ? "http" : (publicUri.getScheme() != null ? publicUri.getScheme() : "http");
         String probeAuthority = rewriteViaIngressIp
                 ? (ingressProbeIp != null && !ingressProbeIp.isBlank() ? ingressProbeIp.trim() : "192.168.92.10")
                 : (publicUri.getPort() > 0 ? publicHost + ":" + publicUri.getPort() : publicHost);
@@ -1161,10 +1582,42 @@ public class ApplicationManagementService {
      */
     private static int httpGetStatus(String url, String hostHeader) throws Exception {
         System.setProperty("jdk.httpclient.allowRestrictedHeaders", "host");
-        var client = java.net.http.HttpClient.newBuilder()
+        var clientBuilder = java.net.http.HttpClient.newBuilder()
                 .followRedirects(java.net.http.HttpClient.Redirect.NORMAL)
-                .connectTimeout(java.time.Duration.ofSeconds(3))
-                .build();
+                .connectTimeout(java.time.Duration.ofSeconds(3));
+        if (hostHeader != null && !hostHeader.isBlank() && url.startsWith("https://")) {
+            // On sonde directement l'IP Traefik (le conteneur backend ne résout pas le DNS
+            // custom Windows) en forçant le Host applicatif. Le Host n'existe qu'au niveau
+            // HTTP, après la poignée de main TLS : le SNI envoyé — et donc le certificat que
+            // Traefik choisit de présenter — correspond toujours à l'IP, jamais au vrai
+            // domaine. Résultat systématique : PKIX invalide (certificat par défaut de
+            // Traefik, hors chaîne de confiance), quel que soit le certificat réel du domaine.
+            // On ne peut pas faire de vérification TLS cohérente sur cette IP « générique » :
+            // on la désactive uniquement pour cette sonde interne (ping /ready informatif vers
+            // notre propre cluster, aucune donnée sensible échangée). Les autres appels HTTPS
+            // de l'appli (GitLab, DefectDojo, SMTP…) ne passent pas par ce chemin et restent en
+            // vérification stricte.
+            try {
+                javax.net.ssl.TrustManager[] trustAll = new javax.net.ssl.TrustManager[] {
+                    new javax.net.ssl.X509TrustManager() {
+                        public void checkClientTrusted(java.security.cert.X509Certificate[] c, String t) { }
+                        public void checkServerTrusted(java.security.cert.X509Certificate[] c, String t) { }
+                        public java.security.cert.X509Certificate[] getAcceptedIssuers() {
+                            return new java.security.cert.X509Certificate[0];
+                        }
+                    }
+                };
+                javax.net.ssl.SSLContext ctx = javax.net.ssl.SSLContext.getInstance("TLS");
+                ctx.init(null, trustAll, new java.security.SecureRandom());
+                javax.net.ssl.SSLParameters sslParams = new javax.net.ssl.SSLParameters();
+                sslParams.setEndpointIdentificationAlgorithm(null);
+                clientBuilder.sslContext(ctx).sslParameters(sslParams);
+            } catch (Exception ignored) {
+                // best-effort : si le contexte custom échoue, on retombe sur le client par défaut
+                // (PKIX standard — l'appelant affichera l'erreur habituelle, rien de cassé).
+            }
+        }
+        var client = clientBuilder.build();
         var builder = java.net.http.HttpRequest.newBuilder()
                 .uri(java.net.URI.create(url))
                 .timeout(java.time.Duration.ofSeconds(4))
@@ -1337,6 +1790,7 @@ public class ApplicationManagementService {
                 .cpuLimit(svc.getCpuLimit())
                 .memoryRequest(svc.getMemoryRequest())
                 .memoryLimit(svc.getMemoryLimit())
+                .hardenedSecurityContext(svc.isHardenedSecurityContext())
                 .envVars(envVars)
                 .createdAt(svc.getCreatedAt() != null
                         ? svc.getCreatedAt().atZone(ZoneId.systemDefault()).toInstant() : null)
@@ -1382,6 +1836,7 @@ public class ApplicationManagementService {
         Instant expiresAt = null;
         Instant readyAt = null;
         Long remainingSeconds = null;
+        String gitBranch = null;
 
         UUID envId = deployment.getEphemeralEnvironmentId();
         if (envId != null) {
@@ -1390,6 +1845,9 @@ public class ApplicationManagementService {
                 ttlHours = env.getTtlHours();
                 readyAt = toInstant(env.getReadyAt());
                 expiresAt = toInstant(env.getExpiresAt());
+                if (env.getGitBranch() != null && !env.getGitBranch().isBlank()) {
+                    gitBranch = env.getGitBranch().trim();
+                }
 
                 // Déploiement RUNNING mais TTL jamais armé (onReady ignoré / env détruit trop tôt)
                 if (deployment.getStatus() == AppDeploymentStatus.RUNNING
@@ -1445,6 +1903,7 @@ public class ApplicationManagementService {
                 .createdAt(deployment.getCreatedAt())
                 .updatedAt(deployment.getUpdatedAt())
                 .databases(databases)
+                .gitBranch(gitBranch)
                 .ttlHours(ttlHours)
                 .expiresAt(expiresAt)
                 .readyAt(readyAt)
@@ -1466,6 +1925,15 @@ public class ApplicationManagementService {
 
     private ManagedApplication loadOwnedApp(UUID id) {
         User user = getCurrentUser();
+        if (user.isAdmin()) {
+            // Console admin (monitoring cluster-wide) : un admin peut consulter n'importe quelle
+            // appli, pas seulement les siennes — mêmes endpoints que le portail utilisateur
+            // (monitoring, historique métriques, logs) pour réutiliser telle quelle la même
+            // richesse d'affichage (charts, KPIs) plutôt que dupliquer une vue admin simplifiée.
+            // Protection déjà assurée par le rôle ADMIN, pas par cette méthode (18 août 2026).
+            return appRepository.findById(id)
+                    .orElseThrow(() -> new AppValidationException("Application introuvable."));
+        }
         return appRepository.findByIdAndCreatedBy(id, user)
                 .orElseThrow(() -> new AppValidationException("Application introuvable."));
     }

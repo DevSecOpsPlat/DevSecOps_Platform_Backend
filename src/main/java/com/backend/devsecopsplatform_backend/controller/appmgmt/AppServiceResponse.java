@@ -31,6 +31,7 @@ public class AppServiceResponse {
     private String cpuLimit;
     private String memoryRequest;
     private String memoryLimit;
+    private boolean hardenedSecurityContext;
     private List<EnvVarResponse> envVars;
     private Instant createdAt;
     private Instant updatedAt;

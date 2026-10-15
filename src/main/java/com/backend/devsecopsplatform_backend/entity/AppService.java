@@ -108,6 +108,21 @@ public class AppService {
     private String healthCheckPath;
 
     /**
+     * Durcissement conteneur optionnel (chantier sécurité des apps déployées, 4 septembre 2026) :
+     * runAsNonRoot + readOnlyRootFilesystem, en plus. Désactivé par défaut ({@code false}) et
+     * activable au cas par cas — imposer ces deux options à toutes les images existantes risquerait
+     * d'en casser certaines (image qui tourne en root, ou qui écrit hors de {@code /tmp}). Le
+     * sous-ensemble sûr (allowPrivilegeEscalation:false, capabilities drop ALL) reste, lui,
+     * toujours actif, sans ce flag — voir AppK8sManifestService.
+     */
+    // columnDefinition avec DEFAULT explicite : sans lui, l'ALTER TABLE émis par Hibernate
+    // (ddl-auto=update) sur une table déjà peuplée échoue ("contains null values") et Hibernate ne
+    // fait que logger l'erreur sans stopper le démarrage -- la colonne reste alors absente en base
+    // en silence (constaté en direct le 4 septembre 2026, corrigé manuellement sur la base live).
+    @Column(name = "hardened_security_context", nullable = false, columnDefinition = "boolean not null default false")
+    private boolean hardenedSecurityContext = false;
+
+    /**
      * Chemin métier interne du service (ex. {@code /projet} pour Spring context-path).
      * Publicement le backend reste exposé sous {@code /api} ; Traefik réécrit vers ce chemin.
      */

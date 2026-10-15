@@ -8,6 +8,7 @@ import com.backend.devsecopsplatform_backend.entity.PipelineStatus;
 import com.backend.devsecopsplatform_backend.entity.QualityGateSnapshot;
 import com.backend.devsecopsplatform_backend.entity.User;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDeployment;
+import com.backend.devsecopsplatform_backend.entity.appmgmt.ScanBatch;
 import com.backend.devsecopsplatform_backend.repository.AppDeploymentRepository;
 import com.backend.devsecopsplatform_backend.repository.AppServiceRepository;
 import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
@@ -15,6 +16,7 @@ import com.backend.devsecopsplatform_backend.repository.FindingOccurrenceReposit
 import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
 import com.backend.devsecopsplatform_backend.repository.QualityGateSnapshotRepository;
 import com.backend.devsecopsplatform_backend.repository.UserRepository;
+import com.backend.devsecopsplatform_backend.repository.appmgmt.ScanBatchRepository;
 import com.backend.devsecopsplatform_backend.service.AiAnalysisService;
 import com.backend.devsecopsplatform_backend.service.GitLabService;
 import com.backend.devsecopsplatform_backend.service.SonarBranchResolution;
@@ -93,6 +95,7 @@ public class QualityGateService {
     private final AiAnalysisService aiAnalysisService;
     private final SecurityScoringService securityScoringService;
     private final QualityGateSnapshotRepository qualityGateSnapshotRepository;
+    private final ScanBatchRepository scanBatchRepository;
     private final ObjectMapper objectMapper;
 
     @Transactional
@@ -192,9 +195,26 @@ public class QualityGateService {
         Optional<PipelineExecution> existing = pipelineExecutionRepository
                 .findByGitlabPipelineIdAndApplicationId(gitlabPipelineId, applicationId);
         if (existing.isPresent()) {
-            return existing.get();
+            PipelineExecution pe = existing.get();
+            attachBatchIfMissing(pe, request);
+            return pe;
         }
         return createScanExecutionIfMissing(applicationId, gitlabPipelineId, request);
+    }
+
+    @Transactional(readOnly = true)
+    public Optional<PipelineExecution> findExecutionForBatchHook(UUID executionId) {
+        return pipelineExecutionRepository.findById(executionId);
+    }
+
+    private void attachBatchIfMissing(PipelineExecution pe, SecurityGateIngestRequest request) {
+        if (pe.getScanBatch() != null || request.getScanBatchId() == null) {
+            return;
+        }
+        scanBatchRepository.findById(request.getScanBatchId()).ifPresent(batch -> {
+            pe.setScanBatch(batch);
+            pipelineExecutionRepository.save(pe);
+        });
     }
 
     /**
@@ -335,9 +355,12 @@ public class QualityGateService {
             execution.setStatus(PipelineStatus.SUCCESS);
             execution.setStartedAt(java.time.LocalDateTime.now());
             execution.setFinishedAt(java.time.LocalDateTime.now());
+            if (request.getScanBatchId() != null) {
+                scanBatchRepository.findById(request.getScanBatchId()).ifPresent(execution::setScanBatch);
+            }
             PipelineExecution saved = pipelineExecutionRepository.save(execution);
-            log.info("PipelineExecution créé depuis security-gate (sans webhook) app={} gitlab=#{}",
-                    applicationId, gitlabPipelineId);
+            log.info("PipelineExecution créé depuis security-gate (sans webhook) app={} gitlab=#{} batch={}",
+                    applicationId, gitlabPipelineId, request.getScanBatchId());
             return saved;
         }).orElseGet(() -> {
             log.warn("PipelineExecution non créé : application {} introuvable en base", applicationId);
@@ -574,7 +597,8 @@ public class QualityGateService {
             }
         }
         List<PipelineExecution> scanExecutions = pipelineExecutionRepository
-                .findByApplicationIdAndBranchOrderByCreatedAtDesc(applicationId, null, PageRequest.of(0, 100));
+                .findByApplicationIdAndBranchAndExecutionKindOrderByCreatedAtDesc(
+                        applicationId, null, PipelineExecutionKind.SCAN, PageRequest.of(0, 100));
         for (PipelineExecution pe : scanExecutions) {
             if (pe.getEnvironment() != null || pe.getStatus() == null || !pe.getStatus().isFinished()) {
                 continue;
@@ -731,7 +755,9 @@ public class QualityGateService {
             log.warn("DefectDojo indisponible pour quality gate: {}", e.getMessage());
         }
 
-        Map<String, Object> sonar = fetchSonarForQualityGate(app, effectiveBranch, execution);
+        // Ce point n'est atteint que lorsque refresh=true (voir le commentaire ligne 732) --
+        // préférer l'appel Sonar live à l'instantané figé, voir fetchSonarForQualityGate(..., refresh).
+        Map<String, Object> sonar = fetchSonarForQualityGate(app, effectiveBranch, execution, true);
         QualityGateResultDto live = buildResult(app, effectiveBranch, execution, dd, sonar, effectiveEnvironmentId);
         return annotateLiveRefreshResult(live, execution);
     }
@@ -965,7 +991,105 @@ public class QualityGateService {
         QualityGateResultDto result = buildResult(
                 resolvedApp, resolvedBranch, execution, dd, sonar, environmentId);
         persistDisplaySnapshot(execution, result, appendHistory);
+        freezeDefectDojoRollupFields(execution, resolvedApp, resolvedBranch, dd, result);
         saveSnapshotTable(resolvedApp.getId(), environmentId, execution, resolvedBranch, source, result);
+    }
+
+    /**
+     * Fige les compteurs / top findings DefectDojo dans {@code qualityGateJson}
+     * (source unique pour hard gate, score et rollup app — Option A).
+     */
+    @SuppressWarnings("unchecked")
+    private void freezeDefectDojoRollupFields(
+            PipelineExecution execution,
+            AppService app,
+            String branch,
+            DefectDojoDashboard2Response dd,
+            QualityGateResultDto result
+    ) {
+        if (execution == null) {
+            return;
+        }
+        Map<String, Object> gate = execution.getQualityGateJson();
+        if (gate == null) {
+            gate = new LinkedHashMap<>();
+        }
+
+        Map<String, Integer> bySev = new LinkedHashMap<>();
+        bySev.put("critical", 0);
+        bySev.put("high", 0);
+        bySev.put("medium", 0);
+        bySev.put("low", 0);
+        bySev.put("info", 0);
+        String source = "EMPTY";
+        if (dd != null && dd.getBySeverity() != null && !dd.getBySeverity().isEmpty()) {
+            bySev.put("critical", dd.getBySeverity().getOrDefault("Critical", 0));
+            bySev.put("high", dd.getBySeverity().getOrDefault("High", 0));
+            bySev.put("medium", dd.getBySeverity().getOrDefault("Medium", 0));
+            bySev.put("low", dd.getBySeverity().getOrDefault("Low", 0));
+            bySev.put("info", dd.getBySeverity().getOrDefault("Info", 0));
+            source = "DEFECTDOJO";
+        } else if (result != null && result.getMetrics() != null
+                && result.getMetrics().get("bySeverity") instanceof Map<?, ?> m) {
+            for (String k : List.of("critical", "high", "medium", "low", "info")) {
+                Object v = m.get(k);
+                if (v == null) {
+                    v = m.get(Character.toUpperCase(k.charAt(0)) + k.substring(1));
+                }
+                bySev.put(k, v instanceof Number n ? n.intValue() : 0);
+            }
+            source = "SNAPSHOT_METRICS";
+        }
+        gate.put("ddBySeverity", bySev);
+        gate.put("ddBySeveritySource", source);
+        gate.put("ddBySeverityFrozenAt", Instant.now().toString());
+
+        // Fige aussi le DAST (ZAP) à plat -- même besoin que ddBySeverity ci-dessus : sans ça,
+        // ScanBatchAggregationService.buildHardGateInput() (qui ne lit que gate à plat, jamais
+        // result.getMetrics() imbriqué sous "displaySnapshot") ne verrait jamais dastApplicable,
+        // et le gate DAST resterait un no-op pour l'agrégation multi-services.
+        if (result != null && result.getMetrics() != null) {
+            Map<String, Object> metrics = result.getMetrics();
+            gate.put("dastApplicable", Boolean.TRUE.equals(metrics.get("dastApplicable")));
+            gate.put("dastEvaluable", Boolean.TRUE.equals(metrics.get("dastEvaluable")));
+            gate.put("dastCritical", metrics.get("dastCritical") instanceof Number n ? n.intValue() : 0);
+            gate.put("dastHigh", metrics.get("dastHigh") instanceof Number n ? n.intValue() : 0);
+            gate.put("dastMedium", metrics.get("dastMedium") instanceof Number n ? n.intValue() : 0);
+        }
+
+        List<Map<String, Object>> top = new ArrayList<>();
+        if (app != null && app.getId() != null) {
+            try {
+                for (String severity : List.of("Critical", "High")) {
+                    if (top.size() >= 10) {
+                        break;
+                    }
+                    var page = defectDojoService.listFindings(
+                            app.getId(), branch, "open", severity, 0, 10, null, null, null, null);
+                    if (page == null || page.getContent() == null) {
+                        continue;
+                    }
+                    for (var item : page.getContent()) {
+                        if (top.size() >= 10) {
+                            break;
+                        }
+                        Map<String, Object> row = new LinkedHashMap<>();
+                        row.put("findingId", item.getId());
+                        row.put("title", item.getTitle());
+                        row.put("severity", item.getSeverity());
+                        row.put("scanType", item.getScanType());
+                        row.put("filePath", item.getFilePath());
+                        row.put("cve", item.getCve());
+                        top.add(row);
+                    }
+                }
+            } catch (Exception e) {
+                log.warn("Freeze top findings DD échoué (app={}): {}", app.getId(), e.getMessage());
+            }
+        }
+        gate.put("ddTopBlockingFindings", top);
+        execution.setQualityGateJson(gate);
+        pipelineExecutionRepository.save(execution);
     }
 
     private QualityGateResultDto loadSnapshotForPipelineExecution(PipelineExecution execution) {
@@ -1657,13 +1781,25 @@ public class QualityGateService {
     }
 
     private Map<String, Object> fetchSonarForQualityGate(AppService app, String branch) {
-        return fetchSonarForQualityGate(app, branch, null);
+        return fetchSonarForQualityGate(app, branch, null, false);
+    }
+
+    private Map<String, Object> fetchSonarForQualityGate(AppService app, String branch, PipelineExecution execution) {
+        return fetchSonarForQualityGate(app, branch, execution, false);
     }
 
     /**
      * Sonar : métriques CI uniquement si le job sonarqube-scan a réussi ; sinon pas de fallback live.
+     *
+     * @param refresh quand {@code true} (bouton "Actualiser"), l'appel live SonarQube est tenté
+     *                EN PREMIER plutôt que l'instantané figé à l'ingestion CI -- sans ça, un pipeline
+     *                déjà ingéré avant un correctif backend (ex. clés de métriques Sonar corrigées)
+     *                continuerait à afficher indéfiniment les anciennes données figées, même après
+     *                clic sur "Actualiser", puisque {@code buildSonarFromPipelineArtifacts} n'est
+     *                presque jamais vide et court-circuitait donc systématiquement l'appel live.
      */
-    private Map<String, Object> fetchSonarForQualityGate(AppService app, String branch, PipelineExecution execution) {
+    private Map<String, Object> fetchSonarForQualityGate(
+            AppService app, String branch, PipelineExecution execution, boolean refresh) {
         if (execution != null) {
             SonarScanJobState sonarJob = sonarScanJobState(execution);
             if (sonarJob == SonarScanJobState.FAILED) {
@@ -1679,12 +1815,14 @@ public class QualityGateService {
                 unavailable.put("branch_fallback_message", "Stage SonarQube non terminé — scan en cours ou absent.");
                 return unavailable;
             }
-            Map<String, Object> storedGate = execution.getQualityGateJson();
-            Map<String, Object> summary = resolveEffectiveSummary(execution, storedGate);
-            Map<String, Object> fromPipeline = buildSonarFromPipelineArtifacts(storedGate, summary);
-            if (!fromPipeline.isEmpty()) {
-                fromPipeline.put("sonar_available", true);
-                return fromPipeline;
+            if (!refresh) {
+                Map<String, Object> storedGate = execution.getQualityGateJson();
+                Map<String, Object> summary = resolveEffectiveSummary(execution, storedGate);
+                Map<String, Object> fromPipeline = buildSonarFromPipelineArtifacts(storedGate, summary);
+                if (!fromPipeline.isEmpty()) {
+                    fromPipeline.put("sonar_available", true);
+                    return fromPipeline;
+                }
             }
         }
         String projectKey = SonarProjectKeyUtil.deriveSonarProjectKey(app.getGitRepositoryUrl());
@@ -1698,6 +1836,17 @@ public class QualityGateService {
             return gitLabService.fetchSonarForQualityGate(projectKey, branch);
         } catch (Exception e) {
             log.debug("SonarQube indisponible: {}", e.getMessage());
+            // Repli sur l'instantané figé plutôt que de perdre toute donnée, si refresh=true a sauté
+            // cette étape plus haut et que l'appel live vient d'échouer (Sonar injoignable).
+            if (refresh && execution != null) {
+                Map<String, Object> storedGate = execution.getQualityGateJson();
+                Map<String, Object> summary = resolveEffectiveSummary(execution, storedGate);
+                Map<String, Object> fromPipeline = buildSonarFromPipelineArtifacts(storedGate, summary);
+                if (!fromPipeline.isEmpty()) {
+                    fromPipeline.put("sonar_available", true);
+                    return fromPipeline;
+                }
+            }
             Map<String, Object> unavailable = new LinkedHashMap<>();
             unavailable.put("sonar_available", false);
             unavailable.put("sonar_project_key", projectKey);
@@ -2000,6 +2149,61 @@ public class QualityGateService {
                 : List.of();
         Map<String, Integer> bySeverity = buildBySeverity(dd, summary, toolMetrics, defectDojoUiAvailable);
 
+        // DAST (ZAP) ne s'applique qu'aux pipelines de déploiement -- il ne tourne jamais en
+        // scan-only. Trois états, pas deux (contrairement à secretsEvaluable) : non applicable
+        // (scan-only, gate ignoré silencieusement), applicable mais pas encore évaluable (déploiement
+        // en cours, job pas terminé -> INDETERMINATE), applicable et évaluable (comparer aux seuils).
+        boolean dastApplicable = execution != null && execution.getExecutionKind() == PipelineExecutionKind.DEPLOY;
+        boolean dastEvaluable = dastApplicable && isDastJobEvaluable(execution);
+        Map<String, Integer> dastSeverity = dastApplicable
+                ? resolveDastSeverity(dd, summary, toolMetrics, defectDojoUiAvailable)
+                : Map.of("critical", 0, "high", 0, "medium", 0);
+        int dastCritical = dastSeverity.getOrDefault("critical", 0);
+        int dastHigh = dastSeverity.getOrDefault("high", 0);
+        int dastMedium = dastSeverity.getOrDefault("medium", 0);
+        int dastLow = dastSeverity.getOrDefault("low", 0);
+        // buildToolMetrics() construit l'entrée "zap" à partir de summary.dast (comptage jq fait
+        // dans .gitlab-ci.yml, sur les GROUPES d'alertes ZAP -- pas fiable) alors que resolveDastSeverity
+        // ci-dessus préfère à raison dd.getDastBySeverity() (vrais findings DefectDojo) dès que
+        // disponible. Sans ce correctif, la carte outil ZAP affichée peut ne pas correspondre aux
+        // findings réels (ex. constaté le 28 août 2026 : "12 high" affiché alors que DefectDojo
+        // n'avait que 3 Medium + 5 Low + 4 Info, 0 High -- summary.dast.high comptait autre chose).
+        if (dastApplicable) {
+            for (QualityGateToolMetricDto t : toolMetrics) {
+                if ("zap".equals(t.getId())) {
+                    t.setCritical(dastCritical);
+                    t.setHigh(dastHigh);
+                    t.setMedium(dastMedium);
+                    t.setLow(dastLow);
+                    t.setTotal(dastCritical + dastHigh + dastMedium + dastLow);
+                    break;
+                }
+            }
+        }
+
+        // Conteneur (Grype) : dimension à part pour le score (paliers absolus, voir
+        // SecurityScoringService), contrairement au DAST pas limité aux pipelines de déploiement --
+        // Grype tourne aussi bien en scan-only qu'en déploiement (voir .gitlab-ci.yml). Même
+        // correctif de cohérence carte outil que pour "zap" ci-dessus : buildToolMetrics() peut
+        // construire l'entrée "grype" à partir d'un résumé CI différent de ce que compte réellement
+        // DefectDojo pour ce pipeline (diagnostic du 29/08/2026 : "raw" Grype à 175, DefectDojo à
+        // 349 pour le même pipeline) -- on repatch avec la valeur qui sert réellement au score.
+        Map<String, Integer> containerSeverity = resolveContainerSeverity(dd, summary, toolMetrics, defectDojoUiAvailable);
+        int containerCritical = containerSeverity.getOrDefault("critical", 0);
+        int containerHigh = containerSeverity.getOrDefault("high", 0);
+        int containerMedium = containerSeverity.getOrDefault("medium", 0);
+        int containerLow = containerSeverity.getOrDefault("low", 0);
+        for (QualityGateToolMetricDto t : toolMetrics) {
+            if ("grype".equals(t.getId())) {
+                t.setCritical(containerCritical);
+                t.setHigh(containerHigh);
+                t.setMedium(containerMedium);
+                t.setLow(containerLow);
+                t.setTotal(containerCritical + containerHigh + containerMedium + containerLow);
+                break;
+            }
+        }
+
         Map<String, Object> effectiveSummary = usePipelineSummary || metricsFromSecurityValidation
                 ? summary
                 : syntheticSummaryFromTools(toolMetrics);
@@ -2032,6 +2236,15 @@ public class QualityGateService {
         metrics.put("ddCritical", ddCritical);
         metrics.put("sonarCritical", sonarDisplayAvailable ? sonarCritical : 0);
         metrics.put("combinedCritical", ddCritical + (sonarDisplayAvailable ? sonarCritical : 0));
+        metrics.put("dastApplicable", dastApplicable);
+        metrics.put("dastEvaluable", dastEvaluable);
+        metrics.put("dastCritical", dastCritical);
+        metrics.put("dastHigh", dastHigh);
+        metrics.put("dastMedium", dastMedium);
+        metrics.put("containerCritical", containerCritical);
+        metrics.put("containerHigh", containerHigh);
+        metrics.put("containerMedium", containerMedium);
+        metrics.put("containerLow", containerLow);
         SecurityValidationJobState svJobState = securityValidationJobState(execution);
         metrics.put("securityValidationGitlabFailed", svJobState == SecurityValidationJobState.FAILED);
         metrics.put("securityValidationSucceeded", svJobState == SecurityValidationJobState.SUCCESS);
@@ -2053,16 +2266,26 @@ public class QualityGateService {
                 .sonarQgStatus(stringVal(sonarFlat.get("quality_gate_status")))
                 .defectDojoAvailable(ddCriticalRes.availableForHardGate())
                 .sonarAvailable(sonarDisplayAvailable)
+                .dastApplicable(dastApplicable)
+                .dastEvaluable(dastEvaluable)
+                .dastCritical(dastCritical)
+                .dastHigh(dastHigh)
+                .dastMedium(dastMedium)
                 .build();
         SecurityScoringService.HardGateEvaluation hardGates = securityScoringService.evaluateHardGates(hardGateInput);
 
-        SecurityScoreDto securityScore = null;
-        if (hardGates.violations().isEmpty() && hardGates.indeterminateSources().isEmpty()) {
-            SecurityScoreInput scoreInput = buildSecurityScoreInput(
-                    bySeverity, effectiveSummary, stages, sonarFlat, sonar, storedGate,
-                    ddCriticalRes.availableForHardGate(), sonarDisplayAvailable, sonarBlockers, resolvedNcloc);
-            securityScore = securityScoringService.computePostureScore(scoreInput);
-        }
+        // Le score de posture est désormais toujours calculé, même si un hard gate est violé --
+        // resolveDeterministicVerdict() (SecurityScoringService) regarde les violations/indéterminés
+        // AVANT de consulter securityScore.getDerivedVerdict(), donc la recommandation finale reste
+        // strictement inchangée ; seul le score devient toujours visible à l'utilisateur.
+        SecurityScoreInput scoreInput = buildSecurityScoreInput(
+                bySeverity, effectiveSummary, stages, sonarFlat, sonar, storedGate,
+                ddCriticalRes.availableForHardGate(), sonarDisplayAvailable, sonarBlockers, resolvedNcloc,
+                dastApplicable, dastCritical, dastHigh, dastMedium,
+                containerCritical, containerHigh, containerMedium, containerLow,
+                lowercaseDoubleKeys(dd != null ? dd.getAvgCvssBySeverity() : null),
+                lowercaseIntKeys(dd != null ? dd.getCvssKnownCountBySeverity() : null));
+        SecurityScoreDto securityScore = securityScoringService.computePostureScore(scoreInput);
 
         VerdictResolution verdictResolution = resolveDeterministicVerdict(hardGates, securityScore);
         String verdict = verdictResolution.verdict();
@@ -2658,9 +2881,25 @@ public class QualityGateService {
                 .build();
     }
 
+    /**
+     * Dernière exécution SCAN (pas la dernière exécution tout court) — c'est le point d'entrée par
+     * défaut du Quality Gate service (getForApplication sans pipelineId/environmentId explicite).
+     * Bug corrigé le 7 septembre 2026 : cette méthode utilisait
+     * {@link PipelineExecutionRepository#findByApplicationIdAndBranchOrderByCreatedAtDesc}, sans
+     * filtre de type, si bien qu'un déploiement (DEPLOY) plus récent que le dernier scan de
+     * sécurité (SCAN) — cas fréquent : redéployer une image déjà scannée sans relancer de scan —
+     * devenait "la dernière exécution", et son {@code quality_gate_json} (vide de résultats de scan,
+     * un DEPLOY ne fait tourner ni SAST/SCA/Container/DAST) masquait silencieusement le vrai verdict
+     * du dernier scan réel (constaté en direct : service affichant "recommandé" malgré des
+     * vulnérabilités critiques réelles sur son dernier scan, et "Actualiser" ne changeant rien
+     * puisque le live refresh retombait sur le même pipeline DEPLOY mal choisi). La variante filtrée
+     * par {@link PipelineExecutionKind#SCAN} existe déjà et est utilisée ailleurs dans cette classe
+     * (voir {@code loadQualityGateBatches}) — il ne restait qu'à l'utiliser ici aussi.
+     */
     private PipelineExecution findLatestExecution(UUID applicationId, String branch) {
         List<PipelineExecution> list = pipelineExecutionRepository
-                .findByApplicationIdAndBranchOrderByCreatedAtDesc(applicationId, branch, PageRequest.of(0, 1));
+                .findByApplicationIdAndBranchAndExecutionKindOrderByCreatedAtDesc(
+                        applicationId, branch, PipelineExecutionKind.SCAN, PageRequest.of(0, 1));
         return list.isEmpty() ? null : list.get(0);
     }
 
@@ -3073,7 +3312,10 @@ public class QualityGateService {
             return out;
         }
         for (QualityGateToolMetricDto t : tools) {
-            if ("sonarqube".equals(t.getId())) {
+            if ("sonarqube".equals(t.getId()) || "zap".equals(t.getId())) {
+                // SonarQube et ZAP (DAST) sont exclus des compteurs génériques : SonarQube a ses
+                // propres pénalités dédiées, ZAP a sa propre dimension (voir resolveDastSeverity /
+                // le gate "dast") -- les compter ici en plus reviendrait à les compter deux fois.
                 continue;
             }
             out.put("critical", out.get("critical") + t.getCritical());
@@ -3098,10 +3340,23 @@ public class QualityGateService {
         out.put("info", 0);
 
         if (defectDojoAvailable && dd != null && dd.getBySeverity() != null && !dd.getBySeverity().isEmpty()) {
-            out.put("critical", dd.getBySeverity().getOrDefault("Critical", 0));
-            out.put("high", dd.getBySeverity().getOrDefault("High", 0));
-            out.put("medium", dd.getBySeverity().getOrDefault("Medium", 0));
-            out.put("low", dd.getBySeverity().getOrDefault("Low", 0));
+            // DAST (ZAP) et conteneur (Grype) sont retirés ici : chacun a sa propre dimension
+            // (voir resolveDastSeverity/resolveContainerSeverity + SecurityScoringService), ne pas
+            // les compter aussi dans les buckets génériques -- sans quoi ils y seraient pénalisés
+            // deux fois (une fois ici par densité ncloc, une fois dans leur propre dimension).
+            // Math.max(0, ...) défensif : bySeverity, dastBySeverity et containerBySeverity ne sont
+            // pas garantis d'appliquer exactement le même filtrage (findings actifs/dédupliqués),
+            // une légère divergence ne doit jamais produire un compteur négatif.
+            Map<String, Integer> dastBySeverity = dd.getDastBySeverity() != null ? dd.getDastBySeverity() : Map.of();
+            Map<String, Integer> containerBySeverity = dd.getContainerBySeverity() != null ? dd.getContainerBySeverity() : Map.of();
+            out.put("critical", Math.max(0, dd.getBySeverity().getOrDefault("Critical", 0)
+                    - dastBySeverity.getOrDefault("Critical", 0) - containerBySeverity.getOrDefault("Critical", 0)));
+            out.put("high", Math.max(0, dd.getBySeverity().getOrDefault("High", 0)
+                    - dastBySeverity.getOrDefault("High", 0) - containerBySeverity.getOrDefault("High", 0)));
+            out.put("medium", Math.max(0, dd.getBySeverity().getOrDefault("Medium", 0)
+                    - dastBySeverity.getOrDefault("Medium", 0) - containerBySeverity.getOrDefault("Medium", 0)));
+            out.put("low", Math.max(0, dd.getBySeverity().getOrDefault("Low", 0)
+                    - dastBySeverity.getOrDefault("Low", 0) - containerBySeverity.getOrDefault("Low", 0)));
             out.put("info", dd.getBySeverity().getOrDefault("Info", 0));
             return out;
         }
@@ -3114,13 +3369,13 @@ public class QualityGateService {
             Map<String, Object> sca = mapVal(summary, "sca");
             Map<String, Object> container = mapVal(summary, "container");
             Map<String, Object> sast = mapVal(summary, "sast");
-            Map<String, Object> dast = mapVal(summary, "dast");
             int secrets = intVal(summary.get("secrets"));
+            // dast.{high,medium,low} n'est plus fondu ici : il alimente désormais exclusivement
+            // resolveDastSeverity() / le gate "dast" dédié.
             out.put("critical", intVal(sca.get("critical")) + intVal(container.get("critical")) + secrets);
-            out.put("high", intVal(sca.get("high")) + intVal(container.get("high"))
-                    + intVal(sast.get("semgrep_high")) + intVal(dast.get("high")));
-            out.put("medium", intVal(sca.get("medium")) + intVal(sast.get("semgrep_medium")) + intVal(dast.get("medium")));
-            out.put("low", intVal(sca.get("low")) + intVal(dast.get("low")));
+            out.put("high", intVal(sca.get("high")) + intVal(container.get("high")) + intVal(sast.get("semgrep_high")));
+            out.put("medium", intVal(sca.get("medium")) + intVal(sast.get("semgrep_medium")));
+            out.put("low", intVal(sca.get("low")));
             return out;
         }
 
@@ -3353,7 +3608,7 @@ public class QualityGateService {
         boolean pipelineBlocked = false;
 
         for (String stageName : STAGE_ORDER) {
-            Map<String, Object> job = findJob(jobsByStage, stageName);
+            Map<String, Object> job = findJob(jobsByStage, jobs, stageName);
             if (job == null && !isAlwaysShownStage(stageName, hasSummary, storedGate)) {
                 continue;
             }
@@ -3428,6 +3683,19 @@ public class QualityGateService {
     }
 
     private Map<String, Object> findJob(Map<String, Map<String, Object>> jobsByStage, String stageName) {
+        return findJob(jobsByStage, List.of(), stageName);
+    }
+
+    /**
+     * @param jobs liste brute (non compressée par stage) -- nécessaire car {@code jobsByStage}
+     *             ({@link #indexJobs}) ne retient qu'un seul job par stage : quand deux jobs
+     *             partagent le même stage (ex. {@code hadolint-dockerfile} et {@code semgrep-sast}
+     *             partagent tous deux {@code sast}, {@code checkov-iac} et {@code gitleaks-secrets}
+     *             partagent tous deux {@code secrets-iac}), le perdant devient invisible via
+     *             {@code jobsByStage} seul -- d'où le repli par nom exact ci-dessous, sur la liste
+     *             complète.
+     */
+    private Map<String, Object> findJob(Map<String, Map<String, Object>> jobsByStage, List<Map<String, Object>> jobs, String stageName) {
         String canonical = stageName.toLowerCase(Locale.ROOT);
         for (String alias : stageAliases(canonical)) {
             Map<String, Object> job = jobsByStage.get(alias);
@@ -3452,6 +3720,21 @@ public class QualityGateService {
                     if (jn.equals(alias) || jn.replace('_', '-').equals(alias)) {
                         return job;
                     }
+                }
+            }
+        }
+        // Repli par nom exact sur la liste brute (jamais de contains() : préfixe "alias-" uniquement,
+        // pour ne jamais faire matcher "setup" avec "sonarqube-setup" -- même garde-fou que ci-dessus,
+        // juste étendu à tous les jobs plutôt qu'aux seuls survivants de la compression par stage).
+        for (Map<String, Object> job : jobs) {
+            String jobName = stringVal(job.get("name"));
+            if (jobName == null) {
+                continue;
+            }
+            String jn = jobName.toLowerCase(Locale.ROOT).replace('_', '-');
+            for (String alias : stageAliases(canonical)) {
+                if (jn.equals(alias) || jn.startsWith(alias + "-")) {
+                    return job;
                 }
             }
         }
@@ -4086,6 +4369,99 @@ public class QualityGateService {
         return state == GitlabJobState.SUCCESS;
     }
 
+    /**
+     * Le gate DAST n'est évaluable que si le job ZAP a réussi sur GitLab. À ne pas confondre avec
+     * "applicable" (voir {@link #resolveDastSeverity}) : DAST ne s'applique qu'aux pipelines de
+     * déploiement (ZAP ne tourne jamais en scan-only), là où "évaluable" ne fait que vérifier,
+     * pour un pipeline où DAST s'applique, si le job a bien terminé.
+     */
+    private boolean isDastJobEvaluable(PipelineExecution execution) {
+        GitlabJobState state = gitlabJobStateForStages(execution, TOOL_GITLAB_STAGES.get("zap"));
+        return state == GitlabJobState.SUCCESS;
+    }
+
+    /**
+     * Répartition par sévérité des findings DAST (ZAP), avec 3 niveaux de repli -- même logique
+     * de priorité que {@link #buildBySeverity} : (1) le comptage DefectDojo scopé au Test ZAP du
+     * pipeline (le plus précis), (2) le résumé du pipeline (`summary.dast`), (3) l'entrée "zap"
+     * déjà présente dans les métriques par outil (repli grossier : total jeté dans "high").
+     */
+    private Map<String, Integer> resolveDastSeverity(
+            DefectDojoDashboard2Response dd,
+            Map<String, Object> summary,
+            List<QualityGateToolMetricDto> tools,
+            boolean defectDojoAvailable
+    ) {
+        if (defectDojoAvailable && dd != null && dd.getDastBySeverity() != null && !dd.getDastBySeverity().isEmpty()) {
+            Map<String, Integer> d = dd.getDastBySeverity();
+            return Map.of(
+                    "critical", d.getOrDefault("Critical", 0),
+                    "high", d.getOrDefault("High", 0),
+                    "medium", d.getOrDefault("Medium", 0),
+                    "low", d.getOrDefault("Low", 0));
+        }
+        if (summary != null && !summary.isEmpty()) {
+            Map<String, Object> dast = mapVal(summary, "dast");
+            if (!dast.isEmpty()) {
+                return Map.of(
+                        "critical", 0,
+                        "high", intVal(dast.get("high")),
+                        "medium", intVal(dast.get("medium")),
+                        "low", intVal(dast.get("low")));
+            }
+        }
+        if (tools != null) {
+            for (QualityGateToolMetricDto t : tools) {
+                if ("zap".equals(t.getId())) {
+                    return Map.of("critical", t.getCritical(), "high", t.getHigh(), "medium", t.getMedium(),
+                            "low", t.getLow());
+                }
+            }
+        }
+        return Map.of("critical", 0, "high", 0, "medium", 0, "low", 0);
+    }
+
+    /**
+     * Symétrique de {@link #resolveDastSeverity} pour le conteneur (Grype) -- ajouté le 29/08/2026
+     * (diagnostic score-à-0, voir SecurityScoringService pour les paliers CONTAINER_*). Même ordre
+     * de préférence : DefectDojo scopé pipeline d'abord, puis le résumé CI, puis l'entrée "grype"
+     * de toolMetrics en dernier repli.
+     */
+    private Map<String, Integer> resolveContainerSeverity(
+            DefectDojoDashboard2Response dd,
+            Map<String, Object> summary,
+            List<QualityGateToolMetricDto> tools,
+            boolean defectDojoAvailable
+    ) {
+        if (defectDojoAvailable && dd != null && dd.getContainerBySeverity() != null && !dd.getContainerBySeverity().isEmpty()) {
+            Map<String, Integer> c = dd.getContainerBySeverity();
+            return Map.of(
+                    "critical", c.getOrDefault("Critical", 0),
+                    "high", c.getOrDefault("High", 0),
+                    "medium", c.getOrDefault("Medium", 0),
+                    "low", c.getOrDefault("Low", 0));
+        }
+        if (summary != null && !summary.isEmpty()) {
+            Map<String, Object> container = mapVal(summary, "container");
+            if (!container.isEmpty()) {
+                return Map.of(
+                        "critical", intVal(container.get("critical")),
+                        "high", intVal(container.get("high")),
+                        "medium", intVal(container.get("medium")),
+                        "low", intVal(container.get("low")));
+            }
+        }
+        if (tools != null) {
+            for (QualityGateToolMetricDto t : tools) {
+                if ("grype".equals(t.getId())) {
+                    return Map.of("critical", t.getCritical(), "high", t.getHigh(), "medium", t.getMedium(),
+                            "low", t.getLow());
+                }
+            }
+        }
+        return Map.of("critical", 0, "high", 0, "medium", 0, "low", 0);
+    }
+
     private static final Map<String, String[]> TOOL_GITLAB_STAGES = Map.ofEntries(
             Map.entry("trivy", new String[]{"sca", "sca-trivy", "trivy"}),
             Map.entry("semgrep", new String[]{"sast", "semgrep"}),
@@ -4174,8 +4550,15 @@ public class QualityGateService {
             return List.of();
         }
         LinkedHashSet<String> labels = new LinkedHashSet<>();
+        boolean dastApplicable = execution.getExecutionKind() == PipelineExecutionKind.DEPLOY;
         for (Map.Entry<String, String[]> entry : TOOL_GITLAB_STAGES.entrySet()) {
             if ("sonarqube".equals(entry.getKey())) {
+                continue;
+            }
+            // ZAP ne tourne jamais sur un pipeline scan-only (par construction, voir dastApplicable
+            // dans buildResult()) -- l'exiger ici reviendrait à toujours signaler un job qui n'a
+            // jamais eu vocation à s'exécuter.
+            if ("zap".equals(entry.getKey()) && !dastApplicable) {
                 continue;
             }
             GitlabJobState state = gitlabJobStateForStages(execution, entry.getValue());
@@ -4228,7 +4611,7 @@ public class QualityGateService {
         Map<String, Map<String, Object>> byStage = indexJobs(jobs);
         GitlabJobState best = GitlabJobState.MISSING;
         for (String canonical : canonicalStages) {
-            Map<String, Object> job = findJob(byStage, canonical);
+            Map<String, Object> job = findJob(byStage, jobs, canonical);
             if (job == null) {
                 continue;
             }
@@ -4535,7 +4918,11 @@ public class QualityGateService {
             Map<String, Object> sonarFlat
     ) {
         Object ratingRaw = sonarFlat.get(ratingKey);
-        if (ratingRaw == null || intVal(ratingRaw) == 0) {
+        // Ne retomber sur la clé historique que si la valeur principale est vraiment absente ou
+        // illisible -- intVal(ratingRaw) == 0 déclenchait ce repli à tort pour toute note valide
+        // exprimée en lettre ("A") ou en décimal ("1.0"), puisque Integer.parseInt échoue dessus
+        // et renvoie 0 par défaut (ratingToLetter, lui, sait lire les deux formats).
+        if (ratingRaw == null || SecurityScoringService.ratingToLetter(ratingRaw) == null) {
             ratingRaw = switch (dimension) {
                 case "SECURITY" -> firstNonNull(
                         sonarFlat.get("security_rating"),
@@ -4549,7 +4936,7 @@ public class QualityGateService {
             };
         }
         String rating = SecurityScoringService.ratingToLetter(ratingRaw);
-        int ratingValue = SecurityScoringService.ratingNumeric(ratingRaw);
+        Integer ratingValue = rating != null ? SecurityScoringService.ratingNumeric(ratingRaw) : null;
         int issues = intVal(sonarFlat.get(issuesKey));
 
         Map<String, Integer> bySeverity = null;
@@ -4594,6 +4981,20 @@ public class QualityGateService {
         return out;
     }
 
+    private static Map<String, Double> lowercaseDoubleKeys(Map<String, Double> m) {
+        if (m == null || m.isEmpty()) return Map.of();
+        Map<String, Double> out = new LinkedHashMap<>();
+        m.forEach((k, v) -> out.put(k.toLowerCase(Locale.ROOT), v));
+        return out;
+    }
+
+    private static Map<String, Integer> lowercaseIntKeys(Map<String, Integer> m) {
+        if (m == null || m.isEmpty()) return Map.of();
+        Map<String, Integer> out = new LinkedHashMap<>();
+        m.forEach((k, v) -> out.put(k.toLowerCase(Locale.ROOT), v));
+        return out;
+    }
+
     private SecurityScoreInput buildSecurityScoreInput(
             Map<String, Integer> bySeverity,
             Map<String, Object> summary,
@@ -4604,14 +5005,23 @@ public class QualityGateService {
             boolean defectDojoAvailable,
             boolean sonarLiveAvailable,
             int sonarBlockers,
-            int resolvedNcloc
+            int resolvedNcloc,
+            boolean dastApplicable,
+            int dastCritical,
+            int dastHigh,
+            int dastMedium,
+            int containerCritical,
+            int containerHigh,
+            int containerMedium,
+            int containerLow,
+            Map<String, Double> avgCvssBySeverity,
+            Map<String, Integer> cvssKnownCountBySeverity
     ) {
-        Map<String, Object> container = mapVal(summary, "container");
-        int containerCritical = intVal(container.get("critical"));
-        if (containerCritical == 0 && storedGate != null) {
-            containerCritical = intVal(storedGate.get("containerCritical"));
-        }
-
+        // containerCritical/High/Medium/Low arrivent désormais résolus par l'appelant via
+        // resolveContainerSeverity() (DefectDojo scopé pipeline en priorité, voir buildResult) --
+        // avant le 29/08/2026 ce champ était recalculé ici depuis summary.container/storedGate et
+        // n'était de toute façon jamais consommé par computePostureScore(). Seuils de hard gate
+        // (containerCriticalThreshold/scaCriticalThreshold) inchangés, indépendants de ce calcul.
         int containerThreshold = thresholdFromSummaryOrDefault(
                 summary, "containerCritical", QualityGateThresholds.CONTAINER_CRITICAL);
         int scaCriticalThreshold = thresholdFromSummaryOrDefault(
@@ -4628,6 +5038,9 @@ public class QualityGateService {
                 .ddBySeverity(bySeverity)
                 .secrets(intVal(summary.get("secrets")))
                 .containerCritical(containerCritical)
+                .containerHigh(containerHigh)
+                .containerMedium(containerMedium)
+                .containerLow(containerLow)
                 .containerCriticalThreshold(containerThreshold)
                 .scaCriticalThreshold(scaCriticalThreshold)
                 .sonarQgStatus(stringVal(sonarFlat.get("quality_gate_status")))
@@ -4644,6 +5057,12 @@ public class QualityGateService {
                 .defectDojoAvailable(defectDojoAvailable)
                 .sonarBlockers(sonarBlockers)
                 .ncloc(resolvedNcloc > 0 ? resolvedNcloc : intVal(sonarFlat.get("ncloc")))
+                .dastApplicable(dastApplicable)
+                .dastCritical(dastCritical)
+                .dastHigh(dastHigh)
+                .dastMedium(dastMedium)
+                .avgCvssBySeverity(avgCvssBySeverity)
+                .cvssKnownCountBySeverity(cvssKnownCountBySeverity)
                 .build();
     }
 

@@ -5,6 +5,9 @@
 #   • Scan    : ACTION absent ou != "deploy" → jobs scan (default rules)
 #   • Deploy  : ACTION=deploy → jobs deploy:* uniquement
 #
+# Runner : désactiver les instance/shared runners du projet GitLab pour forcer
+# le runner self-hosted Windows Docker (host.docker.internal → Sonar/Dojo/backend).
+#
 # DefectDojo : tag pipeline-${CI_PIPELINE_ID} (+ scan ou deploy) pour filtrer
 # les résultats par exécution GitLab (dashboard / quality gate).
 #
@@ -209,27 +212,40 @@ sonarqube-setup:
       REPO_NAME=$(echo "${GIT_REPO_URL}" | sed -E 's|.*/||; s|\.git$||')
       PROJECT_KEY=$(echo "${GIT_REPO_URL}" | sed -E 's|https?://||; s|\.git$||; s|/|_|g; s|[^a-zA-Z0-9_]|_|g')
       echo "Project key = ${PROJECT_KEY}"
+      echo "SONAR_HOST_URL=${SONAR_HOST_URL}"
+      # Préfixe seul (ne jamais logger le token complet) — sqa_/sqp_ → 403 sur /api/projects/*
+      TOKEN_PREFIX=$(printf '%s' "${SONAR_TOKEN}" | cut -c1-4)
+      echo "SONAR_TOKEN prefix=${TOKEN_PREFIX}… (len=${#SONAR_TOKEN})"
+      if [ "$TOKEN_PREFIX" = "sqa_" ] || [ "$TOKEN_PREFIX" = "sqp_" ]; then
+        echo "⚠️ Token type ${TOKEN_PREFIX} : insuffisant pour /api/projects/search|create."
+        echo "   Générez un User Token (squ_…) dans Sonar → My Account → Security."
+      fi
       RESPONSE=$(curl -s -w "\n%{http_code}" -u "${SONAR_TOKEN}:" \
         "${SONAR_HOST_URL}/api/projects/search?projects=${PROJECT_KEY}" 2>&1) || true
       HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
       BODY=$(echo "$RESPONSE" | head -n-1)
       if [ "$HTTP_CODE" != "200" ]; then
         echo "SonarQube API error HTTP $HTTP_CODE — skip"
+        echo "Response body (truncated): $(echo "$BODY" | head -c 400)"
         echo "PROJECT_KEY=" >> project.env
         exit 0
       fi
       EXISTS=$(echo "$BODY" | jq -r '.components | length // 0')
       if [ "$EXISTS" -eq 0 ]; then
-        curl -s -X POST -u "${SONAR_TOKEN}:" \
+        CREATE_RESP=$(curl -s -w "\n%{http_code}" -X POST -u "${SONAR_TOKEN}:" \
           "${SONAR_HOST_URL}/api/projects/create" \
-          -d "project=${PROJECT_KEY}&name=${REPO_NAME}&visibility=private"
+          -d "project=${PROJECT_KEY}&name=${REPO_NAME}" 2>&1) || true
+        CREATE_CODE=$(echo "$CREATE_RESP" | tail -n1)
+        CREATE_BODY=$(echo "$CREATE_RESP" | head -n-1)
+        echo "projects/create HTTP $CREATE_CODE — $(echo "$CREATE_BODY" | head -c 200)"
       fi
       curl -s -X POST -u "${SONAR_TOKEN}:" \
         "${SONAR_HOST_URL}/api/qualitygates/select" \
-        -d "projectKey=${PROJECT_KEY}&gateName=Sonar way"
+        -d "projectKey=${PROJECT_KEY}&gateName=Sonar way" >/dev/null || true
       echo "PROJECT_KEY=${PROJECT_KEY}" >> project.env
-      printf 'SONAR_DASHBOARD_URL="%s/dashboard?id=%s&branch=%s"\n' \
-        "$SONAR_HOST_URL" "$PROJECT_KEY" "$GIT_BRANCH" >> project.env
+      # Community Build : pas de param branch dans l'URL dashboard
+      printf 'SONAR_DASHBOARD_URL="%s/dashboard?id=%s"\n' \
+        "$SONAR_HOST_URL" "$PROJECT_KEY" >> project.env
   artifacts:
     reports:
       dotenv: project.env
@@ -251,12 +267,13 @@ sonarqube-scan:
       fi
     - cd user-repo
     - |
+      # SonarQube Community Build : pas de sonar.branch.name (réservé Developer Edition+).
+      # La branche Git analysée reste celle clonée (GIT_BRANCH) ; le projet Sonar est mono-branche.
       sonar-scanner \
         -Dsonar.projectKey="${PROJECT_KEY}" \
         -Dsonar.sources=. \
         -Dsonar.host.url="${SONAR_HOST_URL}" \
         -Dsonar.token="${SONAR_TOKEN}" \
-        -Dsonar.branch.name="${GIT_BRANCH}" \
         -Dsonar.exclusions="**/node_modules/**,**/dist/**,**/target/**,**/build/**"
   allow_failure: true
 
@@ -268,6 +285,10 @@ trivy-fs-scan:
   stage: sca
   image: alpine:latest
   needs: ["clone-repository"]
+  variables:
+    # Téléchargement DB ~100 Mo : le défaut (5m) timeout souvent sur ADSL / CI locale.
+    TRIVY_TIMEOUT: "15m"
+    TRIVY_DB_REPOSITORY: "ghcr.io/aquasecurity/trivy-db:2"
   before_script:
     - apk add --no-cache curl
     - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
@@ -275,17 +296,37 @@ trivy-fs-scan:
     - echo "Trivy FS — Universal SCA"
     - mkdir -p reports/trivy
     - |
+      set +e
       trivy fs \
         --scanners vuln \
+        --timeout "${TRIVY_TIMEOUT}" \
         --format json \
         --output reports/trivy/trivy-fs.json \
-        user-repo/ || true
+        user-repo/
+      TRIVY_RC=$?
+      set -e
+      if [ "$TRIVY_RC" -ne 0 ] || [ ! -f reports/trivy/trivy-fs.json ]; then
+        echo "⚠️ Trivy FS échoué (rc=$TRIVY_RC) — retry avec mirror ECR…"
+        export TRIVY_DB_REPOSITORY="public.ecr.aws/aquasecurity/trivy-db:2"
+        trivy fs \
+          --scanners vuln \
+          --timeout "${TRIVY_TIMEOUT}" \
+          --format json \
+          --output reports/trivy/trivy-fs.json \
+          user-repo/ || true
+      fi
+      # Stub pour ne pas faire échouer l'upload d'artifacts si la DB n'a pas pu être téléchargée.
+      if [ ! -f reports/trivy/trivy-fs.json ]; then
+        echo '{"Results":[],"error":"trivy-db-download-failed"}' > reports/trivy/trivy-fs.json
+        echo "⚠️ Rapport Trivy vide (DB indisponible) — pipeline continue (allow_failure)."
+      fi
     - |
       apk add --no-cache jq 2>/dev/null || true
       CRIT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' reports/trivy/trivy-fs.json 2>/dev/null || echo 0)
       HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' reports/trivy/trivy-fs.json 2>/dev/null || echo 0)
       echo "Trivy FS: CRITICAL=$CRIT HIGH=$HIGH"
   artifacts:
+    when: always
     paths:
       - reports/trivy/trivy-fs.json
     expire_in: 1 day
@@ -791,11 +832,19 @@ import-defectdojo:
         if [ ! -f "$FILE" ] || [ ! -s "$FILE" ]; then
           echo "[$LABEL] missing or empty"; return
         fi
+        # Stub Trivy (DB download failed) → ne pas importer dans Dojo
+        if echo "$FILE" | grep -q 'trivy' && jq -e '.error == "trivy-db-download-failed"' "$FILE" >/dev/null 2>&1; then
+          echo "[$LABEL] skipped — Trivy DB download failed (rapport stub)"
+          return
+        fi
         ENCODED_TYPE=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$SCAN_TYPE" 2>/dev/null || echo "$SCAN_TYPE" | sed 's/ /%20/g')
         ALL_TESTS=$(curl -s -H "Authorization: ${DOJO_AUTH}" \
           "${DEFECTDOJO_URL}/api/v2/tests/?engagement=${ENGAGEMENT_ID}&scan_type=${ENCODED_TYPE}&limit=100" \
-          | jq -r '.results[].id' | sort -n)
-        COUNT=$(echo "$ALL_TESTS" | grep -c . 2>/dev/null || echo 0)
+          | jq -r '.results[].id // empty' | grep -E '^[0-9]+$' | sort -n || true)
+        COUNT=0
+        if [ -n "$ALL_TESTS" ]; then
+          COUNT=$(printf '%s\n' "$ALL_TESTS" | wc -l | tr -d ' ')
+        fi
         if [ "$COUNT" -gt 1 ]; then
           LATEST=$(echo "$ALL_TESTS" | tail -1)
           for ID in $ALL_TESTS; do
@@ -827,6 +876,7 @@ import-defectdojo:
 
       echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
       smart_import "reports/trivy/trivy-fs.json"             "Trivy Scan"                "Trivy FS"
+      smart_import "reports/license/sbom-spdx.json"          "SPDX"                      "Syft SPDX"
       smart_import "reports/sast/semgrep.json"               "Semgrep JSON Report"       "Semgrep"
       smart_import "reports/sast/hadolint.json"              "Hadolint Dockerfile check" "Hadolint"
       smart_import "reports/secrets/gitleaks.json"           "Gitleaks Scan"             "Gitleaks"
@@ -926,9 +976,15 @@ security-validation:
       SONAR_BUGS=0; SONAR_VULNERABILITIES=0; SONAR_SECURITY_HOTSPOTS=0; SONAR_NCLOC=0
       SONAR_SECURITY_RATING="N/A"
       if [ -n "${SONAR_HOST_URL:-}" ] && [ -n "${SONAR_TOKEN:-}" ] && [ -n "${PROJECT_KEY:-}" ]; then
+        # Community Build : pas de &branch= (mono-branche). Fallback avec branch pour Developer/SonarCloud.
         MEASURES=$(curl -sf -u "${SONAR_TOKEN}:" \
-          "${SONAR_HOST_URL}/api/measures/component?component=${PROJECT_KEY}&branch=${GIT_BRANCH}&metricKeys=bugs,vulnerabilities,security_hotspots,ncloc,software_quality_security_rating" \
+          "${SONAR_HOST_URL}/api/measures/component?component=${PROJECT_KEY}&metricKeys=bugs,vulnerabilities,security_hotspots,ncloc,software_quality_security_rating" \
           2>/dev/null || echo "")
+        if [ -z "$MEASURES" ] && [ -n "${GIT_BRANCH:-}" ]; then
+          MEASURES=$(curl -sf -u "${SONAR_TOKEN}:" \
+            "${SONAR_HOST_URL}/api/measures/component?component=${PROJECT_KEY}&branch=${GIT_BRANCH}&metricKeys=bugs,vulnerabilities,security_hotspots,ncloc,software_quality_security_rating" \
+            2>/dev/null || echo "")
+        fi
         if [ -n "$MEASURES" ]; then
           SONAR_AVAILABLE=true
           SONAR_BUGS=$(to_int "$(echo "$MEASURES" | jq -r '.component.measures[]? | select(.metric=="bugs") | .value // "0"')")
@@ -937,7 +993,11 @@ security-validation:
           SONAR_NCLOC=$(to_int "$(echo "$MEASURES" | jq -r '.component.measures[]? | select(.metric=="ncloc") | .value // "0"')")
           SONAR_SECURITY_RATING=$(echo "$MEASURES" | jq -r '.component.measures[]? | select(.metric=="software_quality_security_rating") | .value // "N/A"')
           QG=$(curl -sf -u "${SONAR_TOKEN}:" \
-            "${SONAR_HOST_URL}/api/qualitygates/project_status?projectKey=${PROJECT_KEY}&branch=${GIT_BRANCH}" 2>/dev/null || echo "")
+            "${SONAR_HOST_URL}/api/qualitygates/project_status?projectKey=${PROJECT_KEY}" 2>/dev/null || echo "")
+          if [ -z "$QG" ] && [ -n "${GIT_BRANCH:-}" ]; then
+            QG=$(curl -sf -u "${SONAR_TOKEN}:" \
+              "${SONAR_HOST_URL}/api/qualitygates/project_status?projectKey=${PROJECT_KEY}&branch=${GIT_BRANCH}" 2>/dev/null || echo "")
+          fi
           SONAR_QUALITY_GATE=$(echo "$QG" | jq -r '.projectStatus.status // "N/A"')
         fi
       fi
@@ -1096,19 +1156,17 @@ publish-ai-context:
     - |
       echo "publish-ai-context → BACKEND_URL=${BACKEND_URL:-<non défini>}"
       if [ -z "$BACKEND_URL" ]; then
-        echo "⚠ BACKEND_URL vide — définir la variable CI/CD GitLab (Settings → CI/CD → Variables)"
+        echo "⚠ BACKEND_URL vide — définir BACKEND_PUBLIC_URL côté backend (.env) ou variable CI GitLab"
         exit 0
       fi
-      if echo "$BACKEND_URL" | grep -qE 'host\.docker\.internal|localhost|127\.0\.0\.1'; then
-        echo "⚠ BACKEND_URL injoignable depuis GitLab SaaS — contexte RAG ignoré"
-        exit 0
-      fi
-      HTTP_CODE=$(curl -s -o response.json -w "%{http_code}" -X POST \
+      # Ne plus skipper host.docker.internal : OK avec runner self-hosted Docker Desktop.
+      # Un curl réel décide si le backend est joignable.
+      HTTP_CODE=$(curl -sS --connect-timeout 10 --max-time 60 -o response.json -w "%{http_code}" -X POST \
         "$BACKEND_URL/api/knowledge/pipeline-context" \
         -H "Content-Type: application/json" \
         -H "X-Pipeline-Secret: $PIPELINE_SECRET" \
         -d @payload.json) || {
-          echo "⚠ curl exit $? — impossible de joindre $BACKEND_URL (tunnel actif ?)"
+          echo "⚠ curl échoué — impossible de joindre $BACKEND_URL (backend up ? network_mode runner ?)"
           exit 0
         }
       echo "Backend HTTP $HTTP_CODE"; cat response.json || true

@@ -90,6 +90,12 @@ public class GitLabService {
     @Value("${pipeline.secret:}")
     private String pipelineSecret;
 
+    @Value("${defectdojo.url:}")
+    private String defectDojoUrl;
+
+    @Value("${defectdojo.token:}")
+    private String defectDojoToken;
+
     // ============================================
     // PIPELINE - CRÉATION ET DÉCLENCHEMENT
     // ============================================
@@ -157,6 +163,7 @@ public class GitLabService {
             addVar(variablesList, "K8S_NAMESPACE", ns);
             addVar(variablesList, "ACTION", "deploy");
             addBackendUrlIfConfigured(variablesList);
+            addScanToolUrlsIfConfigured(variablesList);
             addVar(variablesList, "PIPELINE_SECRET", pipelineSecret != null ? pipelineSecret : "");
 
             return postPipeline(variablesList);
@@ -195,12 +202,36 @@ public class GitLabService {
             addVar(variablesList, "APPLICATION_ID", applicationId.toString());
             addVar(variablesList, "DOCKERFILE_PATH", dockerPath);
             addBackendUrlIfConfigured(variablesList);
+            addScanToolUrlsIfConfigured(variablesList);
             addVar(variablesList, "PIPELINE_SECRET", pipelineSecret != null ? pipelineSecret : "");
 
             return postPipeline(variablesList);
         } catch (Exception e) {
             log.error("❌ Erreur déclenchement scan: {}", e.getMessage());
             throw new RuntimeException("Impossible de lancer le scan: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Déclenche un pipeline CI avec un map de variables (scan lot / deploy-style).
+     * Injecte BACKEND_URL / Sonar / DefectDojo / PIPELINE_SECRET si absents.
+     */
+    public Pipeline triggerCiPipeline(Map<String, String> variables) {
+        try {
+            List<Map<String, String>> variablesList = new ArrayList<>();
+            if (variables != null) {
+                variables.forEach((k, v) -> addVar(variablesList, k, v));
+            }
+            boolean hasSecret = variables != null && variables.containsKey("PIPELINE_SECRET");
+            addBackendUrlIfConfigured(variablesList);
+            addScanToolUrlsIfConfigured(variablesList);
+            if (!hasSecret) {
+                addVar(variablesList, "PIPELINE_SECRET", pipelineSecret != null ? pipelineSecret : "");
+            }
+            return postPipeline(variablesList);
+        } catch (Exception e) {
+            log.error("❌ Erreur déclenchement pipeline CI: {}", e.getMessage());
+            throw new RuntimeException("Impossible de lancer le pipeline: " + e.getMessage(), e);
         }
     }
 
@@ -244,24 +275,43 @@ public class GitLabService {
     }
 
     /**
-     * N'envoie BACKEND_URL au pipeline que si une URL publique est configurée côté backend.
+     * Envoie BACKEND_URL au pipeline si une URL joignable depuis le runner est configurée.
+     * Inclut {@code host.docker.internal} (runner self-hosted Docker Desktop → backend local).
      * Sinon la variable CI/CD GitLab (BACKEND_URL) est utilisée telle quelle.
      */
     private void addBackendUrlIfConfigured(List<Map<String, String>> variablesList) {
-        if (!isPublicCallbackBaseUrl(callbackBaseUrl)) {
+        if (!isReachableFromLocalRunner(callbackBaseUrl)) {
             log.debug("BACKEND_URL non envoyé au pipeline — utilisation de la variable CI/CD GitLab si définie");
             return;
         }
         addVar(variablesList, "BACKEND_URL", callbackBaseUrl.trim());
     }
 
-    private static boolean isPublicCallbackBaseUrl(String url) {
+    /**
+     * Injecte Sonar + DefectDojo dans le pipeline (évite Cloudflare / variables GitLab qui changent).
+     * URLs locales {@code host.docker.internal} OK avec un runner Docker sur la même machine.
+     */
+    private void addScanToolUrlsIfConfigured(List<Map<String, String>> variablesList) {
+        if (isReachableFromLocalRunner(sonarHostUrl) && sonarToken != null && !sonarToken.isBlank()) {
+            addVar(variablesList, "SONAR_HOST_URL", sonarHostUrl.trim().replaceAll("/+$", ""));
+            addVar(variablesList, "SONAR_TOKEN", sonarToken.trim());
+            log.info("SONAR_HOST_URL injecté dans le pipeline: {}", sonarHostUrl.trim());
+        }
+        if (isReachableFromLocalRunner(defectDojoUrl) && defectDojoToken != null && !defectDojoToken.isBlank()) {
+            addVar(variablesList, "DEFECTDOJO_URL", defectDojoUrl.trim().replaceAll("/+$", ""));
+            addVar(variablesList, "DEFECTDOJO_TOKEN", defectDojoToken.trim());
+            log.info("DEFECTDOJO_URL injecté dans le pipeline: {}", defectDojoUrl.trim());
+        }
+    }
+
+    /** URL utilisable depuis un job CI sur Docker Desktop (ou URL publique https). */
+    private static boolean isReachableFromLocalRunner(String url) {
         if (url == null || url.isBlank()) {
             return false;
         }
         String normalized = url.trim().toLowerCase();
-        return !normalized.contains("host.docker.internal")
-                && !normalized.contains("localhost")
+        // localhost/127.x : le job CI voit le localhost du conteneur job, pas l'hôte.
+        return !normalized.contains("localhost")
                 && !normalized.startsWith("http://127.")
                 && !normalized.startsWith("https://127.");
     }
@@ -968,16 +1018,26 @@ public class GitLabService {
         return buildSonarUri(apiPath, params);
     }
 
+    /**
+     * ATTENTION : {@code metricKeys} est envoyé en un seul appel combiné (voir son usage plus bas).
+     * Si SonarQube rejette ne serait-ce qu'une seule clé de cette liste (HTTP 400 "metric key not
+     * found"), TOUT l'appel échoue et TOUTES les métriques sont perdues -- pas seulement la clé en
+     * cause. Vérifié le 2026-08-28 sur SonarQube 26.7.0 (api/server/version) : les clés à détail par
+     * sévérité pour les dimensions "software quality" (MQR) -- {@code software_quality_*_high_issues},
+     * {@code *_medium_issues}, {@code *_low_issues} -- ainsi que {@code software_quality_high_severity_issues}
+     * / {@code _medium_severity_issues} / {@code _low_severity_issues} n'existent PAS sur cette version
+     * (confirmé via GET /api/measures/component, réponse "metric keys are not found"), et faisaient donc
+     * échouer silencieusement la récupération de TOUTES les métriques Sonar (notes, comptages...) à
+     * chaque appel. Seuls les comptages globaux par dimension ({@code software_quality_*_issues}, sans
+     * détail par sévérité) existent réellement -- conservés ci-dessous. Avant de réintroduire une clé
+     * retirée ici, la vérifier d'abord avec un appel GET /api/measures/component isolé.
+     */
     private static final String SONAR_MEASURE_KEYS =
             "bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density,ncloc,security_hotspots,"
                     + "security_rating,reliability_rating,sqale_rating,"
                     + "blocker_violations,critical_violations,major_violations,minor_violations,info_violations,"
                     + "software_quality_security_issues,software_quality_reliability_issues,software_quality_maintainability_issues,"
-                    + "software_quality_security_rating,software_quality_reliability_rating,software_quality_maintainability_rating,"
-                    + "software_quality_high_severity_issues,software_quality_medium_severity_issues,software_quality_low_severity_issues,"
-                    + "software_quality_security_high_issues,software_quality_security_medium_issues,software_quality_security_low_issues,"
-                    + "software_quality_reliability_high_issues,software_quality_reliability_medium_issues,software_quality_reliability_low_issues,"
-                    + "software_quality_maintainability_high_issues,software_quality_maintainability_medium_issues,software_quality_maintainability_low_issues";
+                    + "software_quality_security_rating,software_quality_reliability_rating,software_quality_maintainability_rating";
 
     private HttpEntity<String> sonarAuthEntity() {
         HttpHeaders headers = sonarAuthHeaders();
@@ -2764,6 +2824,22 @@ public class GitLabService {
         } catch (GitLabApiException e) {
             log.error("❌ Erreur retry job {}: {}", jobId, e.getMessage());
             throw new RuntimeException("Impossible de relancer le job", e);
+        }
+    }
+
+    /**
+     * Annule un job GitLab en cours (running/pending) — utilisé pour « stopper un stage »
+     * sans annuler tout le pipeline (audit-deploiement.md, retour utilisateur du 17 août 2026).
+     *
+     * @param jobId ID du job
+     */
+    public void cancelJob(Long jobId) {
+        try {
+            log.info("🛑 Annulation job {}", jobId);
+            gitLabApi.getJobApi().cancelJob(gitlabProjectId, jobId);
+        } catch (GitLabApiException e) {
+            log.error("❌ Erreur annulation job {}: {}", jobId, e.getMessage());
+            throw new RuntimeException("Impossible d'annuler le job", e);
         }
     }
 

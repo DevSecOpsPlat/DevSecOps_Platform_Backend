@@ -4,6 +4,7 @@ import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
 import com.backend.devsecopsplatform_backend.entity.PipelineStatus;
 import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
 import com.backend.devsecopsplatform_backend.service.PipelineStageSyncService;
+import com.backend.devsecopsplatform_backend.service.appmgmt.ScanBatchCompletionService;
 import com.backend.devsecopsplatform_backend.service.environment.EnvironmentLifecycleService;
 import com.backend.devsecopsplatform_backend.service.finding.FindingIngestionService;
 import com.backend.devsecopsplatform_backend.service.qualitygate.QualityGateService;
@@ -33,6 +34,7 @@ public class GitLabWebhookController {
     private final EnvironmentLifecycleService environmentLifecycleService;
     private final FindingIngestionService findingIngestionService;
     private final QualityGateService qualityGateService;
+    private final ScanBatchCompletionService scanBatchCompletionService;
     private final ObjectMapper objectMapper;
 
     @Value("${gitlab.webhook.secret:}")
@@ -135,6 +137,15 @@ public class GitLabWebhookController {
                     environmentLifecycleService.onPipelineFailed(
                             execution.getEnvironment().getId(),
                             "Pipeline en échec (" + newStatus + ")");
+                }
+
+                // Ferme le lot ScanBatch (sinon nouveau scan bloqué après cancel/échec)
+                if (newStatus == PipelineStatus.CANCELED || newStatus == PipelineStatus.FAILED) {
+                    try {
+                        scanBatchCompletionService.onUserCanceledGitlabPipeline(pipelineId);
+                    } catch (Exception e) {
+                        log.warn("Fermeture lot après webhook pipeline #{}: {}", pipelineId, e.getMessage());
+                    }
                 }
 
                 // 5. Ingestion findings (asynchrone) depuis aggregate-report artifacts

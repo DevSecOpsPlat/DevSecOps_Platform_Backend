@@ -135,6 +135,20 @@ public class DefectDojoController {
         }
     }
 
+    /** Résout les Tests (id + scan_type) d'un pipeline -- voir DefectDojoService.listTestsForPipeline. */
+    @GetMapping("/tests")
+    public ResponseEntity<?> testsForPipeline(
+            @RequestParam UUID applicationId,
+            @RequestParam(required = false) String branch,
+            @RequestParam long pipelineId
+    ) {
+        try {
+            return ResponseEntity.ok(defectDojoService.listTestsForPipeline(applicationId, branch, pipelineId));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("message", e.getMessage()));
+        }
+    }
+
     public record FindingStatusRequest(String action) {}
 
     @DeleteMapping("/findings/{findingId}")

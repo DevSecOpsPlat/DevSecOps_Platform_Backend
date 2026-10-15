@@ -30,7 +30,9 @@ public class SecuritySchemaMigration {
         addPipelineQualityGateColumn();
         ensureQualityGateSnapshotsTable();
         backfillLegacyUsers();
-        log.info("Schéma sécurité vérifié (users, login_attempts, alerts, audit_log, blocked_ips).");
+        // Même bean / même timing que le reste du schéma (pas d'@AutoConfigureBefore fictif).
+        new ScanBatchSchemaMigration(jdbcTemplate).migrate();
+        log.info("Schéma sécurité vérifié (users, login_attempts, alerts, audit_log, blocked_ips, scan_batches).");
     }
 
     private void addUserSecurityColumns() {

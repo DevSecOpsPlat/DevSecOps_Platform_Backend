@@ -32,6 +32,16 @@ public class SecurityGateIngestRequest {
     @JsonAlias("deploymentId")
     private String deploymentIdRaw;
 
+    /** Service scanné (AppService.id) — lots multi-services. */
+    @JsonProperty("service_id")
+    @JsonAlias({"serviceId"})
+    private String serviceIdRaw;
+
+    /** Lot de scan application. */
+    @JsonProperty("scan_batch_id")
+    @JsonAlias({"scanBatchId", "batch_id", "batchId"})
+    private String scanBatchIdRaw;
+
     private String recommendation;
     private Integer critical;
     private Integer high;
@@ -95,6 +105,27 @@ public class SecurityGateIngestRequest {
     @JsonIgnore
     public UUID getDeploymentId() {
         return parseUuid(deploymentIdRaw);
+    }
+
+    @JsonIgnore
+    public UUID getServiceId() {
+        UUID fromService = parseUuid(serviceIdRaw);
+        if (fromService != null) {
+            return fromService;
+        }
+        // Rétrocompat : application_id = AppService.id sur les scans mono-service hors lot
+        return getApplicationId();
+    }
+
+    /** true si le corps CI porte un {@code service_id} explicite (pas le fallback application_id). */
+    @JsonIgnore
+    public boolean hasExplicitServiceId() {
+        return serviceIdRaw != null && !serviceIdRaw.isBlank() && parseUuid(serviceIdRaw) != null;
+    }
+
+    @JsonIgnore
+    public UUID getScanBatchId() {
+        return parseUuid(scanBatchIdRaw);
     }
 
     public boolean isDeployKind() {

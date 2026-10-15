@@ -1,6 +1,8 @@
 package com.backend.devsecopsplatform_backend.service;
 
 import com.backend.devsecopsplatform_backend.controller.ai.AnalyzeArtifactResponse;
+import com.backend.devsecopsplatform_backend.controller.ai.ExplainPipelineLogsRequest;
+import com.backend.devsecopsplatform_backend.controller.ai.ExplainPipelineLogsResponse;
 import com.backend.devsecopsplatform_backend.controller.ai.VulnerabilityItem;
 import com.backend.devsecopsplatform_backend.controller.finding.FindingAiRemediationResponse;
 import com.backend.devsecopsplatform_backend.controller.finding.ReferenceItem;
@@ -26,6 +28,7 @@ import java.util.ArrayList;
 import java.util.Optional;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.UUID;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -55,6 +58,15 @@ public class AiAnalysisService {
     private static final int DEFAULT_RETRY_DELAY_SECONDS = 45;
     private static final int MAX_CHAT_TURNS = 24;
     private static final int MAX_CHAT_MESSAGE_CHARS = 10_000;
+
+    /** Chat pipeline streamé (SSE) : travail réseau/IO bloquant fait hors du thread Spring MVC. */
+    private final java.util.concurrent.ExecutorService chatStreamExecutor =
+            java.util.concurrent.Executors.newCachedThreadPool();
+
+    @jakarta.annotation.PreDestroy
+    void shutdownChatStreamExecutor() {
+        chatStreamExecutor.shutdownNow();
+    }
 
     /** JSON Schema pour la sortie structurée de la remédiation. */
     private static final String REMEDIATION_SCHEMA = """
@@ -174,6 +186,24 @@ public class AiAnalysisService {
     private int ollamaNumGpu;
     @Value("${ai.ollama.read-timeout-seconds:600}")
     private int ollamaReadTimeoutSeconds;
+    /** Chat pipeline interactif : réponse volontairement courte (le prompt la demande ≤1200 car.)
+     *  donc pas besoin du plafond de tokens/timeout utilisé pour la remédiation en tâche de fond. */
+    @Value("${ai.ollama.num-predict-chat:750}")
+    private int ollamaNumPredictChat;
+    @Value("${ai.ollama.chat-read-timeout-seconds:210}")
+    private int ollamaChatReadTimeoutSeconds;
+    /**
+     * Routage intelligent (retour utilisateur du 17 août 2026, testé côte à côte) : le petit modèle
+     * ({@code ollamaModel}, 1.5B) répond bien aux questions factuelles mais peut mal arbitrer entre
+     * deux signaux contradictoires dans un log (ex. confondre « upload d'artefact échoué » — un
+     * symptôme automatique de GitLab — avec la vraie cause) ; le 7B a la même consigne et répond
+     * juste. On bascule donc sur ce modèle UNIQUEMENT pour les questions diagnostic (pourquoi/cause)
+     * sur un job en échec — rapide pour tout le reste, fiable là où ça compte vraiment.
+     */
+    @Value("${ai.ollama.model-diagnostic:qwen2.5-coder:7b}")
+    private String ollamaModelDiagnostic;
+    @Value("${ai.ollama.chat-read-timeout-seconds-diagnostic:420}")
+    private int ollamaChatReadTimeoutSecondsDiagnostic;
 
     /**
      * Analyse le contenu d'un artifact (JSON ou texte) et renvoie les vulnérabilités
@@ -214,6 +244,581 @@ public class AiAnalysisService {
                     .vulnerabilities(List.of())
                     .build();
         }
+    }
+
+    /**
+     * Assistant pipeline : répond à toute question (URL, statut, causes d'échec…)
+     * avec le contexte projet + stages + logs optionnels. Pas de kubectl.
+     */
+    public ExplainPipelineLogsResponse explainPipelineLogs(ExplainPipelineLogsRequest request) {
+        if (!aiEnabled) {
+            return explainError("Analyse IA désactivée (ai.enabled=true pour activer).");
+        }
+        String provider = (aiProvider != null) ? aiProvider.strip().toLowerCase() : "groq";
+        if (!isProviderConfigured(provider)) {
+            return explainError("Provider '" + provider + "' non configuré. " + getConfigHint(provider));
+        }
+        if (request == null) {
+            return explainError("Requête vide.");
+        }
+        boolean hasLogs = request.getLogs() != null && !request.getLogs().isBlank();
+        boolean hasQuestion = request.getUserQuestion() != null && !request.getUserQuestion().isBlank();
+        boolean hasContext = request.getProjectContext() != null && !request.getProjectContext().isBlank();
+        boolean hasStages = request.getStagesOverview() != null && !request.getStagesOverview().isBlank();
+        if (!hasLogs && !hasQuestion && !hasContext && !hasStages) {
+            return explainError("Pose une question ou sélectionne un job avec des logs.");
+        }
+
+        Optional<String> deterministic = tryDeterministicStatusAnswer(request);
+        if (deterministic.isPresent()) {
+            String text = deterministic.get();
+            return ExplainPipelineLogsResponse.builder()
+                    .answer(text).summary(text)
+                    .probableCauses(List.of()).suggestedActions(List.of())
+                    .build();
+        }
+
+        String logs = hasLogs ? request.getLogs() : "";
+        // Limite stricte pour Ollama CPU : mesuré en réel sur cette machine, ~18 tok/s en lecture
+        // de prompt — chaque Ko de log en moins compte. Garde le DÉBUT et la FIN (pas juste la fin) :
+        // une étape sautée/non exécutée (« Skipping scan: no files matched ») s'annonce en général
+        // en tout début de log, une troncature « fin seulement » la ferait disparaître (retour
+        // utilisateur du 17 août 2026 : « parfois la dernière partie n'est pas la plus importante »).
+        logs = truncateLogsHeadAndTail(logs, 4_000);
+
+        String prompt = buildExplainLogsPrompt(request, logs);
+        try {
+            String jsonResponse = callAiForInteractiveChat(provider, prompt).text();
+            return parseExplainLogsResponse(jsonResponse);
+        } catch (Exception e) {
+            log.error("Erreur explication logs IA ({}): {}", provider, e.getMessage());
+            return explainError(buildChatErrorMessage(e, provider));
+        }
+    }
+
+    /**
+     * Variante STREAMÉE et CONVERSATIONNELLE du chat pipeline (SSE) : conserve l'historique des
+     * tours précédents (comme une vraie discussion, pas une question isolée à chaque fois — retour
+     * utilisateur du 17 août 2026) et pousse le texte au fur et à mesure qu'il est généré. Sur
+     * cloud (Groq/OpenRouter), la réponse arrive déjà vite — poussée en un seul morceau. Sur Ollama
+     * (CPU, seule option pour les comptes gratuits en quota), le texte apparaît vraiment token par
+     * token. Réponse en texte brut/markdown simple (pas de JSON) — plus naturel au fil de l'eau.
+     */
+    public void streamExplainPipelineLogs(ExplainPipelineLogsRequest request,
+                                           java.util.function.Consumer<Boolean> onMode,
+                                           java.util.function.Consumer<String> onChunk,
+                                           Runnable onComplete,
+                                           java.util.function.Consumer<String> onError) {
+        chatStreamExecutor.submit(() -> {
+            String provider = (aiProvider != null) ? aiProvider.strip().toLowerCase() : "groq";
+            try {
+                if (!aiEnabled) {
+                    onChunk.accept("Analyse IA désactivée (ai.enabled=true pour activer).");
+                    onComplete.run();
+                    return;
+                }
+                if (!isProviderConfigured(provider)) {
+                    onChunk.accept("Provider '" + provider + "' non configuré. " + getConfigHint(provider));
+                    onComplete.run();
+                    return;
+                }
+                if (request == null || request.getUserQuestion() == null || request.getUserQuestion().isBlank()) {
+                    onChunk.accept("Pose une question.");
+                    onComplete.run();
+                    return;
+                }
+
+                // Garde-fou déterministe AVANT tout appel IA : le statut du job est une donnée
+                // certaine (déjà en base), pas une supposition — pour une question du type « y a-t-il
+                // un problème ? » sur un job réussi, on répond sans passer par le modèle : zéro
+                // latence, zéro risque d'hallucination (retour utilisateur du 17 août 2026 : un petit
+                // modèle peut affirmer un échec inexistant face à une question à prémisse piégée —
+                // testé et confirmé côte à côte avec le 7B avant ce correctif). Uniquement sur le
+                // premier tour (pas d'historique) — sinon la question peut porter sur autre chose.
+                if (request.getHistory() == null || request.getHistory().isEmpty()) {
+                    Optional<String> deterministic = tryDeterministicStatusAnswer(request);
+                    if (deterministic.isPresent()) {
+                        onMode.accept(false);
+                        onChunk.accept(deterministic.get());
+                        onComplete.run();
+                        return;
+                    }
+                }
+
+                String logs = request.getLogs() != null ? request.getLogs() : "";
+                logs = truncateLogsHeadAndTail(logs, 4_000);
+                String system = buildPipelineChatSystemPrompt(request, logs);
+                List<ChatTurn> turns = new ArrayList<>();
+                if (request.getHistory() != null) {
+                    turns.addAll(request.getHistory());
+                }
+                turns.add(new ChatTurn("user", request.getUserQuestion().strip()));
+                List<java.util.Map<String, String>> messages = buildChatMessagesForApi(system, turns);
+
+                boolean deepReasoning = needsDeepReasoning(request);
+                onMode.accept(deepReasoning);
+                if (deepReasoning) {
+                    log.info("[AI][CHAT-STREAM] Question diagnostic sur job en échec → routage vers {} (plus lent, plus fiable)",
+                            ollamaModelDiagnostic);
+                }
+                doStreamPipelineChat(provider, messages, system, turns, onChunk, deepReasoning);
+                onComplete.run();
+            } catch (Exception e) {
+                log.error("Erreur chat streaming IA ({}): {}", provider, e.getMessage());
+                onError.accept(buildChatErrorMessage(e, provider));
+            }
+        });
+    }
+
+    /** Mêmes règles de repli que {@link #callAiForInteractiveChat} : Groq → OpenRouter → Ollama (streamé). */
+    private void doStreamPipelineChat(String provider, List<java.util.Map<String, String>> messages,
+                                       String system, List<ChatTurn> turns,
+                                       java.util.function.Consumer<String> onChunk,
+                                       boolean deepReasoning) throws Exception {
+        if (!"groq".equals(provider)) {
+            if ("openrouter".equals(provider)) {
+                onChunk.accept(callOpenRouterFastest(flattenTurnsToPrompt(system, turns)).text().strip());
+                return;
+            }
+            if ("ollama".equals(provider)) {
+                streamOllamaChatMulti(messages, onChunk, deepReasoning);
+                return;
+            }
+            onChunk.accept(callAiProvider(provider, flattenTurnsToPrompt(system, turns)).strip());
+            return;
+        }
+        if (!isProviderConfigured("groq")) {
+            if (isProviderConfigured("openrouter")) {
+                onChunk.accept(callOpenRouterFastest(flattenTurnsToPrompt(system, turns)).text().strip());
+                return;
+            }
+            streamOllamaChatMulti(messages, onChunk, deepReasoning);
+            return;
+        }
+        try {
+            // Groq (quand dispo) reste toujours essayé en premier, y compris pour une question
+            // diagnostic : c'est un gros modèle cloud, rapide ET fiable — le routage vers le 7B local
+            // ne concerne que le repli Ollama (seule option pour les comptes gratuits en quota).
+            onChunk.accept(callGroqChat(messages).strip());
+        } catch (Exception e) {
+            if (!isGroqQuotaExceeded(e)) {
+                throw e;
+            }
+            if (isProviderConfigured("openrouter")) {
+                try {
+                    onChunk.accept(callOpenRouterFastest(flattenTurnsToPrompt(system, turns)).text().strip());
+                    return;
+                } catch (Exception orErr) {
+                    log.warn("[AI][CHAT-STREAM] OpenRouter échoué : {}", orErr.getMessage());
+                }
+            }
+            log.warn("[AI][CHAT-STREAM] Groq (+OpenRouter) en quota → Ollama local streamé ({}s)",
+                    ollamaChatReadTimeoutSeconds);
+            streamOllamaChatMulti(messages, onChunk, deepReasoning);
+        }
+    }
+
+    /** Repli non-conversationnel (OpenRouter/provider générique) : aplati la discussion en un seul prompt. */
+    private String flattenTurnsToPrompt(String system, List<ChatTurn> turns) {
+        StringBuilder sb = new StringBuilder(system).append("\n\nConversation :\n");
+        for (ChatTurn t : turns) {
+            sb.append("user".equals(t.role()) ? "Utilisateur" : "Assistant").append(" : ").append(t.content()).append('\n');
+        }
+        sb.append("Assistant :");
+        return sb.toString();
+    }
+
+    /**
+     * Streaming réel token par token depuis Ollama ({@code /api/chat}, {@code stream:true}) avec
+     * historique de conversation complet — lu ligne par ligne (NDJSON) au fil de l'eau plutôt que
+     * d'attendre la réponse complète.
+     *
+     * @param deepReasoning true = question diagnostic sur un job en échec → bascule sur
+     *                      {@link #ollamaModelDiagnostic} (7B, plus lent mais fiable sur ce genre
+     *                      d'arbitrage) au lieu du modèle rapide par défaut.
+     */
+    private void streamOllamaChatMulti(List<java.util.Map<String, String>> messages,
+                                        java.util.function.Consumer<String> onChunk,
+                                        boolean deepReasoning) {
+        String url = ollamaUrl.replaceAll("/+$", "") + "/api/chat";
+        String model = deepReasoning ? ollamaModelDiagnostic : ollamaModel;
+        int readTimeout = deepReasoning ? ollamaChatReadTimeoutSecondsDiagnostic : ollamaChatReadTimeoutSeconds;
+        var body = new java.util.LinkedHashMap<String, Object>();
+        body.put("model", model);
+        body.put("messages", messages);
+        body.put("stream", true);
+        addOllamaGenerationOptions(body, ollamaNumGpu, ollamaNumPredictChat);
+
+        RestTemplate rest = createOllamaRestTemplate(readTimeout);
+        try {
+            rest.execute(url, HttpMethod.POST,
+                    req -> {
+                        req.getHeaders().setContentType(MediaType.APPLICATION_JSON);
+                        objectMapper.writeValue(req.getBody(), body);
+                    },
+                    resp -> {
+                        try (var reader = new java.io.BufferedReader(
+                                new java.io.InputStreamReader(resp.getBody(), java.nio.charset.StandardCharsets.UTF_8))) {
+                            String line;
+                            while ((line = reader.readLine()) != null) {
+                                if (line.isBlank()) continue;
+                                JsonNode node = objectMapper.readTree(line);
+                                String chunk = node.path("message").path("content").asText("");
+                                if (!chunk.isEmpty()) {
+                                    onChunk.accept(chunk);
+                                }
+                                if (node.path("done").asBoolean(false)) {
+                                    break;
+                                }
+                            }
+                        }
+                        return null;
+                    });
+        } catch (org.springframework.web.client.ResourceAccessException e) {
+            throw new RuntimeException("Ollama inaccessible à " + ollamaUrl + ". Lancez « ollama run " + model + " ».", e);
+        }
+    }
+
+    /**
+     * Tronque un log long en gardant le DÉBUT et la FIN plutôt que la fin seule : une étape sautée
+     * ou jamais exécutée (« Skipping scan », « no files matched », un service qui ne démarre même
+     * pas) s'annonce typiquement en tout début de log — une troncature « fin seulement » la ferait
+     * disparaître alors que c'est souvent l'info la plus utile (retour utilisateur du 17 août 2026).
+     * Répartition ~30% début / ~70% fin : la toute fin (erreur, exit code) reste la plus probable
+     * mais le début n'est plus totalement sacrifié.
+     */
+    private String truncateLogsHeadAndTail(String logs, int maxLen) {
+        if (logs == null || logs.length() <= maxLen) {
+            return logs == null ? "" : logs;
+        }
+        String marker = "\n[... milieu tronqué ...]\n";
+        int budget = Math.max(0, maxLen - marker.length());
+        int headLen = Math.min(logs.length(), budget * 3 / 10);
+        int tailLen = Math.max(0, budget - headLen);
+        String head = logs.substring(0, headLen);
+        String tail = tailLen > 0 ? logs.substring(Math.max(headLen, logs.length() - tailLen)) : "";
+        log.info("Logs explication tronqués de {} à ~{} caractères (début {} + fin {})",
+                logs.length(), maxLen, headLen, tail.length());
+        return head + marker + tail;
+    }
+
+    /** Questions du type « y a-t-il un problème / ça marche ? » — cf. {@link #tryDeterministicStatusAnswer}. */
+    private static final Pattern PROBLEM_QUESTION_PATTERN = Pattern.compile(
+            "(?i)(probl[eè]me|panne|souci|erreur|bug|cass[eé]|(ne\\s+)?march(e|ent)\\s*(pas)?|"
+                    + "fonctionne\\s*(pas)?|(qu|est)[- ]ce\\s+qui\\s+(ne\\s+)?va\\s+pas|"
+                    + "y\\s*a[- ]t[- ]il\\s+un\\s+probl[eè]me|tout\\s+va\\s+bien|"
+                    + "(est[- ]ce\\s+que\\s+)?(c'?a|ça)\\s+marche|"
+                    + "est[- ]ce\\s+que\\s+tout\\s+(va|marche))"
+    );
+
+    /** Questions « pourquoi / cause / corriger » — déclenchent le routage vers le gros modèle. */
+    private static final Pattern DIAGNOSTIC_QUESTION_PATTERN = Pattern.compile(
+            "(?i)(pourquoi|\\bcause\\b|caus[ée]|à cause de|corrige|corriger|d[ée]pann|"
+                    + "diagnostiqu|explique|analys|qu['’]est[- ]ce\\s+qui\\s+(a|s'est)\\s+"
+                    + "(pass[ée]|mal\\s+pass[ée])|d['’]o[uù]\\s+vient)"
+    );
+
+    /** Statuts considérés comme « échec » pour justifier le passage au gros modèle plus lent. */
+    private static final Set<String> FAILURE_LIKE_STATUSES = Set.of("failed", "canceled", "cancelled");
+
+    /**
+     * Signal qu'une vraie erreur est présente dans le log, même si le job est marqué SUCCESS —
+     * cas typique : un job qui clone/traite plusieurs services en parallèle, où UN SEUL échoue sans
+     * faire échouer le job entier. Reconnaître ça correctement (dire le vrai statut ET le
+     * sous-problème, sans se tromper dans un sens ou dans l'autre) demande le gros modèle — testé :
+     * le petit modèle échoue autant en niant l'erreur qu'en annonçant à tort un job en échec.
+     */
+    private static final Pattern LOG_ERROR_SIGNAL_PATTERN = Pattern.compile(
+            "(?i)(fatal:|\\bERROR\\b|exception|unable to access|failed to|permission denied|"
+                    + "connection refused|timeout|TLS connect error|introuvable)"
+    );
+
+    /**
+     * Routage intelligent : une question explicative (« pourquoi », « cause », « explique »,
+     * « corriger ») sur (a) un job réellement en échec, ou (b) un job SUCCESS dont le log contient
+     * quand même un signal d'erreur explicite (échec partiel d'un service parmi plusieurs) demande
+     * d'arbitrer entre plusieurs signaux contradictoires du log — testé et confirmé que le petit
+     * modèle s'y trompe plus souvent que le gros avec la même consigne, dans un sens (invente un
+     * échec) comme dans l'autre (nie une erreur réelle) — retour utilisateur du 17 août 2026. Pour
+     * tout le reste (questions factuelles, log sans signal d'erreur…) le petit modèle suffit et
+     * reste nettement plus rapide.
+     */
+    private boolean needsDeepReasoning(ExplainPipelineLogsRequest request) {
+        String q = request.getUserQuestion();
+        if (q == null || q.isBlank() || !DIAGNOSTIC_QUESTION_PATTERN.matcher(q).find()) {
+            return false;
+        }
+        String status = request.getJobStatus() != null ? request.getJobStatus().trim().toLowerCase(Locale.ROOT) : "";
+        if (FAILURE_LIKE_STATUSES.contains(status)) {
+            return true;
+        }
+        String logs = request.getLogs();
+        return logs != null && LOG_ERROR_SIGNAL_PATTERN.matcher(logs).find();
+    }
+
+    /**
+     * Court-circuite l'IA quand la question porte sur « y a-t-il un problème » et que le statut du
+     * job (donnée certaine, déjà connue côté backend — pas une supposition) dit clairement le
+     * contraire. Réponse instantanée, zéro risque d'hallucination — audit-deploiement.md,
+     * retour utilisateur du 17 août 2026 (les petits modèles peuvent affirmer un échec inexistant
+     * face à une question à prémisse piégée ; testé et confirmé côte à côte avec le 7B).
+     * Ne s'applique qu'au cas sûr à 100% (succès) ; un statut « failed » a besoin des logs pour
+     * expliquer la cause réelle, donc reste géré par le modèle.
+     */
+    private Optional<String> tryDeterministicStatusAnswer(ExplainPipelineLogsRequest request) {
+        String q = request.getUserQuestion();
+        if (q == null || q.isBlank() || !PROBLEM_QUESTION_PATTERN.matcher(q).find()) {
+            return Optional.empty();
+        }
+        String status = request.getJobStatus() != null ? request.getJobStatus().trim().toLowerCase(Locale.ROOT) : "";
+        if (!status.equals("success") && !status.equals("passed")) {
+            return Optional.empty();
+        }
+        String job = (request.getJobName() != null && !request.getJobName().isBlank())
+                ? "« " + request.getJobName() + " »" : "ce job";
+        String stage = (request.getStageName() != null && !request.getStageName().isBlank())
+                ? " (stage " + request.getStageName() + ")" : "";
+        return Optional.of("Aucun problème détecté : " + job + stage + " a réussi (statut SUCCESS).");
+    }
+
+    /**
+     * Prompt SYSTÈME (contexte + règles) de la conversation pipeline — la question de l'utilisateur
+     * n'y est plus incluse, elle devient le dernier tour de la liste de messages (vraie conversation
+     * multi-tours avec historique, cf. {@link #streamExplainPipelineLogs}).
+     */
+    private String buildPipelineChatSystemPrompt(ExplainPipelineLogsRequest req, String logs) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("""
+                Tu es l'assistant EnviroTest (DevSecOps), en conversation avec un TESTEUR / développeur
+                SANS accès cluster (pas de kubectl, pas de shell noeud). Tu réponds à N'IMPORTE QUELLE
+                question sur le projet scanné/déployé et sur ce pipeline (URLs, services, statut, stages,
+                logs, causes d'échec…) — au fil de la discussion, en tenant compte des messages précédents.
+
+                Exemples de bonnes réponses (respecte exactement ce niveau de longueur et ce format) :
+                - Question factuelle (« c'est quoi l'URL / le tag de l'image ? ») → réponse : « https://exemple.com/service »
+                  ou « back:75847975 »  — LA valeur seule, rien d'autre. PAS de phrase du genre « le job a réussi à... »
+                  ou « le statut est SUCCESS » en plus — ce n'est pas ce qui est demandé.
+                - Question « pourquoi » sur un échec réel (timeout clone Git) → réponse :
+                  « Le clone du dépôt a échoué par timeout réseau après 30s. Le dépôt distant était probablement
+                  inaccessible ou trop lent à répondre.
+                  - Relance le pipeline, un timeout réseau est souvent temporaire.
+                  - Si ça persiste, vérifie que le dépôt est accessible publiquement. »
+                  (PAS plus long que ça — pas de liste de 4 causes, pas de section « Configuration réseau »/« Serveur
+                  distant »/etc. Une seule cause, deux actions maximum.)
+
+                Contexte job sélectionné :
+                """);
+        sb.append("- Job SÉLECTIONNÉ (celui dont parle l'utilisateur, sauf s'il précise un autre stage) : ")
+                .append(nullToDash(req.getJobName())).append('\n');
+        sb.append("- Stage du job sélectionné : ").append(nullToDash(req.getStageName())).append('\n');
+        sb.append("- ⚠ STATUT RÉEL du job sélectionné (fais confiance à CETTE ligne, à rien d'autre) : ")
+                .append(nullToDash(req.getJobStatus())).append('\n');
+        sb.append("- Type pipeline : ").append(nullToDash(req.getPipelineKind())).append('\n');
+        sb.append("- Vue d'ensemble des AUTRES stages du pipeline (informatif seulement — un stage listé « failed »")
+                .append(" ici peut être un stage DIFFÉRENT du job sélectionné ci-dessus, ne pas confondre) : ")
+                .append(nullToDash(req.getStagesOverview())).append('\n');
+        sb.append("- Hint projet : ").append(nullToDash(req.getProjectHint())).append('\n');
+        sb.append("\nContexte projet / déploiement / scan (source de vérité pour URLs, namespace, services) :\n");
+        sb.append(nullToDash(req.getProjectContext())).append('\n');
+        if (logs != null && !logs.isBlank()) {
+            sb.append("\nLogs du job (référence si la question porte sur l'échec / le log) :\n```\n")
+                    .append(logs)
+                    .append("\n```\n");
+        } else {
+            sb.append("\n(Aucun log job fourni — réponds avec le contexte projet/pipeline.)\n");
+        }
+        sb.append("""
+
+                Règles STRICTES :
+                0. RÈGLE LA PLUS IMPORTANTE : réponds STRICTEMENT à la question posée (le dernier message
+                   utilisateur), rien d'autre. Le statut du job (FAILED ou non) et la présence de logs
+                   d'erreur NE SONT PAS une invitation à expliquer une panne — ne parle d'échec, de cause,
+                   de solution ou de dépannage QUE SI la question le demande explicitement (mots comme
+                   « pourquoi », « échec », « erreur », « corriger »).
+                   Exemple : si la question est « c'est quoi l'URL du repo cloné ? », réponds juste l'URL trouvée
+                   dans les logs/contexte — même si le job est en échec, N'EXPLIQUE PAS l'échec, ce n'est pas demandé.
+                1. Réponds en français, COURT — 500 caractères maximum au total, réponse complète non tronquée.
+                2. Si on te demande une URL, un service, un namespace, un statut, un tag d'image, un fait précis :
+                   donne UNIQUEMENT ce fait (cherche-le dans le « Contexte projet » ou dans les logs si besoin) —
+                   pas de phrase d'accompagnement sur le statut du job ou le déploiement, sauf si demandé.
+                3. Si (et seulement si) on te demande d'expliquer un échec / une erreur : va droit à LA cause la plus
+                   probable (une seule, pas la liste de toutes les causes possibles), interprète les logs (timeout pods, ImagePullBackOff, CrashLoop, HTTP, artifacts…).
+                3bis. PIÈGE FRÉQUENT à éviter — un log GitLab CI qui échoue affiche souvent, TOUT À LA FIN,
+                   une section « Uploading artifacts for failed job » / « WARNING: ... no matching files » /
+                   « ERROR: No files to upload ». C'est un comportement AUTOMATIQUE de GitLab (il tente
+                   toujours de collecter les artefacts après un échec, même s'ils n'existent pas parce que le
+                   job s'est arrêté avant de les créer) — CE N'EST JAMAIS LA VRAIE CAUSE, seulement une
+                   conséquence. La vraie cause est plus haut dans le log : la PREMIÈRE erreur explicite
+                   (commande qui échoue, code de sortie non nul, curl_exit≠0, timeout, exception). Un
+                   « exit code 52 » avec curl signifie généralement une connexion interrompue par le
+                   serveur distant (« empty reply from server »), pas un problème de fichier manquant —
+                   même si un message qui en parle apparaît juste après dans le log.
+                3ter. ÉCHEC PARTIEL DANS UN JOB « SUCCESS » — cas fréquent : le job clone/traite PLUSIEURS
+                   services en parallèle ; un seul peut échouer (erreur TLS, clone Git, Dockerfile
+                   introuvable…) sans faire échouer le job entier, qui se termine quand même en SUCCESS
+                   pour les autres services. Si le ⚠ STATUT RÉEL ci-dessus dit SUCCESS/PASSED, dis-le
+                   CLAIREMENT en premier (« Le job a globalement réussi »), PUIS seulement décris le
+                   sous-problème réel trouvé dans le log s'il y en a un — ne donne JAMAIS l'impression
+                   que le job a échoué (ton alarmiste, « vérifie X », « relance le pipeline ») si son
+                   statut réel est SUCCESS. Le sous-problème doit être présenté comme localisé à UN
+                   service, pas comme un échec du job.
+                4. NE propose JAMAIS de commandes kubectl, helm, docker exec sur le cluster, ni d'accès SSH.
+                5. Tu peux suggérer : corriger code/Dockerfile/CI, relancer le pipeline, onglet Pods/Services de la plateforme, contacter un ops — uniquement si la question porte sur un problème à corriger.
+                6. Si l'info n'est pas dans le contexte, dis-le clairement (n'invente pas d'URL).
+                7. Réponds en TEXTE BRUT uniquement (PAS de JSON, PAS de titres ##, PAS de listes numérotées imbriquées).
+                   Pour une question factuelle simple : une phrase (voire juste la valeur) suffit, pas de puces ni de sections.
+                   Pour une explication d'échec (règle 3) : 2-3 phrases pour la cause, puis au maximum 2 puces « - ».
+                   Mieux vaut une réponse courte et complète qu'une réponse détaillée mais coupée.
+                8. Tiens compte des messages précédents de la conversation (ne redemande pas une info déjà donnée,
+                   reste cohérent avec tes réponses précédentes).
+                """);
+        return sb.toString();
+    }
+
+    /**
+     * Message d'erreur pour le CHAT pipeline (explainPipelineLogs) — distinct de
+     * {@link #buildUserFriendlyErrorMessage}, qui mentionne Ollama/ai.groq.fallback-to-ollama :
+     * ce chemin ({@link #callAiForInteractiveChat}) ne tente JAMAIS Ollama, donc ce message serait
+     * trompeur ici (retour utilisateur du 17 août 2026 : « il affiche désactivez Ollama alors qu'il
+     * tourne » — le chat ne l'a simplement jamais appelé, il n'y a rien à désactiver).
+     */
+    private String buildChatErrorMessage(Exception e, String provider) {
+        String msg = e.getMessage() != null ? e.getMessage() : "";
+        String lower = msg.toLowerCase(Locale.ROOT);
+        if (msg.contains("429") || lower.contains("quota") || msg.contains("RESOURCE_EXHAUSTED")) {
+            return "Quota IA temporairement dépassé (Groq/OpenRouter). Réessaie dans 1-2 minutes.";
+        }
+        if (msg.contains("404") || msg.contains("NOT_FOUND")) {
+            return "Modèle IA introuvable. Vérifie la configuration ai." + provider + ".model.";
+        }
+        if (msg.contains("401") || msg.contains("Unauthorized")) {
+            return "Clé API IA invalide (" + provider + ").";
+        }
+        return "Erreur IA : " + (msg.length() > 200 ? msg.substring(0, 200) + "..." : msg);
+    }
+
+    private ExplainPipelineLogsResponse explainError(String message) {
+        return ExplainPipelineLogsResponse.builder()
+                .answer(message)
+                .summary(message)
+                .probableCauses(List.of())
+                .suggestedActions(List.of())
+                .build();
+    }
+
+    private String buildExplainLogsPrompt(ExplainPipelineLogsRequest req, String logs) {
+        String question = (req.getUserQuestion() != null && !req.getUserQuestion().isBlank())
+                ? req.getUserQuestion().strip()
+                : "Fais le point : état du pipeline / job, causes si échec, infos utiles (URLs, services).";
+        StringBuilder sb = new StringBuilder();
+        sb.append("""
+                Tu es l'assistant EnviroTest (DevSecOps). Tu réponds à N'IMPORTE QUELLE question
+                sur le projet scanné/déployé et sur ce pipeline (URLs, services, statut, stages, logs, causes d'échec…).
+                L'utilisateur est un TESTEUR / développeur SANS accès cluster (pas de kubectl, pas de shell noeud).
+
+                Contexte job sélectionné :
+                """);
+        sb.append("- Job SÉLECTIONNÉ (celui dont parle l'utilisateur, sauf s'il précise un autre stage) : ")
+                .append(nullToDash(req.getJobName())).append('\n');
+        sb.append("- Stage du job sélectionné : ").append(nullToDash(req.getStageName())).append('\n');
+        sb.append("- ⚠ STATUT RÉEL du job sélectionné (fais confiance à CETTE ligne, à rien d'autre) : ")
+                .append(nullToDash(req.getJobStatus())).append('\n');
+        sb.append("- Type pipeline : ").append(nullToDash(req.getPipelineKind())).append('\n');
+        sb.append("- Vue d'ensemble des AUTRES stages du pipeline (informatif seulement — un stage listé « failed »")
+                .append(" ici peut être un stage DIFFÉRENT du job sélectionné ci-dessus, ne pas confondre) : ")
+                .append(nullToDash(req.getStagesOverview())).append('\n');
+        sb.append("- Hint projet : ").append(nullToDash(req.getProjectHint())).append('\n');
+        sb.append("\nContexte projet / déploiement / scan (source de vérité pour URLs, namespace, services) :\n");
+        sb.append(nullToDash(req.getProjectContext())).append('\n');
+        sb.append("\nQuestion de l'utilisateur :\n").append(question).append('\n');
+        if (logs != null && !logs.isBlank()) {
+            sb.append("\nLogs du job (référence si la question porte sur l'échec / le log) :\n```\n")
+                    .append(logs)
+                    .append("\n```\n");
+        } else {
+            sb.append("\n(Aucun log job fourni — réponds avec le contexte projet/pipeline.)\n");
+        }
+        sb.append("""
+
+                Règles STRICTES :
+                0. Réponds STRICTEMENT à « Question de l'utilisateur » ci-dessus. Le statut du job ou la présence
+                   de logs d'erreur (y compris sur d'AUTRES stages listés dans la vue d'ensemble) ne sont PAS une
+                   invitation à expliquer une panne — ne parle d'échec/cause/solution QUE SI la question le demande.
+                1. Réponds en français, clair et CONCIS (answer ≤ 1200 caractères si possible).
+                2. Si on te demande une URL, un service, un namespace, un statut : utilise le « Contexte projet » en priorité.
+                3. Si (et seulement si) on te demande d'expliquer un échec / un log : interprète les logs (timeout pods, ImagePullBackOff, CrashLoop, HTTP, artifacts…).
+                4. NE propose JAMAIS de commandes kubectl, helm, docker exec sur le cluster, ni d'accès SSH.
+                5. Tu peux suggérer : corriger code/Dockerfile/CI, relancer le pipeline, onglet Pods/Services de la plateforme, contacter un ops.
+                6. Distingue cause racine vs symptôme. Les WARNING artifacts secondaires ne sont pas forcément la cause
+                   principale. Piège fréquent : une section finale « Uploading artifacts for failed job » / « No files
+                   to upload » est un comportement AUTOMATIQUE de GitLab après échec (il tente toujours de collecter
+                   les artefacts, même absents) — ce n'est jamais la vraie cause, qui est plus haut (première erreur
+                   explicite : commande en échec, curl_exit≠0, timeout, exception).
+                6bis. Échec partiel dans un job SUCCESS : un job qui clone/traite plusieurs services en parallèle
+                   peut voir UN SEUL service échouer (erreur TLS, clone Git, Dockerfile introuvable…) sans faire
+                   échouer le job entier. Si le statut réel est SUCCESS/PASSED, dis-le clairement en premier, puis
+                   décris le sous-problème localisé à ce service — ne donne jamais l'impression que le job a échoué.
+                7. Si l'info n'est pas dans le contexte, dis-le clairement (ne invente pas d'URL).
+                8. Pour une question factuelle simple (URL, statut), probableCauses/suggestedActions peuvent être des listes vides.
+                9. Max 3 causes et 3 actions.
+                10. Réponds UNIQUEMENT avec un JSON valide (pas de markdown hors JSON), schéma :
+                {
+                  "answer": "réponse conversationnelle complète à la question",
+                  "summary": "résumé court",
+                  "probableCauses": ["…"] ,
+                  "suggestedActions": ["…"]
+                }
+                """);
+        return sb.toString();
+    }
+
+    private static String nullToDash(String s) {
+        return (s == null || s.isBlank()) ? "—" : s.strip();
+    }
+
+    private ExplainPipelineLogsResponse parseExplainLogsResponse(String jsonText) {
+        String toParse = extractJsonFromResponse(jsonText);
+        try {
+            JsonNode root = objectMapper.readTree(toParse);
+            String answer = root.path("answer").asText("");
+            String summary = root.path("summary").asText("");
+            if (answer.isBlank() && !summary.isBlank()) {
+                answer = summary;
+            }
+            if (summary.isBlank() && !answer.isBlank()) {
+                summary = answer.length() > 280 ? answer.substring(0, 280) + "…" : answer;
+            }
+            return ExplainPipelineLogsResponse.builder()
+                    .answer(answer.isBlank() ? "Aucune explication fournie." : answer)
+                    .summary(summary.isBlank() ? answer : summary)
+                    .probableCauses(readStringList(root.path("probableCauses")))
+                    .suggestedActions(readStringList(root.path("suggestedActions")))
+                    .build();
+        } catch (Exception e) {
+            log.warn("Impossible de parser la réponse d'explication logs: {}", e.getMessage());
+            String fallback = toParse != null && toParse.length() > 800
+                    ? toParse.substring(0, 800) + "…"
+                    : toParse;
+            return ExplainPipelineLogsResponse.builder()
+                    .answer(fallback != null ? fallback : "Réponse IA illisible.")
+                    .summary("L'IA a répondu mais le format JSON n'a pas pu être parsé.")
+                    .probableCauses(List.of())
+                    .suggestedActions(List.of())
+                    .build();
+        }
+    }
+
+    private List<String> readStringList(JsonNode node) {
+        List<String> out = new ArrayList<>();
+        if (node != null && node.isArray()) {
+            for (JsonNode n : node) {
+                String t = n.asText("").strip();
+                if (!t.isBlank()) {
+                    out.add(t);
+                }
+            }
+        }
+        return out;
     }
 
     /**
@@ -989,6 +1594,74 @@ public class AiAnalysisService {
                         + ollamaModel + " » ; 3) définir ai.provider=openrouter si Groq est épuisé.");
     }
 
+    /**
+     * Chemin de repli DÉDIÉ au chat pipeline interactif (explainPipelineLogs) — volontairement
+     * plus « maigre » que {@link #tryGroqQuotaFallbacks} : un seul essai OpenRouter (pas de boucle
+     * 5 modèles × 2 retries avec sleep jusqu'à 60s chacun), et si tout le cloud est à sec, un dernier
+     * recours Ollama local mais borné ({@link #callOllamaChatFast}, ~900 tokens / 180s au lieu de
+     * 4096 tokens / 600s) — pour les comptes gratuits Groq/OpenRouter en quota permanent, Ollama
+     * reste la seule option qui répond réellement (retour utilisateur du 17 août 2026 : sans lui,
+     * le chat échouait systématiquement avec « quota Groq dépassé » sans jamais tenter Ollama).
+     */
+    private AiCallResult callAiForInteractiveChat(String provider, String prompt) throws Exception {
+        if (!"groq".equals(provider)) {
+            if ("openrouter".equals(provider)) {
+                OpenRouterCallResult or = callOpenRouterFastest(prompt);
+                return new AiCallResult(or.text(), "openrouter", or.modelUsed(), false);
+            }
+            if ("ollama".equals(provider)) {
+                String text = callOllamaChatFast(prompt);
+                return new AiCallResult(text, provider, ollamaModel, false);
+            }
+            String text = callAiProvider(provider, prompt);
+            return new AiCallResult(text, provider, resolveModelName(provider), false);
+        }
+        if (!isProviderConfigured("groq")) {
+            if (isProviderConfigured("openrouter")) {
+                OpenRouterCallResult or = callOpenRouterFastest(prompt);
+                return new AiCallResult(or.text(), "openrouter", or.modelUsed(), false);
+            }
+            String text = callOllamaChatFast(prompt);
+            return new AiCallResult(text, "ollama", ollamaModel, false);
+        }
+        try {
+            String text = callGroq(prompt, null, null, groqModelFast);
+            return new AiCallResult(text, "groq", groqModelFast, false);
+        } catch (Exception e) {
+            if (!isGroqQuotaExceeded(e)) {
+                throw e;
+            }
+            if (isProviderConfigured("openrouter")) {
+                log.warn("[AI][CHAT] Groq quota (429) → OpenRouter, 1 essai rapide sans retry/sleep");
+                try {
+                    OpenRouterCallResult or = callOpenRouterFastest(prompt);
+                    return new AiCallResult(or.text(), "openrouter", or.modelUsed(), true);
+                } catch (Exception orErr) {
+                    log.warn("[AI][CHAT] OpenRouter échoué aussi : {}", orErr.getMessage());
+                }
+            }
+            log.warn("[AI][CHAT] Groq (+OpenRouter) en quota → Ollama local, dernier recours borné ({}s)",
+                    ollamaChatReadTimeoutSeconds);
+            try {
+                String text = callOllamaChatFast(prompt);
+                return new AiCallResult(text, "ollama", ollamaModel, true);
+            } catch (Exception ollamaErr) {
+                throw new RuntimeException(
+                        "IA cloud en quota (Groq/OpenRouter) et Ollama local injoignable ou trop lent. "
+                                + summarizeOllamaFailure(ollamaErr), ollamaErr);
+            }
+        }
+    }
+
+    /** Un seul modèle, un seul essai, sans sleep/retry — pour le chat, répondre vite ou échouer vite. */
+    private OpenRouterCallResult callOpenRouterFastest(String prompt) {
+        List<String> models = openRouterModelsToTry();
+        if (models.isEmpty()) {
+            throw new RuntimeException("Aucun modèle OpenRouter configuré");
+        }
+        return callOpenRouterModel(prompt, null, null, models.get(0));
+    }
+
     private FindingAiRemediationResponse runOllamaRemediationJob(String prompt, String jsonSchema, String cacheKey) {
         String text = callOllama(prompt, jsonSchema);
         FindingAiRemediationResponse out = parseFindingRemediationResponse(text);
@@ -1327,7 +2000,7 @@ public class AiAnalysisService {
         headers.setContentType(MediaType.APPLICATION_JSON);
         headers.setBearerAuth(groqApiKey);
         HttpEntity<Object> entity = new HttpEntity<>(body, headers);
-        RestTemplate rest = new RestTemplate();
+        RestTemplate rest = createCloudRestTemplate();
         ResponseEntity<JsonNode> response = rest.exchange(GROQ_URL, HttpMethod.POST, entity, JsonNode.class);
         if (response.getBody() == null) throw new RuntimeException("Réponse Groq vide");
         JsonNode choice = response.getBody().path("choices").path(0);
@@ -1449,7 +2122,7 @@ public class AiAnalysisService {
             headers.set("X-Title", "DevSecOps Platform");
         }
         HttpEntity<Object> entity = new HttpEntity<>(body, headers);
-        RestTemplate rest = new RestTemplate();
+        RestTemplate rest = createCloudRestTemplate();
         try {
             ResponseEntity<JsonNode> response = rest.exchange(OPENROUTER_URL, HttpMethod.POST, entity, JsonNode.class);
             if (response.getBody() == null) {
@@ -1472,8 +2145,12 @@ public class AiAnalysisService {
     }
 
     private void addOllamaGenerationOptions(java.util.LinkedHashMap<String, Object> body, int numGpu) {
+        addOllamaGenerationOptions(body, numGpu, ollamaNumPredict);
+    }
+
+    private void addOllamaGenerationOptions(java.util.LinkedHashMap<String, Object> body, int numGpu, int numPredict) {
         var opts = new java.util.LinkedHashMap<String, Object>();
-        opts.put("num_predict", Math.max(512, ollamaNumPredict));
+        opts.put("num_predict", Math.max(256, numPredict));
         opts.put("temperature", ollamaTemperature);
         if (numGpu >= 0) {
             opts.put("num_gpu", numGpu);
@@ -1561,9 +2238,26 @@ public class AiAnalysisService {
     private String callOllama(String prompt) { return callOllama(prompt, null); }
 
     private RestTemplate createOllamaRestTemplate() {
+        return createOllamaRestTemplate(Math.max(60, ollamaReadTimeoutSeconds));
+    }
+
+    private RestTemplate createOllamaRestTemplate(int readTimeoutSeconds) {
         SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
         factory.setConnectTimeout(Duration.ofSeconds(30));
-        factory.setReadTimeout(Duration.ofSeconds(Math.max(60, ollamaReadTimeoutSeconds)));
+        factory.setReadTimeout(Duration.ofSeconds(readTimeoutSeconds));
+        return new RestTemplate(factory);
+    }
+
+    /**
+     * RestTemplate borné pour les API cloud (Groq/OpenRouter) : ces API répondent normalement en
+     * quelques secondes ; sans timeout explicite, {@code new RestTemplate()} peut bloquer très
+     * longtemps sur une connexion qui traîne, ce qui remontait jusqu'au chat pipeline (retour
+     * utilisateur du 17 août 2026 : « il prend beaucoup de temps à répondre »).
+     */
+    private RestTemplate createCloudRestTemplate() {
+        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
+        factory.setConnectTimeout(Duration.ofSeconds(8));
+        factory.setReadTimeout(Duration.ofSeconds(25));
         return new RestTemplate(factory);
     }
 
@@ -1579,7 +2273,32 @@ public class AiAnalysisService {
         }
     }
 
+    /**
+     * Ollama pour le CHAT pipeline uniquement : plafond de tokens réduit ({@code
+     * ai.ollama.num-predict-chat}, 900 par défaut au lieu de 4096) et timeout borné ({@code
+     * ai.ollama.chat-read-timeout-seconds}, 180s par défaut au lieu de 600s) — le prompt demande
+     * déjà une réponse courte, inutile d'attendre le plafond de la remédiation en tâche de fond.
+     * Cible directement le cas « Groq gratuit toujours en quota, Ollama = seule option disponible »
+     * (retour utilisateur du 17 août 2026).
+     */
+    private String callOllamaChatFast(String prompt) {
+        try {
+            return callOllamaInternal(prompt, null, ollamaNumGpu, ollamaNumPredictChat, ollamaChatReadTimeoutSeconds);
+        } catch (RuntimeException e) {
+            if (ollamaNumGpu != 0 && isOllamaCudaOrGpuFailure(e.getMessage())) {
+                return callOllamaInternal(prompt, null, 0, ollamaNumPredictChat, ollamaChatReadTimeoutSeconds);
+            }
+            throw e;
+        }
+    }
+
     private String callOllamaInternal(String prompt, String jsonSchema, int numGpu) {
+        return callOllamaInternal(prompt, jsonSchema, numGpu, ollamaNumPredict,
+                Math.max(60, ollamaReadTimeoutSeconds));
+    }
+
+    private String callOllamaInternal(String prompt, String jsonSchema, int numGpu,
+                                       int numPredict, int readTimeoutSeconds) {
         String url = ollamaUrl.replaceAll("/+$", "") + "/api/generate";
         var body = new java.util.LinkedHashMap<String, Object>();
         body.put("model", ollamaModel);
@@ -1589,12 +2308,12 @@ public class AiAnalysisService {
             try { body.put("format", objectMapper.readTree(jsonSchema)); }
             catch (Exception e) { log.warn("Schéma Ollama ignoré: {}", e.getMessage()); }
         }
-        addOllamaGenerationOptions(body, numGpu);
+        addOllamaGenerationOptions(body, numGpu, numPredict);
 
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
         HttpEntity<Object> entity = new HttpEntity<>(body, headers);
-        RestTemplate rest = createOllamaRestTemplate();
+        RestTemplate rest = createOllamaRestTemplate(readTimeoutSeconds);
         try {
             ResponseEntity<JsonNode> response = rest.exchange(url, HttpMethod.POST, entity, JsonNode.class);
             if (response.getBody() == null) throw new RuntimeException("Réponse Ollama vide");

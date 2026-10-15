@@ -3,6 +3,7 @@ package com.backend.devsecopsplatform_backend.repository;
 import com.backend.devsecopsplatform_backend.entity.Alert;
 import com.backend.devsecopsplatform_backend.entity.AlertStatus;
 import com.backend.devsecopsplatform_backend.entity.AlertType;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.JpaSpecificationExecutor;
 import org.springframework.data.jpa.repository.Query;
@@ -15,6 +16,10 @@ import java.util.UUID;
 public interface AlertRepository extends JpaRepository<Alert, UUID>, JpaSpecificationExecutor<Alert> {
 
     List<Alert> findByDeletedFalseOrderByCreatedAtDesc();
+
+    /** Fenêtre bornée pour le fil d'activité admin (AdminActivityService) — évite de charger
+     * toute la table quand seules les N dernières alertes sont nécessaires. */
+    List<Alert> findByDeletedFalseOrderByCreatedAtDesc(Pageable pageable);
 
     List<Alert> findByDeletedFalseAndStatusOrderByCreatedAtDesc(AlertStatus status);
 
@@ -55,4 +60,7 @@ public interface AlertRepository extends JpaRepository<Alert, UUID>, JpaSpecific
 
     List<Alert> findByDeletedFalseAndTypeInAndCreatedAtAfterOrderByCreatedAtDesc(
             List<AlertType> types, LocalDateTime since);
+
+    List<Alert> findByDeletedFalseAndTypeInAndCreatedAtBetweenOrderByCreatedAtDesc(
+            List<AlertType> types, LocalDateTime from, LocalDateTime to);
 }

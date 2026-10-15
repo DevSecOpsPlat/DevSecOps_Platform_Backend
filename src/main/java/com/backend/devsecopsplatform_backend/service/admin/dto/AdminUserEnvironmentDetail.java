@@ -8,6 +8,9 @@ public record AdminUserEnvironmentDetail(
         UUID applicationId,
         String applicationName,
         String environmentName,
+        /** Namespace K8s réel — permet de réutiliser tel quel GET /api/admin/monitoring/namespaces/{namespace}
+         * (AdminMonitoringService.getNamespaceDetail) depuis la page détail Environnement, sans nouvel appel K8s. */
+        String namespace,
         String gitBranch,
         String status,
         String url,

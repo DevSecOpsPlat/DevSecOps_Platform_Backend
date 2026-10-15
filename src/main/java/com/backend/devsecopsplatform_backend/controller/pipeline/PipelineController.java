@@ -4,12 +4,15 @@ import com.backend.devsecopsplatform_backend.controller.environment.PipelineScan
 import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
 import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
 import com.backend.devsecopsplatform_backend.entity.PipelineExecutionKind;
+import com.backend.devsecopsplatform_backend.entity.PipelineStatus;
 import com.backend.devsecopsplatform_backend.repository.AppServiceRepository;
+import com.backend.devsecopsplatform_backend.repository.ManagedApplicationRepository;
 import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
 import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
 import com.backend.devsecopsplatform_backend.repository.UserRepository;
 import com.backend.devsecopsplatform_backend.service.GitLabService;
 import com.backend.devsecopsplatform_backend.service.PipelineStageSyncService;
+import com.backend.devsecopsplatform_backend.service.appmgmt.ScanBatchCompletionService;
 import com.fasterxml.jackson.databind.JsonNode;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -40,9 +43,11 @@ public class PipelineController {
     private final EphemeralEnvironmentRepository environmentRepository;
     private final PipelineExecutionRepository pipelineExecutionRepository;
     private final AppServiceRepository appServiceRepository;
+    private final ManagedApplicationRepository managedApplicationRepository;
     private final UserRepository userRepository;
     private final GitLabService gitLabService;
     private final PipelineStageSyncService pipelineStageSyncService;
+    private final ScanBatchCompletionService scanBatchCompletionService;
 
     private com.backend.devsecopsplatform_backend.entity.User getCurrentUser() {
         Authentication auth = SecurityContextHolder.getContext().getAuthentication();
@@ -110,7 +115,66 @@ public class PipelineController {
                 .map(this::buildPipelineResponseFromDb)
                 .collect(Collectors.toList());
 
+        backfillSharedPipelineStages(result);
+
+        // Si des lignes multi-services n'ont toujours pas de jobs, resync GitLab (propage à toutes).
+        result.stream()
+                .map(m -> m.get("pipelineId"))
+                .filter(id -> id instanceof Number)
+                .map(id -> ((Number) id).longValue())
+                .filter(pid -> pid > 0)
+                .distinct()
+                .filter(pid -> result.stream().anyMatch(m ->
+                        pid.equals(asLong(m.get("pipelineId")))
+                                && (m.get("jobs") instanceof List<?> jobs && jobs.isEmpty())))
+                .forEach(pid -> java.util.concurrent.CompletableFuture.runAsync(() -> {
+                    try {
+                        pipelineStageSyncService.syncStagesForPipeline(pid);
+                    } catch (Exception e) {
+                        log.debug("Refresh async pipeline {} (list): {}", pid, e.getMessage());
+                    }
+                }));
+
         return ResponseEntity.ok(result);
+    }
+
+    /**
+     * Un scan multi-services partage un gitlabPipelineId : si une exécution a déjà les jobs
+     * (stages_json), les propager aux sœurs encore vides (données historiques avant sync all).
+     */
+    @SuppressWarnings("unchecked")
+    private void backfillSharedPipelineStages(List<Map<String, Object>> rows) {
+        Map<Long, Map<String, Object>> donorByPipeline = new HashMap<>();
+        for (Map<String, Object> row : rows) {
+            Long pid = asLong(row.get("pipelineId"));
+            if (pid == null) continue;
+            Object jobs = row.get("jobs");
+            if (!(jobs instanceof List<?> list) || list.isEmpty()) continue;
+            donorByPipeline.putIfAbsent(pid, row);
+        }
+        if (donorByPipeline.isEmpty()) return;
+
+        for (Map<String, Object> row : rows) {
+            Long pid = asLong(row.get("pipelineId"));
+            if (pid == null) continue;
+            Map<String, Object> donor = donorByPipeline.get(pid);
+            if (donor == null || donor == row) continue;
+            Object jobs = row.get("jobs");
+            boolean empty = !(jobs instanceof List<?> list) || list.isEmpty();
+            if (!empty) continue;
+            row.put("jobs", donor.get("jobs"));
+            if (row.get("shortSha") == null) row.put("shortSha", donor.get("shortSha"));
+            if (row.get("webUrl") == null) row.put("webUrl", donor.get("webUrl"));
+            if (row.get("ref") == null) row.put("ref", donor.get("ref"));
+            if (row.get("duration") == null) row.put("duration", donor.get("duration"));
+            if (row.get("totalJobs") == null) row.put("totalJobs", donor.get("totalJobs"));
+            if (row.get("jobStatusCount") == null) row.put("jobStatusCount", donor.get("jobStatusCount"));
+        }
+    }
+
+    private static Long asLong(Object v) {
+        if (v instanceof Number n) return n.longValue();
+        return null;
     }
 
     private Map<String, Object> buildPipelineResponseFromDb(PipelineExecution execution) {
@@ -335,8 +399,13 @@ public class PipelineController {
             if (applicationId == null) {
                 return ResponseEntity.badRequest().build();
             }
-            appServiceRepository.findByIdAndCreatedBy(applicationId, user)
-                    .orElseThrow(() -> new RuntimeException("Application introuvable ou accès refusé"));
+            // applicationId peut être soit un service isolé (legacy), soit une appli managée
+            // (le pipeline n'est alors rattaché à aucun service en particulier).
+            boolean owns = appServiceRepository.findByIdAndCreatedBy(applicationId, user).isPresent()
+                    || managedApplicationRepository.findByIdAndCreatedBy(applicationId, user).isPresent();
+            if (!owns) {
+                throw new RuntimeException("Application introuvable ou accès refusé");
+            }
             return ResponseEntity.ok(fetchPipelineLiveFromGitLab(pipelineId, includeReports, refresh));
         }
 
@@ -446,7 +515,8 @@ public class PipelineController {
 
     /**
      * POST /api/pipelines/{pipelineId}/cancel
-     * Annule un pipeline en cours (si l'utilisateur en est propriétaire).
+     * Annule un pipeline en cours (GitLab) et ferme le lot ScanBatch associé
+     * pour permettre de relancer un scan immédiatement.
      */
     @PostMapping("/{pipelineId}/cancel")
     public ResponseEntity<Void> cancelPipeline(@PathVariable Long pipelineId) {
@@ -458,12 +528,24 @@ public class PipelineController {
         }
         try {
             gitLabService.cancelPipeline(pipelineId);
+        } catch (Exception e) {
+            // Déjà annulé / terminé côté GitLab : on ferme quand même l'état local
+            log.warn("Annulation GitLab pipeline #{} : {} — sync lot locale quand même",
+                    pipelineId, e.getMessage());
+        }
+        try {
+            scanBatchCompletionService.onUserCanceledGitlabPipeline(pipelineId);
+            // Best-effort : jobs/stages BDD
+            try {
+                pipelineStageSyncService.syncStagesForPipeline(pipelineId);
+            } catch (Exception syncEx) {
+                log.debug("Sync stages après cancel #{}: {}", pipelineId, syncEx.getMessage());
+            }
             return ResponseEntity.noContent().build();
         } catch (Exception e) {
-            log.error("❌ Annulation pipeline {}: {}", pipelineId, e.getMessage());
-            return ResponseEntity.notFound().build();
+            log.error("❌ Annulation pipeline {} (état local): {}", pipelineId, e.getMessage());
+            return ResponseEntity.internalServerError().build();
         }
-
     }
 
     /**
@@ -491,6 +573,33 @@ public class PipelineController {
             return ResponseEntity.noContent().build();
         } catch (Exception e) {
             log.error("❌ Retry job {}: {}", jobId, e.getMessage());
+            return ResponseEntity.internalServerError().build();
+        }
+    }
+
+    /**
+     * POST /api/pipelines/jobs/{jobId}/cancel
+     * Annule un job en cours (running/pending) sans annuler tout le pipeline — « stopper un stage ».
+     */
+    @PostMapping("/jobs/{jobId}/cancel")
+    public ResponseEntity<Void> cancelJob(@PathVariable Long jobId) {
+        var user = getCurrentUser();
+        try {
+            var job = gitLabService.getJob(jobId);
+            if (job == null || job.getPipeline() == null || job.getPipeline().getId() == null) {
+                return ResponseEntity.notFound().build();
+            }
+            Long pipelineId = job.getPipeline().getId();
+            PipelineExecution execution = pipelineExecutionRepository.findByGitlabPipelineId(pipelineId)
+                    .orElseThrow(() -> new RuntimeException("Pipeline inconnu"));
+            if (!canAccessExecution(execution, user)) {
+                return ResponseEntity.status(403).build();
+            }
+            gitLabService.cancelJob(jobId);
+            maybeRefreshAsync(execution, true);
+            return ResponseEntity.noContent().build();
+        } catch (Exception e) {
+            log.error("❌ Cancel job {}: {}", jobId, e.getMessage());
             return ResponseEntity.internalServerError().build();
         }
     }

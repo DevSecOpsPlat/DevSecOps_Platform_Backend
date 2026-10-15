@@ -61,4 +61,29 @@ public class ManagedDeploymentWebhookController {
             return ResponseEntity.internalServerError().body(Map.of("message", "Erreur interne"));
         }
     }
+
+    /**
+     * POST /api/webhooks/managed-deployments/{deploymentId}/container-scan
+     * Body : { critical, high, medium, low, imageName } — résumé Grype du job deploy:grype-scan.
+     * audit-deploiement.md, chantier #9 : le résultat n'était calculé qu'en CI, jamais affiché.
+     */
+    @PostMapping("/{deploymentId}/container-scan")
+    public ResponseEntity<?> updateContainerScan(
+            @PathVariable UUID deploymentId,
+            @RequestHeader(value = "X-Pipeline-Secret", required = false) String secret,
+            @RequestBody ContainerScanCallbackRequest request) {
+
+        if (pipelineSecret == null || pipelineSecret.isBlank() || !pipelineSecret.equals(secret)) {
+            return ResponseEntity.status(403).body(Map.of("message", "Secret invalide"));
+        }
+        try {
+            deploymentService.applyContainerScanCallback(deploymentId, request);
+            return ResponseEntity.ok(Map.of("status", "ok"));
+        } catch (AppValidationException e) {
+            return ResponseEntity.status(404).body(Map.of("message", e.getMessage()));
+        } catch (Exception e) {
+            log.error("Erreur callback scan container déploiement {}: {}", deploymentId, e.getMessage(), e);
+            return ResponseEntity.internalServerError().body(Map.of("message", "Erreur interne"));
+        }
+    }
 }

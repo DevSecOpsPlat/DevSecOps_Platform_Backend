@@ -31,6 +31,43 @@ public class SecurityScoringService {
     private static final int HOTSPOT_PENALTY_CAP = 10;
     private static final int POSTURE_WARN_THRESHOLD = 75;
 
+    // ── Diagnostic du 29/08/2026 (30 derniers quality_gate_snapshots) ──────────────────────────
+    // Constat : dans 5/5 pipelines à score 0 de l'échantillon, dd_critical + dd_high + dd_medium
+    // saturaient SIMULTANÉMENT leur plafond individuel de -30 (-90 à eux seuls), avant même DAST
+    // ou Sonar -- aucun plafond n'existait sur la somme. PROVISOIRE : calibré sur 30 pipelines
+    // seulement, à revoir dès qu'on dispose de plus de données (voir docs/audit-quality-gate.md).
+    private static final int SEVERITY_GLOBAL_CAP = 70;
+
+    // Même réserve (provisoire, 30 pipelines) pour la dimension conteneur ci-dessous -- sans ce
+    // second plafond, un pipeline à forte densité de findings Grype reproduirait exactement le
+    // même mécanisme de dépassement, juste déplacé d'un bucket à l'autre.
+    private static final int CONTAINER_GLOBAL_CAP = 70;
+
+    // Paliers absolus pour le scan de conteneur (Grype) -- PAS de densité par ncloc. Diagnostic du
+    // 29/08/2026 : ni le rapport Grype natif, ni l'agrégation CI, ni aucun DTO backend n'exposent
+    // un total de paquets scannés dans l'image (Syft ne tourne que pour la conformité licence,
+    // jamais fusionné au scan de vulnérabilités) -- une normalisation par "nombre de dépendances"
+    // n'est donc pas possible aujourd'hui. Le nombre de vulnérabilités d'une image de base
+    // (paquets OS/runtime) n'a de toute façon structurellement aucun lien avec ncloc : deux
+    // pipelines de la même appli avec ncloc=140 et ncloc=928 montraient des comptages Grype du
+    // même ordre de grandeur dans l'échantillon.
+    // Seuils calibrés sur les comptages réels (dimension DefectDojo, après import) observés sur
+    // les pipelines du flux déploiement de l'échantillon :
+    //   critical : 0, 7, 13, 13, 13, 13
+    //   high     : 0, 44, 113, 116, 132, 144
+    //   medium   : 0 (majorité des cas), un cas à 117
+    //   low      : 0 (majorité des cas), un cas à 25
+    // Échantillon volontairement restreint (30 pipelines, ~5 exploitables par sévérité hors
+    // doublons) -- seuils à recalibrer avec plus de données, voir docs/audit-quality-gate.md.
+    private static final int[] CONTAINER_CRIT_THRESHOLDS = {3, 8, 15};
+    private static final int[] CONTAINER_CRIT_IMPACTS = {8, 16, 25, 30};
+    private static final int[] CONTAINER_HIGH_THRESHOLDS = {15, 50, 120};
+    private static final int[] CONTAINER_HIGH_IMPACTS = {8, 16, 24, 30};
+    private static final int[] CONTAINER_MEDIUM_THRESHOLDS = {10, 40, 90};
+    private static final int[] CONTAINER_MEDIUM_IMPACTS = {6, 14, 22, 30};
+    private static final int[] CONTAINER_LOW_THRESHOLDS = {8, 20};
+    private static final int[] CONTAINER_LOW_IMPACTS = {6, 14, 30};
+
     public record HardGateEvaluation(
             List<HardGateViolationDto> violations,
             List<HardGateViolationDto> indeterminate,
@@ -97,6 +134,22 @@ public class SecurityScoringService {
             }
         }
 
+        // DAST (ZAP) ne s'applique jamais aux pipelines scan-only (ZAP n'y tourne pas) : le gate
+        // reste silencieusement absent dans ce cas, comportement identique à avant ce changement.
+        // Bloquant (VIOLATED), avec le seuil de tolérance déjà prévu pour le DAST (pas zéro-tolérance
+        // comme les autres gates, pour absorber le bruit propre à une analyse dynamique).
+        if (input.isDastApplicable()) {
+            if (!input.isDastEvaluable()) {
+                indeterminateSources.add("DAST (ZAP)");
+                indeterminate.add(violation("dast", "Vulnérabilités élevées (DAST / ZAP)",
+                        "Scan DAST non exécuté ou incomplet — état inconnu", "INDETERMINATE"));
+            } else if (input.getDastHigh() > QualityGateThresholds.DAST_HIGH) {
+                violations.add(violation("dast", "Vulnérabilités élevées (DAST / ZAP)",
+                        input.getDastHigh() + " finding(s) élevé(s) ZAP (seuil " + QualityGateThresholds.DAST_HIGH + ")",
+                        "VIOLATED"));
+            }
+        }
+
         String summary = buildHardGateSummary(violations);
         return new HardGateEvaluation(violations, indeterminate, indeterminateSources, summary);
     }
@@ -111,6 +164,7 @@ public class SecurityScoringService {
         }
 
         List<ScoreBreakdownItemDto> breakdown = new ArrayList<>();
+        List<String> appliedCaps = new ArrayList<>();
         Map<String, Integer> dd = input.getDdBySeverity() != null ? input.getDdBySeverity() : Map.of();
 
         int crit = dd.getOrDefault("critical", 0);
@@ -121,16 +175,65 @@ public class SecurityScoringService {
         boolean useDensity = ncloc >= 100;
 
         int score = 100;
-        score -= severityPenalty(breakdown, "critical", crit, ncloc, useDensity, DENSITY_CRITICAL_FACTOR, ABS_PENALTY_CRITICAL);
-        score -= severityPenalty(breakdown, "high", high, ncloc, useDensity, DENSITY_HIGH_FACTOR, ABS_PENALTY_HIGH);
-        score -= severityPenalty(breakdown, "medium", med, ncloc, useDensity, DENSITY_MEDIUM_FACTOR, ABS_PENALTY_MEDIUM);
-        score -= severityPenalty(breakdown, "low", low, ncloc, useDensity, DENSITY_LOW_FACTOR, ABS_PENALTY_LOW);
+        CvssWeighting critW = cvssWeighting("critical", crit, input);
+        int critImpact = severityPenalty(breakdown, "critical", crit, critW.weightedCount(), critW.note(),
+                ncloc, useDensity, DENSITY_CRITICAL_FACTOR, ABS_PENALTY_CRITICAL);
+        CvssWeighting highW = cvssWeighting("high", high, input);
+        int highImpact = severityPenalty(breakdown, "high", high, highW.weightedCount(), highW.note(),
+                ncloc, useDensity, DENSITY_HIGH_FACTOR, ABS_PENALTY_HIGH);
+        CvssWeighting medW = cvssWeighting("medium", med, input);
+        int medImpact = severityPenalty(breakdown, "medium", med, medW.weightedCount(), medW.note(),
+                ncloc, useDensity, DENSITY_MEDIUM_FACTOR, ABS_PENALTY_MEDIUM);
+        CvssWeighting lowW = cvssWeighting("low", low, input);
+        int lowImpact = severityPenalty(breakdown, "low", low, lowW.weightedCount(), lowW.note(),
+                ncloc, useDensity, DENSITY_LOW_FACTOR, ABS_PENALTY_LOW);
 
+        // Plafond global sur la somme des 4 buckets de sévérité -- appliqué APRÈS les plafonds
+        // individuels de -30 (rognage de la somme finale), pas d'arrêt anticipé de l'accumulation :
+        // chaque bucket reste calculé et affiché avec sa vraie valeur individuelle (transparence),
+        // seule la part appliquée au score est plafonnée. Choix délibéré (plus simple, plus
+        // prévisible, n'exige pas de choisir un ordre d'évaluation des buckets) -- voir diagnostic
+        // du 29/08/2026. Sans dépassement (cas normal), ce plafond est un no-op strict : score
+        // identique au comportement d'avant ce changement.
+        int severitySum = critImpact + highImpact + medImpact + lowImpact;
+        int severityApplied = applyGlobalCap(severitySum, SEVERITY_GLOBAL_CAP, "severity_global_cap", appliedCaps);
+        score -= severityApplied;
+
+        // Conteneur (Grype) : dimension à part, paliers absolus (PAS de densité par ncloc), jamais
+        // fondue dans crit/high/med/low ci-dessus -- voir QualityGateService.buildBySeverity
+        // (soustraction symétrique à celle déjà faite pour DAST) et les constantes CONTAINER_*
+        // ci-dessus pour la justification des seuils. Même plafond global que les buckets de
+        // sévérité, même raison : éviter de reproduire le même mécanisme de dépassement ici.
+        int containerImpact = 0;
+        containerImpact += containerTierPenalty(breakdown, "critical", input.getContainerCritical(),
+                CONTAINER_CRIT_THRESHOLDS, CONTAINER_CRIT_IMPACTS);
+        containerImpact += containerTierPenalty(breakdown, "high", input.getContainerHigh(),
+                CONTAINER_HIGH_THRESHOLDS, CONTAINER_HIGH_IMPACTS);
+        containerImpact += containerTierPenalty(breakdown, "medium", input.getContainerMedium(),
+                CONTAINER_MEDIUM_THRESHOLDS, CONTAINER_MEDIUM_IMPACTS);
+        containerImpact += containerTierPenalty(breakdown, "low", input.getContainerLow(),
+                CONTAINER_LOW_THRESHOLDS, CONTAINER_LOW_IMPACTS);
+        int containerApplied = applyGlobalCap(containerImpact, CONTAINER_GLOBAL_CAP, "container_global_cap", appliedCaps);
+        score -= containerApplied;
+
+        // DAST (ZAP) : dimension à part, jamais fondue dans crit/high/med/low ci-dessus (voir
+        // QualityGateService.buildBySeverity) -- ligne de détail dédiée, visible séparément.
+        int dastImpact = 0;
+        if (input.isDastApplicable()) {
+            dastImpact += severityPenalty(breakdown, "dast_high", input.getDastHigh(),
+                    ncloc, useDensity, DENSITY_HIGH_FACTOR, ABS_PENALTY_HIGH);
+            dastImpact += severityPenalty(breakdown, "dast_medium", input.getDastMedium(),
+                    ncloc, useDensity, DENSITY_MEDIUM_FACTOR, ABS_PENALTY_MEDIUM);
+        }
+        score -= dastImpact;
+
+        int sonarImpact = 0;
         if (input.isSonarAvailable()) {
-            score -= ratingPenalty("Security", input.getSecurityRating(), breakdown);
-            score -= ratingPenalty("Reliability", input.getReliabilityRating(), breakdown);
+            int secRating = ratingPenalty("Security", input.getSecurityRating(), breakdown);
+            int relRating = ratingPenalty("Reliability", input.getReliabilityRating(), breakdown);
+            sonarImpact += secRating + relRating;
             if (input.isCoverageKnown() && input.getCoverage() < 50) {
-                score -= 5;
+                sonarImpact += 5;
                 breakdown.add(item("sonar_coverage", "SONAR_QUALITY",
                         "Couverture de tests < 50 % (" + formatCoverage(input.getCoverage()) + ")", -5, null,
                         "Informationnel si aucun test configuré"));
@@ -139,12 +242,19 @@ public class SecurityScoringService {
                 int hsImpact = Math.min(HOTSPOT_PENALTY_CAP,
                         (int) Math.round(input.getSecurityHotspots() * 0.5));
                 if (hsImpact > 0) {
-                    score -= hsImpact;
+                    sonarImpact += hsImpact;
                     breakdown.add(item("sonar_hotspots", "SONAR_QUALITY",
                             input.getSecurityHotspots() + " security hotspot(s) à revoir", -hsImpact, null, null));
                 }
             }
+            score -= sonarImpact;
         }
+
+        // Vraie somme avant plafonds (contrairement au comportement historique où ce champ ne
+        // faisait que refléter le score déjà plafonné) -- calculée à partir des sommes non
+        // plafonnées de chaque dimension, avant le clamp final [0, 100]. Volontairement non
+        // clampée : une valeur négative est le signal utile (diagnostic du 29/08/2026).
+        int rawScoreBeforeCaps = 100 - severitySum - containerImpact - dastImpact - sonarImpact;
 
         score = Math.max(0, Math.min(100, score));
         String grade = scoreToGrade(score);
@@ -155,9 +265,51 @@ public class SecurityScoringService {
                 .grade(grade)
                 .derivedVerdict(derivedVerdict)
                 .breakdown(breakdown)
-                .rawScoreBeforeCaps(score)
-                .appliedCaps(List.of())
+                .rawScoreBeforeCaps(rawScoreBeforeCaps)
+                .appliedCaps(appliedCaps)
                 .build();
+    }
+
+    /**
+     * Rogne la somme d'un groupe de buckets déjà individuellement calculés/plafonnés -- rognage
+     * de la somme finale (pas d'arrêt anticipé de l'accumulation). N'enregistre l'id du plafond
+     * dans {@code appliedCaps} que s'il a réellement fallu rogner (no-op sinon, comportement
+     * historique préservé à l'identique).
+     */
+    private static int applyGlobalCap(int sum, int cap, String capId, List<String> appliedCaps) {
+        if (sum > cap) {
+            appliedCaps.add(capId);
+            return cap;
+        }
+        return sum;
+    }
+
+    /** Recherche le palier applicable (comptage brut -> impact), 0 si count &lt;= 0. */
+    private static int tierImpact(int count, int[] thresholds, int[] impacts) {
+        if (count <= 0) return 0;
+        for (int i = 0; i < thresholds.length; i++) {
+            if (count <= thresholds[i]) {
+                return impacts[i];
+            }
+        }
+        return impacts[impacts.length - 1];
+    }
+
+    private int containerTierPenalty(
+            List<ScoreBreakdownItemDto> breakdown,
+            String severityKey,
+            int count,
+            int[] thresholds,
+            int[] impacts
+    ) {
+        int impact = tierImpact(count, thresholds, impacts);
+        if (impact > 0) {
+            breakdown.add(item("container_" + severityKey, "DEFECTDOJO",
+                    count + " " + severityKey + "(s) conteneur (Grype) — palier absolu, indépendant de ncloc",
+                    -impact, null,
+                    "Palier provisoire (échantillon 30 pipelines, 29/08/2026) — voir SecurityScoringService"));
+        }
+        return impact;
     }
 
     /** @deprecated Utiliser {@link #computePostureScore} — conservé pour compatibilité tests. */
@@ -223,6 +375,7 @@ public class SecurityScoringService {
         return 0;
     }
 
+    /** Compte brut (comportement historique, non pondéré par CVSS) — utilisé par le DAST. */
     private int severityPenalty(
             List<ScoreBreakdownItemDto> breakdown,
             String severityKey,
@@ -232,25 +385,83 @@ public class SecurityScoringService {
             double densityFactor,
             double absFactor
     ) {
-        if (count <= 0) return 0;
+        return severityPenalty(breakdown, severityKey, count, count, null, ncloc, useDensity, densityFactor, absFactor);
+    }
+
+    /**
+     * @param rawCount      compte brut, affiché tel quel dans le libellé (jamais de décimale visible)
+     * @param weightedCount compte utilisé pour le calcul — identique à rawCount si pas de CVSS connu
+     *                      (repli sûr, comportement inchangé), sinon pondéré par {@link #cvssWeighting}
+     * @param cvssNote      suffixe optionnel affiché dans le libellé quand la pondération CVSS
+     *                      s'écarte notablement de 1.0 (null sinon)
+     */
+    private int severityPenalty(
+            List<ScoreBreakdownItemDto> breakdown,
+            String severityKey,
+            int rawCount,
+            double weightedCount,
+            String cvssNote,
+            int ncloc,
+            boolean useDensity,
+            double densityFactor,
+            double absFactor
+    ) {
+        if (rawCount <= 0) return 0;
         int impact;
         String label;
         if (useDensity) {
-            double density = count * 1000.0 / ncloc;
+            double density = weightedCount * 1000.0 / ncloc;
             impact = (int) Math.round(Math.min(30, density * densityFactor));
-            label = count + " " + severityKey + "(s) — densité "
+            label = rawCount + " " + severityKey + "(s) — densité "
                     + String.format(Locale.ROOT, "%.2f", density) + " / 1000 LOC";
         } else {
-            impact = severityKey.equals("low")
-                    ? (int) Math.round(count * absFactor)
-                    : (int) Math.round(count * absFactor);
-            label = count + " " + severityKey + "(s) (DefectDojo, comptage absolu — ncloc inconnu)";
+            impact = (int) Math.round(weightedCount * absFactor);
+            label = rawCount + " " + severityKey + "(s) (DefectDojo, comptage absolu — ncloc inconnu)";
+        }
+        if (cvssNote != null) {
+            label += " " + cvssNote;
         }
         if (impact > 0) {
             breakdown.add(item("dd_" + severityKey, "DEFECTDOJO", label, -impact, null,
                     useDensity ? "Pénalité basée sur la densité (ncloc=" + ncloc + ")" : null));
         }
         return impact;
+    }
+
+    private record CvssWeighting(double weightedCount, String note) {}
+
+    /**
+     * Pondère un compte de findings par le CVSS moyen observé dans son bucket de sévérité, en
+     * modulant (±50 % max) autour du point médian CVSS v3.1 standard de cette sévérité. Repli sûr :
+     * sans donnée CVSS pour ce bucket, retourne le compte brut inchangé (score identique à avant
+     * ce changement).
+     */
+    private CvssWeighting cvssWeighting(String severityKey, int rawCount, SecurityScoreInput input) {
+        if (rawCount <= 0) {
+            return new CvssWeighting(0, null);
+        }
+        Map<String, Double> avgMap = input.getAvgCvssBySeverity();
+        Map<String, Integer> knownMap = input.getCvssKnownCountBySeverity();
+        Double avg = avgMap != null ? avgMap.get(severityKey) : null;
+        Integer known = knownMap != null ? knownMap.get(severityKey) : null;
+        if (avg == null || known == null || known <= 0) {
+            return new CvssWeighting(rawCount, null);
+        }
+        double midpoint = switch (severityKey) {
+            case "critical" -> 9.5;
+            case "high" -> 8.0;
+            case "medium" -> 5.5;
+            case "low" -> 2.0;
+            default -> 1.0;
+        };
+        double weight = Math.max(0.5, Math.min(1.5, avg / midpoint));
+        int unknown = Math.max(0, rawCount - known);
+        double weightedCount = (known * weight) + unknown;
+        String note = Math.abs(weight - 1.0) >= 0.05
+                ? "(CVSS moy. " + String.format(Locale.ROOT, "%.1f", avg) + ", pondéré ×"
+                        + String.format(Locale.ROOT, "%.2f", weight) + ")"
+                : null;
+        return new CvssWeighting(weightedCount, note);
     }
 
     private int ratingPenalty(String dimension, String letter, List<ScoreBreakdownItemDto> breakdown) {
@@ -317,12 +528,30 @@ public class SecurityScoringService {
         return String.format(Locale.ROOT, "%.1f %%", coverage);
     }
 
-    private static String scoreToGrade(int score) {
+    public static String scoreToGrade(int score) {
         if (score >= 90) return "A";
         if (score >= 75) return "B";
         if (score >= 60) return "C";
         if (score >= 40) return "D";
         return "E";
+    }
+
+    /**
+     * Même logique que {@code QualityGateService.resolveDeterministicVerdict} —
+     * exposée pour l'agrégation lot (Chantier 4) sans coupler au controller QG.
+     */
+    public String resolveDeterministicVerdict(HardGateEvaluation hardGates, SecurityScoreDto postureScore) {
+        if (hardGates != null && !hardGates.violations().isEmpty()) {
+            return "NOT_RECOMMENDED";
+        }
+        if (hardGates != null && (!hardGates.indeterminateSources().isEmpty()
+                || (hardGates.indeterminate() != null && !hardGates.indeterminate().isEmpty()))) {
+            return "INDETERMINE";
+        }
+        if (postureScore != null && postureScore.getDerivedVerdict() != null) {
+            return postureScore.getDerivedVerdict();
+        }
+        return "WITH_WARNINGS";
     }
 
     private static SecurityScoreDto emptyScore() {

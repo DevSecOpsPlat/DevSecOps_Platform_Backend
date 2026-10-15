@@ -2,6 +2,7 @@ package com.backend.devsecopsplatform_backend.controller.appmgmt;
 
 import com.backend.devsecopsplatform_backend.service.appmgmt.ApplicationManagementService;
 import com.backend.devsecopsplatform_backend.service.appmgmt.AppValidationException;
+import com.backend.devsecopsplatform_backend.service.appmgmt.ManagedAppScanService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -28,6 +29,7 @@ import java.util.UUID;
 public class ApplicationManagementController {
 
     private final ApplicationManagementService service;
+    private final ManagedAppScanService managedAppScanService;
 
     // ---------- Applications ----------
 
@@ -77,6 +79,46 @@ public class ApplicationManagementController {
         return handle(() -> ResponseEntity.ok(service.deleteService(id, sid)));
     }
 
+    /**
+     * Aperçu ressources avant d'enregistrer une édition de service déjà déployé (quota namespace
+     * + capacité nœud, sur l'état RÉEL du cluster) — même garde-fou que la modale Déployer, pour
+     * le chemin d'édition qui la contournait jusqu'ici (audit-deploiement.md §8).
+     */
+    @PostMapping("/{id}/services/{sid}/resource-preview")
+    public ResponseEntity<?> previewServiceResourceChange(@PathVariable UUID id, @PathVariable UUID sid,
+                                                           @RequestBody AppServiceRequest request) {
+        return handle(() -> ResponseEntity.ok(service.previewServiceResourceChange(id, sid, request)));
+    }
+
+    // ---------- Scan lot (Chantier 2) ----------
+
+    @PostMapping("/{id}/scan")
+    public ResponseEntity<?> scanApp(
+            @PathVariable UUID id,
+            @RequestBody(required = false) ManagedAppScanRequest request) {
+        return handle(() -> ResponseEntity.ok(
+                managedAppScanService.scanApplication(id, request != null ? request : new ManagedAppScanRequest())));
+    }
+
+    @GetMapping("/{id}/scan-batches")
+    public ResponseEntity<?> listScanBatches(@PathVariable UUID id) {
+        return handle(() -> ResponseEntity.ok(managedAppScanService.listBatches(id)));
+    }
+
+    @GetMapping("/{id}/scan-batches/{batchId}")
+    public ResponseEntity<?> getScanBatch(@PathVariable UUID id, @PathVariable UUID batchId) {
+        return handle(() -> ResponseEntity.ok(managedAppScanService.getBatch(id, batchId)));
+    }
+
+    @GetMapping("/{id}/security-posture")
+    public ResponseEntity<?> securityPosture(
+            @PathVariable UUID id,
+            @RequestParam(required = false) UUID batchId) {
+        return handle(() -> ResponseEntity.ok(batchId != null
+                ? managedAppScanService.securityPosture(id, batchId)
+                : managedAppScanService.securityPosture(id)));
+    }
+
     // ---------- Databases ----------
 
     @PostMapping("/{id}/databases")
@@ -124,6 +166,13 @@ public class ApplicationManagementController {
 
     // ---------- Déploiements ----------
 
+    @PostMapping("/{id}/deploy/preview")
+    public ResponseEntity<?> deployPreview(
+            @PathVariable UUID id,
+            @RequestBody(required = false) ManagedDeployRequest request) {
+        return handle(() -> ResponseEntity.ok(service.previewDeploy(id, request)));
+    }
+
     @PostMapping("/{id}/deploy")
     public ResponseEntity<?> deploy(
             @PathVariable UUID id,
@@ -139,6 +188,12 @@ public class ApplicationManagementController {
     @GetMapping("/{id}/deployments/{did}")
     public ResponseEntity<?> getDeployment(@PathVariable UUID id, @PathVariable UUID did) {
         return handle(() -> ResponseEntity.ok(service.getDeployment(id, did)));
+    }
+
+    /** Temps-machine cumulé (approximatif) — audit-deploiement.md, chantier #10. */
+    @GetMapping("/{id}/machine-time")
+    public ResponseEntity<?> getMachineTime(@PathVariable UUID id) {
+        return handle(() -> ResponseEntity.ok(service.getMachineTimeUsage(id)));
     }
 
     @DeleteMapping("/{id}/deployments/{did}")
@@ -172,6 +227,12 @@ public class ApplicationManagementController {
         return handle(() -> ResponseEntity.ok(service.rebuildService(id, sid)));
     }
 
+    /** Objectif 3 (post-deploy) : relance manuelle du smoke test, sans restriction. */
+    @PostMapping("/{id}/services/{sid}/smoke-test/rerun")
+    public ResponseEntity<?> rerunSmokeTest(@PathVariable UUID id, @PathVariable UUID sid) {
+        return handle(() -> ResponseEntity.ok(service.rerunSmokeTest(id, sid)));
+    }
+
     /** Pods du namespace (phase, ready, restarts). */
     @GetMapping("/{id}/deployments/{did}/pods")
     public ResponseEntity<?> listDeploymentPods(@PathVariable UUID id, @PathVariable UUID did) {
@@ -184,10 +245,27 @@ public class ApplicationManagementController {
         return handle(() -> ResponseEntity.ok(service.getDeploymentMonitoring(id, did)));
     }
 
-    /** Alertes runtime live + historique (CrashLoop, OOM, health KO…). */
+    /** Alertes runtime live + historique (CrashLoop, OOM, Warning K8s FailedCreate…). */
     @GetMapping("/{id}/deployments/{did}/alerts")
     public ResponseEntity<?> getDeploymentAlerts(@PathVariable UUID id, @PathVariable UUID did) {
         return handle(() -> ResponseEntity.ok(service.listDeploymentAlerts(id, did)));
+    }
+
+    /**
+     * Historique des alertes de l'application, tous environnements confondus.
+     * Filtrable par plage de dates (from/to, ISO instant) et par namespace.
+     */
+    @GetMapping("/{id}/alerts/history")
+    public ResponseEntity<?> getAppAlertsHistory(
+            @PathVariable UUID id,
+            @RequestParam(required = false) String from,
+            @RequestParam(required = false) String to,
+            @RequestParam(required = false) String namespace) {
+        return handle(() -> {
+            java.time.Instant fromInst = from != null && !from.isBlank() ? java.time.Instant.parse(from) : null;
+            java.time.Instant toInst = to != null && !to.isBlank() ? java.time.Instant.parse(to) : null;
+            return ResponseEntity.ok(service.listAppAlertsHistory(id, fromInst, toInst, namespace));
+        });
     }
 
     /** Historique métriques long terme (échantillons CPU/MEM/net). */

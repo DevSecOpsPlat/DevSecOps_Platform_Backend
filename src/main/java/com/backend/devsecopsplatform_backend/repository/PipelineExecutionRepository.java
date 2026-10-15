@@ -22,7 +22,55 @@ public interface PipelineExecutionRepository extends JpaRepository<PipelineExecu
 
     List<PipelineExecution> findByEnvironmentOrderByCreatedAtDesc(EphemeralEnvironment environment);
 
-    Optional<PipelineExecution> findByGitlabPipelineId(Long gitlabPipelineId);
+    /**
+     * Cache du commit HEAD (obsolescence) jamais vérifié ou périmé -- pour le rafraîchissement en
+     * arrière-plan ({@link com.backend.devsecopsplatform_backend.service.appmgmt.HeadCacheRefreshScheduler}).
+     * JOIN FETCH pe.appService obligatoire : ces entités sortent détachées de cette requête (pas de
+     * transaction ouverte par l'appelant au moment de l'appel) puis sont lues plus tard dans une
+     * AUTRE transaction (ManagedAppScanService#refreshHeadCacheIfStale) -- rouvrir une session
+     * ailleurs ne réattache pas un proxy lazy déjà détaché, d'où l'eager fetch ici (association
+     * *-to-one, donc pas de souci de pagination en mémoire avec le LIMIT du Pageable).
+     */
+    @Query("""
+            SELECT pe FROM PipelineExecution pe
+            JOIN FETCH pe.appService
+            WHERE pe.headCheckedAt IS NULL OR pe.headCheckedAt < :cutoff
+            """)
+    List<PipelineExecution> findByHeadCheckedAtIsNullOrHeadCheckedAtBefore(
+            @Param("cutoff") java.time.LocalDateTime cutoff, Pageable pageable);
+
+    /**
+     * Historique / mono-exécution : au plus une ligne attendue avant les lots multi-services.
+     * Après D1, préférer {@link #findAllByGitlabPipelineId} ou
+     * {@link #findByGitlabPipelineIdAndApplicationId}.
+     */
+    Optional<PipelineExecution> findFirstByGitlabPipelineIdOrderByCreatedAtDesc(Long gitlabPipelineId);
+
+    /** @deprecated utiliser {@link #findFirstByGitlabPipelineIdOrderByCreatedAtDesc} ou findAll… */
+    default Optional<PipelineExecution> findByGitlabPipelineId(Long gitlabPipelineId) {
+        return findFirstByGitlabPipelineIdOrderByCreatedAtDesc(gitlabPipelineId);
+    }
+
+    List<PipelineExecution> findAllByGitlabPipelineIdOrderByCreatedAtAsc(Long gitlabPipelineId);
+
+    @Query("""
+            SELECT pe FROM PipelineExecution pe
+            JOIN FETCH pe.appService app
+            WHERE pe.scanBatch.id = :batchId
+            ORDER BY app.name ASC
+            """)
+    List<PipelineExecution> findByScanBatchIdWithService(@Param("batchId") UUID batchId);
+
+    @Query("""
+            SELECT pe FROM PipelineExecution pe
+            JOIN FETCH pe.appService app
+            JOIN FETCH pe.scanBatch
+            WHERE pe.scanBatch.id IN :batchIds
+            ORDER BY app.name ASC
+            """)
+    List<PipelineExecution> findByScanBatchIdInWithService(@Param("batchIds") Collection<UUID> batchIds);
+
+    List<PipelineExecution> findByScanBatchIdOrderByCreatedAtAsc(UUID scanBatchId);
 
     List<PipelineExecution> findByStatusIn(Collection<PipelineStatus> statuses);
 
@@ -237,4 +285,18 @@ public interface PipelineExecutionRepository extends JpaRepository<PipelineExecu
             WHERE env.id = :environmentId
             """)
     Optional<PipelineExecution> findByEnvironmentIdWithDetails(@Param("environmentId") UUID environmentId);
+
+    /** Fenêtre bornée d'exécutions récentes, tous comptes confondus, pour le fil d'activité admin
+     * (AdminActivityService) — fetch de tout ce qui est lu pendant la construction du DTO
+     * (propriétaire, application parente si multi-services, environnement) pour éviter le
+     * lazy-loading hors session. */
+    @Query("""
+            SELECT pe FROM PipelineExecution pe
+            JOIN FETCH pe.appService app
+            LEFT JOIN FETCH app.createdBy
+            LEFT JOIN FETCH app.managedApplication
+            LEFT JOIN FETCH pe.environment env
+            ORDER BY pe.createdAt DESC
+            """)
+    List<PipelineExecution> findAllWithDetailsOrderByCreatedAtDesc(Pageable pageable);
 }

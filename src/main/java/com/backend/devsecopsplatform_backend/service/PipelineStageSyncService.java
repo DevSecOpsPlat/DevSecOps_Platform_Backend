@@ -25,6 +25,8 @@ import java.util.Map;
 /**
  * Synchronise les stages/jobs des pipelines GitLab vers la base de données (stages_json).
  * Les stages sont récupérés via l'API GitLab puis persistés dans PipelineExecution.stagesJson.
+ * Un même gitlabPipelineId peut avoir plusieurs exécutions (scan multi-services) :
+ * la synchro propage le résumé GitLab à toutes les lignes.
  */
 @Service
 @Slf4j
@@ -41,7 +43,7 @@ public class PipelineStageSyncService {
 
     /**
      * Met à jour les stages en base pour un pipeline donné (appel API GitLab puis sauvegarde).
-     * En cas d'erreur API, ne modifie pas la base et log un avertissement.
+     * Propage vers toutes les {@link PipelineExecution} partageant ce gitlabPipelineId.
      *
      * @param pipelineId ID du pipeline GitLab
      * @return true si la synchro a réussi, false sinon
@@ -51,9 +53,12 @@ public class PipelineStageSyncService {
         if (pipelineId == null || pipelineId <= 0) {
             return false;
         }
-        return pipelineExecutionRepository.findByGitlabPipelineId(pipelineId)
-                .map(execution -> doSync(execution, pipelineId))
-                .orElse(false);
+        List<PipelineExecution> executions =
+                pipelineExecutionRepository.findAllByGitlabPipelineIdOrderByCreatedAtAsc(pipelineId);
+        if (executions.isEmpty()) {
+            return false;
+        }
+        return doSync(executions, pipelineId);
     }
 
     /**
@@ -134,13 +139,16 @@ public class PipelineStageSyncService {
         return Map.of();
     }
 
-    private boolean doSync(PipelineExecution execution, Long pipelineId) {
+    private boolean doSync(List<PipelineExecution> executions, Long pipelineId) {
         try {
             Map<String, Object> summary = gitLabService.fetchPipelineSummaryLive(pipelineId);
 
             Object newJobsObj = summary.get("jobs");
             int newJobsCount = newJobsObj instanceof List<?> list ? list.size() : 0;
-            int existingJobsCount = countJobsInStages(execution.getStagesJson());
+            int existingJobsCount = executions.stream()
+                    .mapToInt(e -> countJobsInStages(e.getStagesJson()))
+                    .max()
+                    .orElse(0);
             // Timeout GitLab → fallback vide : ne pas écraser une vue BDD valide
             if (newJobsCount == 0) {
                 if (existingJobsCount > 0) {
@@ -156,47 +164,66 @@ public class PipelineStageSyncService {
             }
 
             Map<String, Object> stagesJson = buildStagesJsonFromSummary(summary);
-            execution.setStagesJson(stagesJson);
-
-            // Mettre à jour le status de l’exécution à partir du status GitLab,
-            // même si le webhook n’est pas configuré (cas courant en local).
             PipelineStatus newStatus = PipelineStatus.fromGitLabStatus((String) summary.get("status"));
-            PipelineStatus oldStatus = execution.getStatus();
-            if (newStatus != null && oldStatus != newStatus) {
-                execution.setStatus(newStatus);
-            }
-
-            // Harmoniser les dates si GitLab les fournit.
             LocalDateTime createdAt = toLocalDateTime(summary.get("createdAt"));
             LocalDateTime finishedAt = toLocalDateTime(summary.get("finishedAt"));
-            if (execution.getStartedAt() == null && createdAt != null) {
-                execution.setStartedAt(createdAt);
-            }
-            if (newStatus != null && newStatus.isFinished()) {
-                if (execution.getFinishedAt() == null && finishedAt != null) {
-                    execution.setFinishedAt(finishedAt);
-                } else if (execution.getFinishedAt() == null) {
-                    execution.setFinishedAt(LocalDateTime.now());
-                }
 
-                // Pipeline CI : seule transition env = FAILED si encore PENDING/BUILDING
-                if (execution.getEnvironment() != null
-                        && (newStatus == PipelineStatus.FAILED || newStatus == PipelineStatus.CANCELED)) {
-                    String reason = buildPipelineFailureReason(summary);
-                    environmentLifecycleService.onPipelineFailed(execution.getEnvironment().getId(), reason);
-                }
+            for (PipelineExecution execution : executions) {
+                applySummaryToExecution(execution, stagesJson, newStatus, createdAt, finishedAt, summary);
             }
-
-            pipelineExecutionRepository.save(execution);
-            log.info("✅ Stages synchronisés en BDD pour le pipeline #{} ({} jobs)", pipelineId, stagesJson.get("totalJobs"));
+            pipelineExecutionRepository.saveAll(executions);
+            log.info("✅ Stages synchronisés en BDD pour le pipeline #{} ({} jobs, {} exécution(s))",
+                    pipelineId, stagesJson.get("totalJobs"), executions.size());
 
             if (newStatus != null && newStatus.isFinished()) {
-                qualityGateService.captureSnapshotAfterStagesSync(execution);
+                for (PipelineExecution execution : executions) {
+                    try {
+                        qualityGateService.captureSnapshotAfterStagesSync(execution);
+                    } catch (Exception e) {
+                        log.warn("Snapshot QG après sync #{} (exec {}): {}",
+                                pipelineId, execution.getId(), e.getMessage());
+                    }
+                }
             }
             return true;
         } catch (Exception e) {
             log.warn("⚠️ Impossible de synchroniser les stages pour le pipeline #{}: {}", pipelineId, e.getMessage());
             return false;
+        }
+    }
+
+    private void applySummaryToExecution(
+            PipelineExecution execution,
+            Map<String, Object> stagesJson,
+            PipelineStatus newStatus,
+            LocalDateTime createdAt,
+            LocalDateTime finishedAt,
+            Map<String, Object> summary
+    ) {
+        // Copie défensive : chaque ligne a sa propre map (évite aliasing Hibernate/jsonb)
+        execution.setStagesJson(new HashMap<>(stagesJson));
+
+        PipelineStatus oldStatus = execution.getStatus();
+        if (newStatus != null && oldStatus != newStatus) {
+            execution.setStatus(newStatus);
+        }
+
+        if (execution.getStartedAt() == null && createdAt != null) {
+            execution.setStartedAt(createdAt);
+        }
+        if (newStatus != null && newStatus.isFinished()) {
+            if (execution.getFinishedAt() == null && finishedAt != null) {
+                execution.setFinishedAt(finishedAt);
+            } else if (execution.getFinishedAt() == null) {
+                execution.setFinishedAt(LocalDateTime.now());
+            }
+
+            // Pipeline CI : seule transition env = FAILED si encore PENDING/BUILDING
+            if (execution.getEnvironment() != null
+                    && (newStatus == PipelineStatus.FAILED || newStatus == PipelineStatus.CANCELED)) {
+                String reason = buildPipelineFailureReason(summary);
+                environmentLifecycleService.onPipelineFailed(execution.getEnvironment().getId(), reason);
+            }
         }
     }
 
