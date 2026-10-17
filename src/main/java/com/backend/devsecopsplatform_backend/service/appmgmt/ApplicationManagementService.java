@@ -17,8 +17,10 @@ import com.backend.devsecopsplatform_backend.repository.AppDeploymentRepository;
 import com.backend.devsecopsplatform_backend.repository.AppServiceRepository;
 import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
 import com.backend.devsecopsplatform_backend.repository.ManagedApplicationRepository;
+import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
 import com.backend.devsecopsplatform_backend.repository.ServiceEnvVarRepository;
 import com.backend.devsecopsplatform_backend.repository.UserRepository;
+import com.backend.devsecopsplatform_backend.repository.appmgmt.ScanBatchRepository;
 import com.backend.devsecopsplatform_backend.service.GitLabService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -62,6 +64,8 @@ public class ApplicationManagementService {
     private final ServiceEnvVarRepository envVarRepository;
     private final AppDeploymentRepository deploymentRepository;
     private final EphemeralEnvironmentRepository environmentRepository;
+    private final PipelineExecutionRepository pipelineExecutionRepository;
+    private final ScanBatchRepository scanBatchRepository;
     private final UserRepository userRepository;
     private final AppConnectionUrlService connectionUrlService;
     private final AppDeploymentService deploymentService;
@@ -84,6 +88,8 @@ public class ApplicationManagementService {
             ServiceEnvVarRepository envVarRepository,
             AppDeploymentRepository deploymentRepository,
             EphemeralEnvironmentRepository environmentRepository,
+            PipelineExecutionRepository pipelineExecutionRepository,
+            ScanBatchRepository scanBatchRepository,
             UserRepository userRepository,
             AppConnectionUrlService connectionUrlService,
             AppDeploymentService deploymentService,
@@ -101,6 +107,8 @@ public class ApplicationManagementService {
         this.envVarRepository = envVarRepository;
         this.deploymentRepository = deploymentRepository;
         this.environmentRepository = environmentRepository;
+        this.pipelineExecutionRepository = pipelineExecutionRepository;
+        this.scanBatchRepository = scanBatchRepository;
         this.userRepository = userRepository;
         this.connectionUrlService = connectionUrlService;
         this.deploymentService = deploymentService;
@@ -167,6 +175,15 @@ public class ApplicationManagementService {
     @Transactional
     public void deleteApp(UUID id) {
         ManagedApplication app = loadOwnedApp(id);
+        // Dépendances hors du cascade JPA de ManagedApplication (services/databases/deployments
+        // seulement, cf. l'entité) : PipelineExecution et EphemeralEnvironment référencent les
+        // services via une FK NOT NULL, ScanBatch référence l'application directement -- sans ce
+        // nettoyage explicite, delete() échoue en violation de contrainte FK dès qu'un service a
+        // été déployé ou scanné au moins une fois. Ordre important : PipelineExecution avant
+        // EphemeralEnvironment (PipelineExecution.environment_id la référence aussi).
+        pipelineExecutionRepository.deleteByAppService_ManagedApplication_Id(id);
+        environmentRepository.deleteByService_ManagedApplication_Id(id);
+        scanBatchRepository.deleteByManagedApplication_Id(id);
         appRepository.delete(app); // cascade services / databases / deployments
     }
 

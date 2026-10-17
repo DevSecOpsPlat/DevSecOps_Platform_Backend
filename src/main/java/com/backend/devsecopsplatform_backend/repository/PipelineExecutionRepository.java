@@ -22,6 +22,11 @@ public interface PipelineExecutionRepository extends JpaRepository<PipelineExecu
 
     List<PipelineExecution> findByEnvironmentOrderByCreatedAtDesc(EphemeralEnvironment environment);
 
+    /** Suppression d'application : app_service_id est NOT NULL ici, non couvert par le cascade
+     * JPA de ManagedApplication (services/databases/deployments seulement) -- doit s'exécuter
+     * avant la suppression des EphemeralEnvironment référencées (environment_id, unique). */
+    void deleteByAppService_ManagedApplication_Id(UUID applicationId);
+
     /**
      * Cache du commit HEAD (obsolescence) jamais vérifié ou périmé -- pour le rafraîchissement en
      * arrière-plan ({@link com.backend.devsecopsplatform_backend.service.appmgmt.HeadCacheRefreshScheduler}).

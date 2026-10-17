@@ -18,6 +18,10 @@ public interface ScanBatchRepository extends JpaRepository<ScanBatch, UUID> {
 
     List<ScanBatch> findByManagedApplicationIdOrderByCreatedAtDesc(UUID managedApplicationId, Pageable pageable);
 
+    /** Suppression d'application : managed_application_id est NOT NULL ici, non couvert par le
+     * cascade JPA de ManagedApplication (services/databases/deployments seulement). */
+    void deleteByManagedApplication_Id(UUID applicationId);
+
     Optional<ScanBatch> findByIdAndManagedApplicationId(UUID id, UUID managedApplicationId);
 
     Optional<ScanBatch> findByGitlabPipelineId(Long gitlabPipelineId);
