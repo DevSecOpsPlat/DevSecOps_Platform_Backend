@@ -1,0 +1,74 @@
+# Outils qui restent en Docker sur le PC hôte : SonarQube (:9000) et DefectDojo (:8080).
+# Remplace l'ancien envirotest-routing (namespace default) : envirotest.cloud et api.envirotest.cloud
+# sont désormais servis par 40-ingress.yaml, et la cible n'est plus l'IP Wi-Fi du PC (qui change
+# avec le réseau) mais son IP VMnet8 __PC_IP__ (fixe, attribuée par VMware).
+apiVersion: v1
+kind: Service
+metadata:
+  name: sonarqube-ext
+  namespace: default
+spec:
+  ports:
+    - port: 9000
+      targetPort: 9000
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: sonarqube-ext
+  namespace: default
+subsets:
+  - addresses:
+      - ip: __PC_IP__
+    ports:
+      - port: 9000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: defectdojo-ext
+  namespace: default
+spec:
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: defectdojo-ext
+  namespace: default
+subsets:
+  - addresses:
+      - ip: __PC_IP__
+    ports:
+      - port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: envirotest-routing
+  namespace: default
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: sonar.envirotest.cloud
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: sonarqube-ext
+                port:
+                  number: 9000
+    - host: dojo.envirotest.cloud
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: defectdojo-ext
+                port:
+                  number: 8080
