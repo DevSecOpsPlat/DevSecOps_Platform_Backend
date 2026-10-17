@@ -25,7 +25,7 @@ import java.util.UUID;
 @RequestMapping("/api/managed-applications")
 @RequiredArgsConstructor
 @Slf4j
-@CrossOrigin(origins = {"http://localhost:4200", "http://envirotest.local", "http://envirotest.local:4200"})
+@CrossOrigin(origins = {"http://localhost:4200", "http://envirotest.local", "http://envirotest.local:4200", "https://envirotest.cloud"})
 public class ApplicationManagementController {
 
     private final ApplicationManagementService service;

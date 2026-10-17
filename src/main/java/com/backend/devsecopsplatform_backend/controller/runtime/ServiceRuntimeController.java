@@ -45,7 +45,7 @@ import java.util.UUID;
 @RestController
 @RequiredArgsConstructor
 @Slf4j
-@CrossOrigin(origins = {"http://localhost:4200", "http://envirotest.local", "http://envirotest.local:4200"})
+@CrossOrigin(origins = {"http://localhost:4200", "http://envirotest.local", "http://envirotest.local:4200", "https://envirotest.cloud"})
 public class ServiceRuntimeController {
 
     private final AppServiceRepository appServiceRepository;

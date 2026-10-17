@@ -26,7 +26,7 @@ import java.util.concurrent.CompletableFuture;
 @RequestMapping("/api/security-gate")
 @RequiredArgsConstructor
 @Slf4j
-@CrossOrigin(origins = {"http://localhost:4200", "http://envirotest.local", "http://envirotest.local:4200"})
+@CrossOrigin(origins = {"http://localhost:4200", "http://envirotest.local", "http://envirotest.local:4200", "https://envirotest.cloud"})
 public class SecurityGateCompatController {
 
     private final QualityGateService qualityGateService;
