@@ -36,6 +36,11 @@ public interface EphemeralEnvironmentRepository extends JpaRepository<EphemeralE
     List<EphemeralEnvironment> findByStatusIn(Collection<EnvironmentStatus> statuses);
     List<EphemeralEnvironment> findByService_Id(UUID serviceId);
 
+    /** Suppression d'application : app_service_id est NOT NULL ici, non couvert par le cascade
+     * JPA de ManagedApplication (services/databases/deployments seulement) -- sans ça, supprimer
+     * une app dont un service a déjà eu un déploiement échoue en violation de contrainte FK. */
+    void deleteByService_ManagedApplication_Id(UUID applicationId);
+
     Optional<EphemeralEnvironment> findFirstByNamespaceOrderByCreatedAtDesc(String namespace);
 
     List<EphemeralEnvironment> findByService_IdAndGitBranchOrderByCreatedAtDesc(

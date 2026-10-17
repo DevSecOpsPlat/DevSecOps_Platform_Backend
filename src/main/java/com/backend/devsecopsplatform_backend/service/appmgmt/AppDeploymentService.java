@@ -850,9 +850,15 @@ public class AppDeploymentService {
                 setDeployPhase(deployment, ingressOk ? "Terminé — Ingress appliqué" : "Terminé — Ingress indisponible (non bloquant)");
                 advanceDeployStep(deployment, "ingress");
             } else {
-                // Ingress désactivé ou bundle vide
-                persistIngressState(deployment, !ingressEnabled,
-                        ingressEnabled ? "Bundle Ingress vide" : null);
+                // Bundle Ingress vide : soit rien à exposer (déploiement worker-only -- cas
+                // normal, pas un échec), soit l'Ingress est globalement désactivé. Avant, un
+                // déploiement sans aucun FRONTEND/BACKEND exposé était marqué ingressApplied=false
+                // en permanence (pas d'Ingress généré par construction, cf. applicationIngress) --
+                // ça déclenchait côté front un faux "Ingress non appliqué" ET masquait tout le
+                // bandeau live (TTL + boutons Prolonger), ingressBroken() dépendant du même flag.
+                boolean nothingToExpose = !hasExternallyExposedService(shadow);
+                boolean applied = !ingressEnabled || nothingToExpose;
+                persistIngressState(deployment, applied, applied ? null : "Bundle Ingress vide");
                 setDeployPhase(deployment, "Terminé");
             }
 
@@ -1057,6 +1063,13 @@ public class AppDeploymentService {
         transactionTemplate.executeWithoutResult(s -> deploymentRepository.save(deployment));
     }
 
+    /** Même règle que AppK8sManifestService#applicationIngress (FRONTEND/BACKEND + port exposé) --
+     * si rien ne matche, un bundle Ingress vide est normal, pas un échec. */
+    private boolean hasExternallyExposedService(ManagedApplication app) {
+        return app.getServices().stream()
+                .anyMatch(s -> AppServiceRules.isExternallyExposed(s.getRole()) && s.getExposedPort() != null);
+    }
+
     private boolean isIngressApplied(AppDeployment deployment) {
         if (!ingressEnabled) {
             return true;
@@ -1088,7 +1101,9 @@ public class AppDeploymentService {
                     loadResolvedImages(deployment), shadow);
             String yaml = manifestService.generateIngressBundle(shadow, namespace, opts);
             if (yaml == null || yaml.isBlank()) {
-                persistIngressState(deployment, false, "Bundle Ingress vide au retry");
+                boolean nothingToExpose = !hasExternallyExposedService(shadow);
+                persistIngressState(deployment, nothingToExpose,
+                        nothingToExpose ? null : "Bundle Ingress vide au retry");
                 return;
             }
             k8sManifestApplyService.applyManifests(yaml);
