@@ -1,0 +1,31 @@
+# Routage public de la plateforme. Le tunnel Cloudflare (Deployment cloudflared, namespace default)
+# envoie déjà envirotest.cloud, api.envirotest.cloud et *.envirotest.cloud vers Traefik : rien à
+# changer côté Cloudflare / Hostinger. Pas de TLS ici : Cloudflare termine le HTTPS.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: envirotest-platform
+  namespace: envirotest
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: envirotest.cloud
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
+    - host: api.envirotest.cloud
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 8089

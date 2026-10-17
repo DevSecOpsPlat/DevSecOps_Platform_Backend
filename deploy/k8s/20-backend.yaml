@@ -1,0 +1,137 @@
+# Backend Spring Boot. Toutes les clés du .env (tokens, API IA, SMTP...) arrivent par le Secret
+# envirotest-backend-env (créé par deploy.sh depuis DevSecOps_Platform_Frontend/.env, jamais
+# committé). Les valeurs "env:" ci-dessous sont propres au cluster et l'emportent sur le .env :
+# le code garde ses valeurs par défaut localhost (dev local), le cluster utilise le domaine.
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: envirotest
+spec:
+  selector:
+    app: backend
+  ports:
+    - port: 8089
+      targetPort: 8089
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: backend-knowledge
+  namespace: envirotest
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 256Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: envirotest
+spec:
+  replicas: 1
+  # Recreate : jamais deux backends en même temps — les tâches planifiées (TTL, nettoyage des
+  # namespaces, réconciliation) tourneraient en double sur le cluster.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      imagePullSecrets:
+        - name: gitlab-registry
+      # SonarQube, DefectDojo et Ollama tournent en Docker sur le PC hôte, joignable depuis les VMs
+      # via l'IP VMnet8 (fixe, indépendante du Wi-Fi). Les URLs du .env (host.docker.internal,
+      # ollama) restent valables telles quelles : elles sont aussi injectées dans les pipelines,
+      # dont le runner tourne sur ce même PC où host.docker.internal existe déjà.
+      hostAliases:
+        - ip: "__PC_IP__"
+          hostnames: ["host.docker.internal", "ollama"]
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values: ["k3s-worker"]
+      containers:
+        - name: backend
+          image: __BACKEND_IMAGE__
+          ports:
+            - containerPort: 8089
+          envFrom:
+            - secretRef:
+                name: envirotest-backend-env
+          env:
+            - name: SPRING_DATASOURCE_URL
+              value: jdbc:postgresql://postgres:5432/EnviroTest
+            - name: SPRING_DATASOURCE_USERNAME
+              value: postgres
+            - name: SPRING_DATASOURCE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: envirotest-db
+                  key: password
+            - name: SERVER_PORT
+              value: "8089"
+            - name: APP_SECURITY_TRUST_LOCALHOST
+              value: "false"
+            # Liens des e-mails d'activation
+            - name: APP_FRONTEND_URL
+              value: https://envirotest.cloud
+            - name: APP_CORS_ALLOWED_ORIGINS
+              value: http://localhost:4200,http://envirotest.local:4200,http://envirotest.local,https://envirotest.cloud,http://envirotest.cloud
+            # URL de rappel envoyée aux pipelines GitLab (POST /api/deploy, statut...)
+            - name: BACKEND_PUBLIC_URL
+              value: https://api.envirotest.cloud/projet
+            # Traefik vit dans le namespace "traefik" sur ce cluster (cf. NOTES-INCIDENTS-INFRA n°3)
+            - name: DEPLOYMENT_NETWORK_POLICY_INGRESS_NAMESPACE
+              value: traefik
+            - name: AI_OPENROUTER_HTTP_REFERER
+              value: https://envirotest.cloud
+            - name: AI_KNOWLEDGE_DIR
+              value: /data/knowledge
+            # Logs allégés (2 vCPU par nœud) — repasser à true / DEBUG pour diagnostiquer
+            - name: SPRING_JPA_SHOW_SQL
+              value: "false"
+            - name: LOGGING_LEVEL_ORG_SPRINGFRAMEWORK_SECURITY
+              value: INFO
+            # Tas Java borné par la limite mémoire du conteneur (sinon ~1/4 de la RAM du nœud)
+            - name: JAVA_TOOL_OPTIONS
+              value: -XX:MaxRAMPercentage=60
+          startupProbe:
+            tcpSocket:
+              port: 8089
+            periodSeconds: 5
+            failureThreshold: 72
+          readinessProbe:
+            tcpSocket:
+              port: 8089
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8089
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 250m
+              memory: 1Gi
+            limits:
+              memory: 1536Mi
+          volumeMounts:
+            - name: knowledge
+              mountPath: /data/knowledge
+      volumes:
+        - name: knowledge
+          persistentVolumeClaim:
+            claimName: backend-knowledge

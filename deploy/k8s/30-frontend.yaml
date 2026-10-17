@@ -1,0 +1,62 @@
+# Frontend Angular (image buildée avec ANGULAR_CONFIG=docker : BASE_URL relative /projet/).
+# Son nginx proxifie /projet/ vers http://backend:8089 — le Service "backend" de ce namespace.
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: envirotest
+spec:
+  selector:
+    app: frontend
+  ports:
+    - port: 80
+      targetPort: 80
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: envirotest
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      imagePullSecrets:
+        - name: gitlab-registry
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values: ["k3s-worker"]
+      containers:
+        - name: frontend
+          image: __FRONTEND_IMAGE__
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            periodSeconds: 30
+            failureThreshold: 4
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi

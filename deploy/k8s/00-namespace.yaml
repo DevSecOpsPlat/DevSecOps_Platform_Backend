@@ -1,0 +1,8 @@
+# Namespace de la plateforme EnviroTest elle-même (frontend, backend, base).
+# Les environnements déployés PAR la plateforme restent dans leurs propres namespaces env-<slug>-<id>.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: envirotest
+  labels:
+    app.kubernetes.io/part-of: envirotest-platform
