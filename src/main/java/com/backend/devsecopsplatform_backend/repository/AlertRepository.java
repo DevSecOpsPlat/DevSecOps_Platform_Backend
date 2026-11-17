@@ -10,6 +10,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.time.LocalDateTime;
+import java.util.Collection;
 import java.util.List;
 import java.util.UUID;
 
@@ -28,6 +29,8 @@ public interface AlertRepository extends JpaRepository<Alert, UUID>, JpaSpecific
     List<Alert> findByDeletedFalseAndStatusAndTypeOrderByCreatedAtDesc(AlertStatus status, AlertType type);
 
     long countByDeletedFalseAndStatus(AlertStatus status);
+
+    long countByDeletedFalseAndStatusAndTypeNotIn(AlertStatus status, Collection<AlertType> types);
 
     long countByDeletedFalseAndCreatedAtAfter(LocalDateTime since);
 

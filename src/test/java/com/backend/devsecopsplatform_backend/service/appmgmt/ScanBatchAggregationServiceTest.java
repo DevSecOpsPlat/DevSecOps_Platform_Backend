@@ -23,7 +23,8 @@ class ScanBatchAggregationServiceTest {
 
     @BeforeEach
     void setUp() {
-        aggregation = new ScanBatchAggregationService(new SecurityScoringService());
+        // Sans dépôt de snapshots : agrégation sur le qualityGateJson CI seul.
+        aggregation = new ScanBatchAggregationService(new SecurityScoringService(), null);
     }
 
     @Test

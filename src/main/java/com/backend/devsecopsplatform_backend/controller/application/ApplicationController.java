@@ -4,6 +4,7 @@ package com.backend.devsecopsplatform_backend.controller.application;
 import com.backend.devsecopsplatform_backend.service.application.ApplicationService;
 import com.backend.devsecopsplatform_backend.service.environment.EnvironmentLifecycleService;
 import com.backend.devsecopsplatform_backend.service.environment.EnvironmentService;
+import com.backend.devsecopsplatform_backend.service.environment.ServiceEnvironmentResolver;
 import com.backend.devsecopsplatform_backend.service.PipelineStageSyncService;
 import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
 import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
@@ -33,6 +34,7 @@ public class ApplicationController {
     private final PipelineExecutionRepository pipelineExecutionRepository;
     private final PipelineStageSyncService pipelineStageSyncService;
     private final EnvironmentService environmentService;
+    private final ServiceEnvironmentResolver serviceEnvironmentResolver;
 
     /**
      * POST /api/applications
@@ -146,12 +148,14 @@ public class ApplicationController {
             @RequestParam(name = "size", defaultValue = "50") int size
     ) {
         try {
-            List<EphemeralEnvironment> envs = environmentRepository.findByService_Id(id);
+            // Environnements du service + ceux des déploiements de son application gérée
+            // (un déploiement d'app n'a qu'un environnement, rattaché au service représentant).
+            List<EphemeralEnvironment> envs = serviceEnvironmentResolver.environmentsForService(id, null);
 
             List<DeploymentHistoryItem> history = envs.stream()
                     .filter(env -> branch == null || branch.isBlank() || branch.equals(env.getGitBranch()))
                     .flatMap(env -> pipelineExecutionRepository.findByEnvironmentOrderByCreatedAtDesc(env).stream()
-                            .map(exec -> buildDeploymentHistoryItem(env, exec))
+                            .map(exec -> buildDeploymentHistoryItem(id, env, exec))
                     )
                     .sorted((a, b) -> {
                         if (a.getCreatedAt() == null && b.getCreatedAt() == null) return 0;
@@ -175,11 +179,13 @@ public class ApplicationController {
         }
     }
 
-    private DeploymentHistoryItem buildDeploymentHistoryItem(EphemeralEnvironment env, PipelineExecution exec) {
+    private DeploymentHistoryItem buildDeploymentHistoryItem(UUID serviceId, EphemeralEnvironment env, PipelineExecution exec) {
         List<Map<String, Object>> jobs = pipelineStageSyncService.getJobsFromStagesJson(exec);
         String shortSha = shortShaFromStagesJson(exec);
 
         DeploymentHistoryItem item = new DeploymentHistoryItem();
+        item.setApplicationDeployment(ServiceEnvironmentResolver.isSharedFromApplication(env, serviceId));
+        item.setServiceName(env.getService() != null ? env.getService().getName() : null);
         item.setEnvironmentId(env.getId());
         item.setEnvironmentName(env.getEnvironmentName());
         item.setGitBranch(env.getGitBranch());

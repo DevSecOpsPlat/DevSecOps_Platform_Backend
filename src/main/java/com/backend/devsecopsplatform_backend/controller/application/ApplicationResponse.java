@@ -15,6 +15,8 @@ public class ApplicationResponse {
     private String description;
     private String gitRepositoryUrl;
     private String dockerfilePath;
+    /** Branche de travail du service (scan/déploiement par défaut). */
+    private String gitBranch;
     private LocalDateTime createdAt;
     private String createdByUsername;
 

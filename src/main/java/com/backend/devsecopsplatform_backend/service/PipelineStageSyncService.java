@@ -21,6 +21,7 @@ import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 /**
  * Synchronise les stages/jobs des pipelines GitLab vers la base de données (stages_json).
@@ -126,6 +127,20 @@ public class PipelineStageSyncService {
     }
 
     /**
+     * Empreinte stable de la liste des jobs (id + statut, triés) : change dès qu'un job est relancé
+     * ou change d'état, reste identique quand un pipeline terminé est simplement relu.
+     */
+    private String jobsSignature(Map<String, Object> stages) {
+        if (stages == null) {
+            return "";
+        }
+        return parseJobsList(stages.get("jobs")).stream()
+                .map(job -> String.valueOf(job.get("id")) + ":" + String.valueOf(job.get("status")))
+                .sorted()
+                .collect(java.util.stream.Collectors.joining("|"));
+    }
+
+    /**
      * Extrait jobStatusCount depuis stagesJson pour le fallback.
      */
     @SuppressWarnings("unchecked")
@@ -168,6 +183,17 @@ public class PipelineStageSyncService {
             LocalDateTime createdAt = toLocalDateTime(summary.get("createdAt"));
             LocalDateTime finishedAt = toLocalDateTime(summary.get("finishedAt"));
 
+            // État AVANT la synchro, pour ne recalculer le snapshot QG que si quelque chose a changé.
+            // Recalculer à chaque affichage (pipeline déjà terminé, jobs inchangés) relançait DefectDojo
+            // et SonarQube en boucle, saturait le pool de connexions BDD et provoquait des 524 Cloudflare.
+            String newJobsSignature = jobsSignature(stagesJson);
+            Map<UUID, Boolean> recaptureNeeded = new HashMap<>();
+            for (PipelineExecution execution : executions) {
+                boolean wasFinished = execution.getStatus() != null && execution.getStatus().isFinished();
+                boolean jobsChanged = !newJobsSignature.equals(jobsSignature(execution.getStagesJson()));
+                recaptureNeeded.put(execution.getId(), !wasFinished || jobsChanged);
+            }
+
             for (PipelineExecution execution : executions) {
                 applySummaryToExecution(execution, stagesJson, newStatus, createdAt, finishedAt, summary);
             }
@@ -177,6 +203,9 @@ public class PipelineStageSyncService {
 
             if (newStatus != null && newStatus.isFinished()) {
                 for (PipelineExecution execution : executions) {
+                    if (!Boolean.TRUE.equals(recaptureNeeded.get(execution.getId()))) {
+                        continue;
+                    }
                     try {
                         qualityGateService.captureSnapshotAfterStagesSync(execution);
                     } catch (Exception e) {

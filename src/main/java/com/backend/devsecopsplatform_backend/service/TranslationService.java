@@ -27,7 +27,16 @@ public class TranslationService {
     private static final Pattern HTML_BLOCK_SPLIT =
             Pattern.compile("(?<=</(?:p|li|h[1-6]|div|td|tr|ul|ol|pre|code)>)", Pattern.CASE_INSENSITIVE);
 
-    private final RestTemplate restTemplate = new RestTemplate();
+    private final RestTemplate restTemplate = buildRestTemplate();
+
+    /** Délais courts : une traduction lente ne doit jamais bloquer l'affichage d'une page. */
+    private static RestTemplate buildRestTemplate() {
+        org.springframework.http.client.SimpleClientHttpRequestFactory factory =
+                new org.springframework.http.client.SimpleClientHttpRequestFactory();
+        factory.setConnectTimeout(3000);
+        factory.setReadTimeout(5000);
+        return new RestTemplate(factory);
+    }
     private final Map<String, String> cache = new ConcurrentHashMap<>();
 
     @Value("${translation.enabled:true}")

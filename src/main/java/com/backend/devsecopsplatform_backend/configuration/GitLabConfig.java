@@ -21,8 +21,11 @@ public class GitLabConfig {
 
     @Bean
     public GitLabApi gitLabApi() {
-        // Initialise la connexion à l'API GitLab
-        return new GitLabApi(gitlabUrl, gitlabToken);
+        // Initialise la connexion à l'API GitLab, avec délais bornés (connexion 5 s, lecture 60 s) :
+        // sans eux, un GitLab lent bloquait la requête HTTP et sa connexion PostgreSQL indéfiniment.
+        GitLabApi api = new GitLabApi(gitlabUrl, gitlabToken);
+        api.setRequestTimeout(5_000, 60_000);
+        return api;
     }
 
     /**

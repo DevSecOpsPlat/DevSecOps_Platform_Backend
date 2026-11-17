@@ -37,6 +37,7 @@ public class EnvironmentService {
     private final PipelineStageSyncService pipelineStageSyncService;
     private final CloudResourceRepository cloudResourceRepository;
     private final EnvironmentLifecycleService environmentLifecycleService;
+    private final ServiceEnvironmentResolver serviceEnvironmentResolver;
 
     @Value("${deployment.preview.nip.enabled:false}")
     private boolean nipPreviewEnabled;
@@ -289,11 +290,15 @@ public class EnvironmentService {
         return result;
     }
 
-    /** Environnements de l’utilisateur, filtrés par application (pour le sélecteur d’env du dashboard). */
+    /**
+     * Environnements de l’utilisateur, filtrés par application (pour le sélecteur d’env du dashboard).
+     * Inclut les environnements des déploiements de l'application gérée auxquels le service a participé.
+     */
     public List<EnvironmentSummaryResponse> getMyEnvironmentsForApplication(UUID appId) {
         User user = getCurrentUser();
-        List<EphemeralEnvironment> list = environmentRepository
-                .findByRequestedByAndServiceIdWithServiceAndPipelineOrderByCreatedAtDesc(user, appId);
+        List<EphemeralEnvironment> list = serviceEnvironmentResolver.environmentsForService(appId, user).stream()
+                .filter(e -> e.getEnvironmentName() == null || !e.getEnvironmentName().startsWith("scan-"))
+                .toList();
         List<EnvironmentSummaryResponse> result = new ArrayList<>();
         for (EphemeralEnvironment e : list) {
             PipelineExecution pipeline = e.getPipelineExecution();

@@ -126,6 +126,77 @@ public class ScanBatchCompletionService {
     }
 
     /**
+     * Lot COMPLETE figé par une ancienne version de l'agrégation (sans score informatif ni
+     * alignement sur les snapshots Quality Gate des services) : re-calcul unique.
+     *
+     * @return true si le lot a été recalculé
+     */
+    @Transactional
+    public boolean refreezeIfLegacy(UUID batchId) {
+        ScanBatch batch = scanBatchRepository.findById(batchId).orElse(null);
+        if (batch == null || batch.getStatus() != ScanBatchStatus.COMPLETE) {
+            return false;
+        }
+        Map<String, Object> payload = batch.getVerdictPayloadJson() != null
+                ? new LinkedHashMap<>(batch.getVerdictPayloadJson())
+                : new LinkedHashMap<>();
+        Object version = payload.get("aggregationVersion");
+        if (version instanceof Number n && n.intValue() >= ScanBatchAggregationService.AGGREGATION_VERSION) {
+            return false;
+        }
+        List<PipelineExecution> withService =
+                pipelineExecutionRepository.findByScanBatchIdWithService(batch.getId());
+        if (withService.isEmpty()) {
+            return false;
+        }
+        freezeOfficialVerdict(batch, withService, payload);
+        batch.setVerdictPayloadJson(payload);
+        scanBatchRepository.save(batch);
+        log.info("Lot {} recalculé (agrégation v{}) verdict={} score={}",
+                batchId, ScanBatchAggregationService.AGGREGATION_VERSION, batch.getVerdict(), batch.getSecurityScore());
+        return true;
+    }
+
+    /**
+     * Lot {@link ScanBatchStatus#PARTIAL} dont toutes les exécutions attendues sont finalement
+     * terminées (ingest arrivé après la fin du pipeline GitLab, ou rafraîchissement perdu pendant
+     * une saturation du backend) : promotion en COMPLETE avec verdict et score figés.
+     * Une exécution encore « en cours » mais qui possède déjà son quality-gate est considérée
+     * comme réussie : le security-gate est le dernier job du scan.
+     *
+     * @return true si le lot est passé en COMPLETE
+     */
+    @Transactional
+    public boolean completePartialIfAllFinished(UUID batchId) {
+        ScanBatch batch = scanBatchRepository.findById(batchId).orElse(null);
+        if (batch == null || batch.getStatus() != ScanBatchStatus.PARTIAL) {
+            return false;
+        }
+        List<PipelineExecution> executions =
+                pipelineExecutionRepository.findByScanBatchIdOrderByCreatedAtAsc(batch.getId());
+        for (PipelineExecution pe : executions) {
+            if (!pe.isFinished() && pe.getQualityGateJson() != null && !pe.getQualityGateJson().isEmpty()) {
+                pe.markAsSuccess();
+                pipelineExecutionRepository.save(pe);
+            }
+        }
+        int expected = batch.getExpectedServiceCount();
+        long finished = executions.stream().filter(PipelineExecution::isFinished).count();
+        if (expected <= 0 || finished < expected) {
+            return false;
+        }
+        refreshBatchStatus(batch);
+        boolean complete = scanBatchRepository.findById(batchId)
+                .map(b -> b.getStatus() == ScanBatchStatus.COMPLETE)
+                .orElse(false);
+        if (complete) {
+            log.info("Lot {} PARTIAL → COMPLETE (toutes les exécutions terminées : {}/{})",
+                    batchId, finished, expected);
+        }
+        return complete;
+    }
+
+    /**
      * Annulation utilisateur : ferme le lot associé (si scan managé) pour permettre un nouveau scan.
      */
     @Transactional

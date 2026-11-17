@@ -62,7 +62,7 @@ public class AppDeploymentGitLabService {
             body.put("variables", variablesList);
 
             String url = gitlabApiUrl + "/projects/" + deployProjectId + "/pipeline";
-            RestTemplate rest = new RestTemplate();
+            RestTemplate rest = com.backend.devsecopsplatform_backend.configuration.HttpTimeouts.restTemplate();
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.APPLICATION_JSON);
             headers.set("PRIVATE-TOKEN", gitlabToken);

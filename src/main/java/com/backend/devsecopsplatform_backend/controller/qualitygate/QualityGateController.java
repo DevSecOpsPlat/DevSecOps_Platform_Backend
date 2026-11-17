@@ -2,6 +2,7 @@ package com.backend.devsecopsplatform_backend.controller.qualitygate;
 
 import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
 import com.backend.devsecopsplatform_backend.service.PipelineStageSyncService;
+import com.backend.devsecopsplatform_backend.service.appmgmt.ScanBatchCompletionService;
 import com.backend.devsecopsplatform_backend.service.finding.FindingIngestionService;
 import com.backend.devsecopsplatform_backend.service.qualitygate.QualityGateService;
 import com.backend.devsecopsplatform_backend.service.qualitygate.SnapshotCaptureRejectedException;
@@ -30,9 +31,22 @@ public class QualityGateController {
     private final FindingIngestionService findingIngestionService;
     private final PipelineExecutionRepository pipelineExecutionRepository;
     private final PipelineStageSyncService pipelineStageSyncService;
+    private final ScanBatchCompletionService scanBatchCompletionService;
 
     @Value("${pipeline.secret}")
     private String pipelineSecret;
+
+    private void refreshApplicationVerdict(UUID applicationId, Long pipelineId) {
+        if (pipelineId == null || pipelineId <= 0) {
+            return;
+        }
+        try {
+            pipelineExecutionRepository.findByGitlabPipelineIdAndApplicationId(pipelineId, applicationId)
+                    .ifPresent(pe -> scanBatchCompletionService.refreshAfterDefectDojoSnapshot(pe.getId()));
+        } catch (Exception e) {
+            log.warn("Verdict application non rafraîchi après recapture (#{}): {}", pipelineId, e.getMessage());
+        }
+    }
 
     /** Ingestion du verdict CI (job security-validation). */
     @PostMapping("/ingest")
@@ -51,10 +65,20 @@ public class QualityGateController {
             @RequestParam(required = false, defaultValue = "false") boolean refresh
     ) {
         try {
-            if (environmentId != null) {
+            if (environmentId != null && refresh) {
                 syncStagesForEnvironment(applicationId, environmentId);
-            } else if (pipelineId != null && pipelineId > 0) {
+            } else if (pipelineId != null && pipelineId > 0 && refresh) {
+                // Seul « Actualiser » attend la synchro GitLab : l'affichage normal lit la BDD,
+                // la synchro des pipelines ouverts étant faite par PipelineStatusSyncScheduler.
                 syncStagesForPipeline(pipelineId);
+            }
+            if (refresh && snapshotId == null && environmentId == null
+                    && qualityGateService.recaptureSnapshotForUser(applicationId, branch, pipelineId)) {
+                // Recalculé ET enregistré : la page affichera désormais ce résultat sans actualiser.
+                // Le verdict de l'application (lot de scan) suit le snapshot du service.
+                refreshApplicationVerdict(applicationId, pipelineId);
+                return ResponseEntity.ok(qualityGateService.getForApplication(
+                        applicationId, branch, null, pipelineId, false, null));
             }
             return ResponseEntity.ok(qualityGateService.getForApplication(
                     applicationId, branch, environmentId, pipelineId, refresh, snapshotId));

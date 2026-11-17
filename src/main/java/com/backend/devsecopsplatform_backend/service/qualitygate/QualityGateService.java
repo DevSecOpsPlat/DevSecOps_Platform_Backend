@@ -762,6 +762,32 @@ public class QualityGateService {
         return annotateLiveRefreshResult(live, execution);
     }
 
+    /**
+     * « Actualiser » : recalcule le résultat en direct (DefectDojo + SonarQube) ET l'enregistre
+     * comme snapshot de l'exécution, pour que l'affichage suivant montre le même résultat
+     * sans devoir actualiser à nouveau. Retourne false si l'exécution ne peut pas encore être
+     * figée (pipeline en cours) : l'appelant se rabat alors sur le calcul en direct sans écriture.
+     */
+    @Transactional
+    public boolean recaptureSnapshotForUser(UUID applicationId, String branch, Long pipelineId) {
+        User user = currentUser();
+        applicationRepository.findByIdAndCreatedBy(applicationId, user)
+                .orElseThrow(() -> new IllegalArgumentException("Application introuvable ou accès refusé"));
+        PipelineExecution execution;
+        if (pipelineId != null && pipelineId > 0) {
+            execution = pipelineExecutionRepository
+                    .findByGitlabPipelineIdAndApplicationId(pipelineId, applicationId)
+                    .orElse(null);
+        } else {
+            execution = findLatestExecution(applicationId, normalizeBranch(branch));
+        }
+        if (execution == null || !canPersistSnapshot(execution)) {
+            return false;
+        }
+        captureSnapshotAfterPipeline(execution, SNAPSHOT_SOURCE_MANUAL, true);
+        return true;
+    }
+
     /** Indique si un snapshot peut être figé en BDD pour cette exécution. */
     public boolean canPersistSnapshot(PipelineExecution execution) {
         if (execution == null) {
@@ -2020,10 +2046,9 @@ public class QualityGateService {
             }
         }
         try {
-            DefectDojoDashboard2Response dd = defectDojoService.getDashboard2(applicationId, null);
-            if (dd.getBranches() != null) {
-                merged.addAll(dd.getBranches());
-            }
+            // Liste légère (produit + engagements) : calculer tout le tableau de bord global
+            // DefectDojo pour n'en garder que les noms de branches dépassait le délai Cloudflare.
+            merged.addAll(defectDojoService.listBranches(applicationId));
         } catch (Exception ignored) {
         }
         environmentRepository.findByService_Id(applicationId).stream()
@@ -2430,7 +2455,12 @@ public class QualityGateService {
         if (dto == null) {
             return;
         }
-        tryEnrichFromLiveDefectDojo(dto, app, branch, environmentId, execution);
+        // Le snapshot stocké est servi tel quel : il a été calculé d'un seul tenant (DefectDojo +
+        // SonarQube) au moment de la capture. Le retoucher ici avec une seconde requête DefectDojo,
+        // de portée différente, produisait des pages incohérentes (verdict « 13 critiques » mais
+        // garde-fou « Critical = 0 ») et des temps de réponse supérieurs au délai de Cloudflare (524).
+        // La fraîcheur est assurée par la recapture en fin de pipeline et par « Actualiser »,
+        // qui recalcule ET enregistre le snapshot (voir recaptureSnapshotForUser).
         if (!Boolean.TRUE.equals(dto.getDefectDojoAvailable())) {
             applyDefectDojoSnapshotFallback(dto, execution);
         }

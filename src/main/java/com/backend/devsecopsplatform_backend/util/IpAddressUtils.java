@@ -18,10 +18,14 @@ public final class IpAddressUtils {
     }
 
     private static String extractRaw(HttpServletRequest request) {
+        // CF-Connecting-IP d'abord : en production le trafic passe par Cloudflare → tunnel → Traefik
+        // → nginx, et Traefik remplace X-Forwarded-For par l'IP du pod cloudflared. Sans ce header,
+        // tous les clients apparaissaient sous la même IP interne (10.42.x.x) — détection de force
+        // brute, rate limit et blocage s'appliquaient alors à tout le monde à la fois.
         String forwarded = firstNonBlank(
+                request.getHeader("CF-Connecting-IP"),
                 request.getHeader("X-Forwarded-For"),
-                request.getHeader("X-Real-IP"),
-                request.getHeader("CF-Connecting-IP")
+                request.getHeader("X-Real-IP")
         );
         if (forwarded != null && !forwarded.isBlank()) {
             return forwarded.split(",")[0].trim();

@@ -40,5 +40,10 @@ public class DeploymentHistoryItem {
 
     private Integer ttlHours;
     private LocalDateTime expiresAt;
+
+    /** Vrai si l'environnement vient d'un déploiement de l'application entière (rattaché à un autre service). */
+    private boolean applicationDeployment;
+    /** Service auquel l'environnement est rattaché (représentant du déploiement). */
+    private String serviceName;
 }
 

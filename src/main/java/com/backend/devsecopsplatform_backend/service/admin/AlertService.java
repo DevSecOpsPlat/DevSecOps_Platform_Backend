@@ -34,6 +34,8 @@ import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.EnumSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -52,6 +54,15 @@ public class AlertService {
     private static final DateTimeFormatter DISPLAY_DT = DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm");
     private static final int TOP_IP_LIMIT = 5;
     private static final int KPI_DETAIL_LIMIT = 50;
+
+    /**
+     * Événements d'exécution des applications déployées (CrashLoop, OOM, sondes, avertissements
+     * Kubernetes…) : ils ont leur place dans le monitoring de chaque application, pas dans le centre
+     * de sécurité, où ils noyaient les vraies menaces (plus de 85 % du volume).
+     */
+    private static final Set<AlertType> RUNTIME_TYPES = Arrays.stream(AlertType.values())
+            .filter(t -> t.name().startsWith("DEPLOYMENT_"))
+            .collect(Collectors.toCollection(() -> EnumSet.noneOf(AlertType.class)));
 
     private final AlertRepository alertRepository;
     private final IpBlocklistService blocklistService;
@@ -103,7 +114,7 @@ public class AlertService {
 
     @Transactional(readOnly = true)
     public long countUnread() {
-        return alertRepository.countByDeletedFalseAndStatus(AlertStatus.NON_LUE);
+        return alertRepository.countByDeletedFalseAndStatusAndTypeNotIn(AlertStatus.NON_LUE, RUNTIME_TYPES);
     }
 
     @Transactional(readOnly = true)
@@ -122,7 +133,9 @@ public class AlertService {
 
     @Transactional(readOnly = true)
     public AdminSecurityDashboardResponse getSecurityDashboard() {
-        List<Alert> allAlerts = alertRepository.findByDeletedFalseOrderByCreatedAtDesc();
+        List<Alert> allAlerts = alertRepository.findByDeletedFalseOrderByCreatedAtDesc().stream()
+                .filter(a -> !RUNTIME_TYPES.contains(a.getType()))
+                .toList();
 
         List<BlockedIpView> blockedViews = blocklistService.listBlockedDetailed();
         long activeBlocked = blocklistService.countCurrentlyBlocked();
@@ -331,6 +344,8 @@ public class AlertService {
             }
             if (type != null) {
                 predicates.add(cb.equal(root.get("type"), type));
+            } else {
+                predicates.add(cb.not(root.get("type").in(RUNTIME_TYPES)));
             }
             if (StringUtils.hasText(ip)) {
                 predicates.add(cb.like(cb.lower(root.get("ipAddress")), "%" + ip.trim().toLowerCase(Locale.ROOT) + "%"));
