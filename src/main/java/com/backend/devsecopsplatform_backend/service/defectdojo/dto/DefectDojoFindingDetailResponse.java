@@ -3,6 +3,7 @@ package com.backend.devsecopsplatform_backend.service.defectdojo.dto;
 import lombok.Builder;
 import lombok.Data;
 
+import java.util.Map;
 import java.util.UUID;
 
 @Data
@@ -11,7 +12,10 @@ public class DefectDojoFindingDetailResponse {
 
     private int id;
     private String title;
+    /** Texte lisible du scanner (métadonnées techniques extraites dans {@link #scannerFields}). */
     private String description;
+    /** Métadonnées techniques du scanner (libellé français → valeur brute) : PURL, source, méthode… */
+    private Map<String, String> scannerFields;
     private String severity;
     private String status;
     private boolean active;

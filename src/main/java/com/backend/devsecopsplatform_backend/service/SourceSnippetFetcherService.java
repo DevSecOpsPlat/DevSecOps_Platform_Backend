@@ -272,7 +272,7 @@ public class SourceSnippetFetcherService {
         String url = "https://api.github.com/repos/" + owner + "/" + repo + "/contents/" + encodedPath
                 + "?ref=" + java.net.URLEncoder.encode(ref, StandardCharsets.UTF_8);
 
-        RestTemplate rest = new RestTemplate();
+        RestTemplate rest = com.backend.devsecopsplatform_backend.configuration.HttpTimeouts.restTemplate(5_000, 15_000);
         HttpHeaders headers = new HttpHeaders();
         headers.setAccept(List.of(MediaType.parseMediaType("application/vnd.github+json")));
         if (token != null && !token.isBlank()) {

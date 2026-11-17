@@ -22,6 +22,9 @@ public interface PipelineExecutionRepository extends JpaRepository<PipelineExecu
 
     List<PipelineExecution> findByEnvironmentOrderByCreatedAtDesc(EphemeralEnvironment environment);
 
+    /** Exécutions d'un service parmi un ensemble de pipelines GitLab (participation aux déploiements d'application). */
+    List<PipelineExecution> findByAppService_IdAndGitlabPipelineIdIn(UUID serviceId, Collection<Long> gitlabPipelineIds);
+
     /** Suppression d'application : app_service_id est NOT NULL ici, non couvert par le cascade
      * JPA de ManagedApplication (services/databases/deployments seulement) -- doit s'exécuter
      * avant la suppression des EphemeralEnvironment référencées (environment_id, unique). */

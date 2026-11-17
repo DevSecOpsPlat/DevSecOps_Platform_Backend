@@ -1,0 +1,27 @@
+# Nettoyeur automatique des conteneurs de job du GitLab Runner.
+#
+# Toutes les 5 minutes, supprime les conteneurs ARRÊTÉS portant le label que
+# GitLab Runner met sur ses conteneurs (com.gitlab.gitlab-runner.managed=true).
+# `docker container prune` n'enlève que des conteneurs déjà arrêtés : un job en
+# cours n'est jamais touché, ni les outils (SonarQube, DefectDojo, Ollama), ni
+# le runner lui-même.
+#
+# Mise en route :   docker compose -f deploy/runner-cleanup/docker-compose.yml up -d
+# Arrêt :           docker compose -f deploy/runner-cleanup/docker-compose.yml down
+# Journal :         docker logs -f runner-cleanup
+
+services:
+  runner-cleanup:
+    image: docker:29.5.3
+    container_name: runner-cleanup
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        echo "runner-cleanup démarré — purge toutes les 300 s";
+        while true; do
+          docker container prune -f --filter "label=com.gitlab.gitlab-runner.managed=true";
+          sleep 300;
+        done

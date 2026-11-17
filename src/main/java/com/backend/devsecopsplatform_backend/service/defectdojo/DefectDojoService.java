@@ -75,6 +75,7 @@ public class DefectDojoService {
     private final UserRepository userRepository;
     private final SourceSnippetFetcherService sourceSnippetFetcherService;
     private final DefectDojoHttpClientFactory httpClientFactory;
+    private final com.backend.devsecopsplatform_backend.service.TranslationService translationService;
 
     private record EngagementContext(
             AppService application,
@@ -599,7 +600,49 @@ public class DefectDojoService {
         JsonNode testDetail = fetchTestDetails(f);
         DefectDojoFindingDetailResponse detail = mapFindingDetail(f, ctx, testDetail);
         enrichFindingCodeContext(detail, app, ctx.branch());
+        translateScannerTexts(detail, findingId);
         return detail;
+    }
+
+    /**
+     * Les scanners (Trivy, Grype, ZAP…) rédigent en anglais et mêlent métadonnées techniques et
+     * description : les métadonnées ({@code **Package URL:**}, {@code **Matcher:**}…) sont extraites
+     * dans {@code scannerFields}, puis description, mitigation et impact sont traduits en français
+     * (cache en mémoire, texte d'origine conservé en cas d'échec).
+     */
+    private void translateScannerTexts(DefectDojoFindingDetailResponse detail, int findingId) {
+        if (detail == null) {
+            return;
+        }
+        ScannerTextFormatter.Formatted desc = ScannerTextFormatter.format(detail.getDescription());
+        detail.setScannerFields(desc.fields().isEmpty() ? null : desc.fields());
+        detail.setDescription(translateBounded(desc.text(), "dd_finding_" + findingId + "_desc_v2"));
+
+        ScannerTextFormatter.Formatted mitigation = ScannerTextFormatter.format(detail.getMitigation());
+        if (!mitigation.fields().isEmpty()) {
+            Map<String, String> merged = new LinkedHashMap<>(
+                    detail.getScannerFields() != null ? detail.getScannerFields() : Map.of());
+            mitigation.fields().forEach(merged::putIfAbsent);
+            detail.setScannerFields(merged);
+        }
+        detail.setMitigation(translateBounded(
+                ScannerTextFormatter.frenchHints(mitigation.text()), "dd_finding_" + findingId + "_mitigation_v2"));
+        detail.setImpact(translateBounded(
+                ScannerTextFormatter.format(detail.getImpact()).text(), "dd_finding_" + findingId + "_impact_v2"));
+    }
+
+    private String translateBounded(String text, String cacheKey) {
+        // Au-delà, la traduction (découpée en morceaux) deviendrait trop lente pour l'affichage.
+        // Les métadonnées étant extraites avant, il ne reste en général que la description utile.
+        if (text == null || text.isBlank() || text.length() > 2400) {
+            return text;
+        }
+        try {
+            return translationService.translateToFrench(text, cacheKey);
+        } catch (Exception e) {
+            log.debug("Traduction du finding ignorée ({}): {}", cacheKey, e.getMessage());
+            return text;
+        }
     }
 
     public enum FindingAction {
@@ -1004,14 +1047,14 @@ public class DefectDojoService {
                 "false_positive", "out_of_scope", "total", "inactive"
         );
         Map<String, String> labels = Map.of(
-                "verified", "Verified Findings",
-                "open", "Open Findings",
-                "risk_accepted", "Risk Accepted",
-                "closed", "Closed Findings",
-                "false_positive", "False Positive",
-                "out_of_scope", "Out of Scope",
-                "total", "Total Findings",
-                "inactive", "Inactive Findings"
+                "verified", "Vérifiés",
+                "open", "Ouverts",
+                "risk_accepted", "Risque accepté",
+                "closed", "Fermés",
+                "false_positive", "Faux positifs",
+                "out_of_scope", "Hors périmètre",
+                "total", "Total",
+                "inactive", "Inactifs"
         );
         List<DefectDojoMetricCard> cards = new ArrayList<>();
         for (String key : keys) {
@@ -1279,14 +1322,14 @@ public class DefectDojoService {
 
     private static String buildStatusLabel(JsonNode f) {
         List<String> parts = new ArrayList<>();
-        if (!f.path("active").asBoolean(false)) parts.add("Inactive");
-        if (f.path("verified").asBoolean(false)) parts.add("Verified");
-        if (f.path("is_mitigated").asBoolean(false)) parts.add("Mitigated");
-        if (f.path("false_p").asBoolean(false)) parts.add("False Positive");
-        if (f.path("risk_accepted").asBoolean(false)) parts.add("Risk Accepted");
-        if (f.path("out_of_scope").asBoolean(false)) parts.add("Out of Scope");
-        if (f.path("under_review").asBoolean(false)) parts.add("Under Review");
-        return parts.isEmpty() ? "Active" : String.join(", ", parts);
+        if (!f.path("active").asBoolean(false)) parts.add("Inactif");
+        if (f.path("verified").asBoolean(false)) parts.add("Vérifié");
+        if (f.path("is_mitigated").asBoolean(false)) parts.add("Corrigé");
+        if (f.path("false_p").asBoolean(false)) parts.add("Faux positif");
+        if (f.path("risk_accepted").asBoolean(false)) parts.add("Risque accepté");
+        if (f.path("out_of_scope").asBoolean(false)) parts.add("Hors périmètre");
+        if (f.path("under_review").asBoolean(false)) parts.add("En revue");
+        return parts.isEmpty() ? "Actif" : String.join(", ", parts);
     }
 
     private static String extractCve(JsonNode f) {

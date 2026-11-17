@@ -257,7 +257,11 @@ public class PipelineController {
         }
         try {
             Instant t = Instant.parse(s);
-            return Duration.between(t, Instant.now()).getSeconds() > 8;
+            // Pipeline terminé : son état GitLab ne bouge plus (sauf relance manuelle d'un job),
+            // inutile de le resynchroniser toutes les 8 s à chaque affichage.
+            boolean finished = execution.getStatus() != null && execution.getStatus().isFinished();
+            long maxAgeSeconds = finished ? 600 : 8;
+            return Duration.between(t, Instant.now()).getSeconds() > maxAgeSeconds;
         } catch (Exception e) {
             return true;
         }

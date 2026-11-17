@@ -25,11 +25,12 @@ public final class SecurityAlertDetailsBuilder {
         details.put("path", path);
         details.put("query", query);
         details.put("fullUrl", buildFullUrl(path, query));
-        details.put("ip", request.getRemoteAddr());
+        details.put("ip", IpAddressUtils.resolve(request));
         details.put("userAgent", userAgent);
         details.put("threatCategory", threatCategory);
         details.put("threatDetail", threatDetail);
         Map<String, String> headers = new LinkedHashMap<>();
+        addHeader(headers, request, "CF-Connecting-IP");
         addHeader(headers, request, "X-Forwarded-For");
         addHeader(headers, request, "X-Real-IP");
         addHeader(headers, request, "Referer");

@@ -222,10 +222,10 @@
         "Exécuter les tests de non-régression.",
         "Commit/push et relancer l'analyse depuis la plateforme."
       ],
-      "suggestedPatch": "# Exemple npm\nnpm update vulnerable-package\n# ou pin version corrigée dans package.json",
+      "suggestedPatch": "# Exemple npm\nnpm update vulnerable-package\n# ou figer la version corrigée dans package.json",
       "secureCodeBefore": "\"lodash\": \"4.17.15\"",
       "secureCodeAfter": "\"lodash\": \"4.17.21\"",
-      "bestPractices": ["Dependabot/Renovate en CI.", "Scanner SCA à chaque build.", "Pin des versions en prod."],
+      "bestPractices": ["Activer Dependabot ou Renovate dans la CI.", "Lancer une analyse des dépendances (SCA) à chaque build.", "Figer les versions des dépendances en production."],
       "references": [
         {"type": "OWASP", "id": "SCA", "url": "https://owasp.org/www-community/Component_Analysis"}
       ],

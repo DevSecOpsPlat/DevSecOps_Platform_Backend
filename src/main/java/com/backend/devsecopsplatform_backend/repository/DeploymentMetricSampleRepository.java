@@ -17,6 +17,8 @@ public interface DeploymentMetricSampleRepository extends JpaRepository<Deployme
     List<DeploymentMetricSample> findByDeploymentIdAndSampledAtBetweenOrderBySampledAtAsc(
             UUID deploymentId, Instant from, Instant to);
 
+    /** Transaction propre : l'échantillonneur appelle cette purge hors transaction (requête de suppression). */
+    @org.springframework.transaction.annotation.Transactional
     @Modifying(clearAutomatically = true)
     @Query("DELETE FROM DeploymentMetricSample s WHERE s.sampledAt < :before")
     int deleteBySampledAtBefore(@Param("before") Instant before);

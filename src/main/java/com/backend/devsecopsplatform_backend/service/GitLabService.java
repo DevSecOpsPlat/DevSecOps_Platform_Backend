@@ -243,7 +243,7 @@ public class GitLabService {
             body.put("variables", variablesList);
 
             String url = gitlabApiUrl + "/projects/" + gitlabProjectId + "/pipeline";
-            RestTemplate rest = new RestTemplate();
+            RestTemplate rest = com.backend.devsecopsplatform_backend.configuration.HttpTimeouts.restTemplate();
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(org.springframework.http.MediaType.APPLICATION_JSON);
             headers.set("PRIVATE-TOKEN", gitlabToken);
@@ -599,7 +599,7 @@ public class GitLabService {
                     gitlabApiUrl, gitlabProjectId, jobId, artifactPath);
 
             // 2. Configuration des headers avec ton token privé
-            RestTemplate restTemplate = new RestTemplate();
+            RestTemplate restTemplate = com.backend.devsecopsplatform_backend.configuration.HttpTimeouts.restTemplate();
             HttpHeaders headers = new HttpHeaders();
             headers.set("PRIVATE-TOKEN", gitlabToken); // Utilise ton token d'application.properties
 
@@ -796,7 +796,7 @@ public class GitLabService {
                     .encode()
                     .toUriString();
 
-            RestTemplate restTemplate = new RestTemplate();
+            RestTemplate restTemplate = com.backend.devsecopsplatform_backend.configuration.HttpTimeouts.restTemplate();
             HttpHeaders headers = new HttpHeaders();
             headers.set("PRIVATE-TOKEN", gitlabToken);
             ResponseEntity<byte[]> response = restTemplate.exchange(

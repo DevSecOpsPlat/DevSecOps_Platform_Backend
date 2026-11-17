@@ -850,6 +850,11 @@ public class AiAnalysisService {
         Optional<FindingAiRemediationResponse> cached = remediationCacheEnabled
                 ? remediationCacheService.get(cacheKey)
                 : Optional.empty();
+        if (cached.isPresent() && "static-template".equals(cached.get().getAiProviderUsed())) {
+            // Modèle statique : recalcul instantané depuis le fichier courant. Resservir la copie en cache
+            // figerait une ancienne version du modèle (ex. textes corrigés depuis en français).
+            cached = Optional.empty();
+        }
         if (cached.isPresent()) {
             remediationCacheService.touchHit(cacheKey);
             log.info("[AI] Cache hit ({})", cacheKey.substring(0, 8));
@@ -1491,6 +1496,23 @@ public class AiAnalysisService {
         return false;
     }
 
+    /**
+     * Groq 400 « Generated JSON does not match the expected schema » : le modèle n'a pas respecté
+     * la sortie structurée stricte (json_schema). C'est intermittent et récupérable — on réessaie
+     * en json_object (sans schéma), qui n'impose que du JSON valide. Rien à voir avec un quota.
+     */
+    private static boolean isGroqSchemaError(Throwable e) {
+        if (e instanceof HttpClientErrorException he && he.getStatusCode() == HttpStatus.BAD_REQUEST) {
+            String body = he.getResponseBodyAsString();
+            if (body != null) {
+                return body.contains("does not match the expected schema")
+                        || body.contains("json_validate_failed")
+                        || body.contains("failed_generation");
+            }
+        }
+        return false;
+    }
+
     /** Remédiation/artifact : Groq 429 → fallback Ollama pour cet appel. */
     private AiCallResult callAiProviderWithFallbackResult(String provider, String prompt) throws Exception {
         return callAiProviderWithFallbackResult(provider, prompt, null, null, null);
@@ -1975,6 +1997,24 @@ public class AiAnalysisService {
 
     private String callGroq(String prompt, String schemaName, String jsonSchema, String groqModelOverride) {
         String model = (groqModelOverride != null && !groqModelOverride.isBlank()) ? groqModelOverride : groqModel;
+        boolean strictSchema = (jsonSchema != null && schemaName != null);
+        try {
+            return callGroqOnce(prompt, model, schemaName, jsonSchema, strictSchema);
+        } catch (HttpClientErrorException e) {
+            // Groq a refusé la sortie structurée stricte (400 « does not match the expected schema »).
+            // Un seul réessai en json_object (sans schéma) : rapide, reste sur Groq, et corrige la
+            // plupart des cas. Si ce réessai échoue pour quota (429), le relais OpenRouter → Ollama
+            // prend le relais chez l'appelant.
+            if (strictSchema && isGroqSchemaError(e)) {
+                log.warn("[AI] Groq schéma strict refusé (400) — réessai en json_object");
+                return callGroqOnce(prompt, model, schemaName, jsonSchema, false);
+            }
+            throw e;
+        }
+    }
+
+    private String callGroqOnce(String prompt, String model, String schemaName, String jsonSchema,
+                                boolean strictSchema) {
         var body = new java.util.LinkedHashMap<String, Object>();
         body.put("model", model);
         body.put("messages", llmMessagesWithFrenchSystem(prompt));
@@ -1984,15 +2024,19 @@ public class AiAnalysisService {
             body.put("reasoning_effort", groqReasoningEffort);
         }
         if (jsonSchema != null && schemaName != null) {
-            try {
-                JsonNode schema = objectMapper.readTree(jsonSchema);
-                body.put("response_format", java.util.Map.of(
-                        "type", "json_schema",
-                        "json_schema", java.util.Map.of(
-                                "name", schemaName, "strict", true, "schema", schema)));
-            } catch (Exception e) {
-                log.warn("Schéma JSON invalide, fallback json_object: {}", e.getMessage());
+            if (!strictSchema) {
                 body.put("response_format", java.util.Map.of("type", "json_object"));
+            } else {
+                try {
+                    JsonNode schema = objectMapper.readTree(jsonSchema);
+                    body.put("response_format", java.util.Map.of(
+                            "type", "json_schema",
+                            "json_schema", java.util.Map.of(
+                                    "name", schemaName, "strict", true, "schema", schema)));
+                } catch (Exception e) {
+                    log.warn("Schéma JSON invalide, fallback json_object: {}", e.getMessage());
+                    body.put("response_format", java.util.Map.of("type", "json_object"));
+                }
             }
         }
 

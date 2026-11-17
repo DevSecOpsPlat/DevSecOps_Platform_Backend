@@ -134,6 +134,7 @@ public class ApplicationService {
                 .description(app.getDescription())
                 .gitRepositoryUrl(app.getGitRepositoryUrl())
                 .dockerfilePath(app.getDockerfilePath())
+                .gitBranch(app.getGitBranch() != null && !app.getGitBranch().isBlank() ? app.getGitBranch().trim() : "main")
                 .createdAt(app.getCreatedAt())
                 .createdByUsername(app.getCreatedBy().getUsername())
                 .hasGithubToken(app.getEncryptedGithubToken() != null)

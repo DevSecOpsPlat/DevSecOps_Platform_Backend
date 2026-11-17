@@ -2,8 +2,10 @@ package com.backend.devsecopsplatform_backend.service.appmgmt;
 
 import com.backend.devsecopsplatform_backend.entity.AppService;
 import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
+import com.backend.devsecopsplatform_backend.entity.QualityGateSnapshot;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.AppServiceRole;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.ScanBatch;
+import com.backend.devsecopsplatform_backend.repository.QualityGateSnapshotRepository;
 import com.backend.devsecopsplatform_backend.service.qualitygate.HardGateInput;
 import com.backend.devsecopsplatform_backend.service.qualitygate.SecurityScoreInput;
 import com.backend.devsecopsplatform_backend.service.qualitygate.SecurityScoringService;
@@ -19,13 +21,19 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Agrégation D5 du verdict application à partir des {@code qualityGateJson} figés (D6).
+ * Agrégation D5 du verdict application.
+ * <p>
+ * Source par service : le snapshot Quality Gate du service (celui qu'affiche sa page Quality Gate)
+ * quand il existe, sinon le {@code qualityGateJson} figé de la CI (D6). Ainsi le verdict et le
+ * score de l'application sont toujours cohérents avec ce que montre chaque service.
  * <p>
  * Invariants :
  * <ul>
- *   <li>hard gate violé sur un service → {@code NOT_RECOMMENDED}, score null</li>
+ *   <li>hard gate violé sur un service → {@code NOT_RECOMMENDED}</li>
  *   <li>indéterminé sur un service → pas {@code RECOMMENDED} ({@code INDETERMINE})</li>
- *   <li>score = min des scores ajustés (pas de moyenne) ; worker +10 avant min → FRONTEND pèse plus</li>
+ *   <li>score (informatif) = min des scores ajustés (pas de moyenne) ; worker +10 avant min →
+ *       FRONTEND pèse plus. Renseigné même quand le verdict est bloquant, comme sur la page
+ *       Quality Gate du service — à condition que chaque service ait un score.</li>
  * </ul>
  */
 @Service
@@ -36,10 +44,14 @@ public class ScanBatchAggregationService {
     /** Biais worker : score interne relevé avant le min → un FRONTEND faible domine davantage. */
     static final int WORKER_SCORE_RELAXATION = 10;
 
+    /** Version de l'agrégation stockée dans le payload (re-calcul des anciens lots au démarrage). */
+    public static final int AGGREGATION_VERSION = 2;
+
     private static final List<String> VERDICT_SEVERITY = List.of(
             "NOT_RECOMMENDED", "INDETERMINE", "WITH_WARNINGS", "RECOMMENDED");
 
     private final SecurityScoringService securityScoringService;
+    private final QualityGateSnapshotRepository qualityGateSnapshotRepository;
 
     public record ServiceContribution(
             String pipelineExecutionId,
@@ -53,7 +65,8 @@ public class ScanBatchAggregationService {
             boolean hardGateViolated,
             boolean indeterminate,
             List<String> hardGateIds,
-            List<String> indeterminateSources
+            List<String> indeterminateSources,
+            boolean fromSnapshot
     ) {}
 
     public record AggregationResult(
@@ -88,25 +101,35 @@ public class ScanBatchAggregationService {
             verdict = "INDETERMINE";
         } else {
             verdict = worstVerdict(contribs.stream().map(ServiceContribution::verdict).toList());
-            // Relaxation worker uniquement pour sélectionner le service dimensionnant ;
-            // le score reporté reste le score réel (cohérent hub service ↔ app).
-            if ("RECOMMENDED".equals(verdict) || "WITH_WARNINGS".equals(verdict)) {
-                dimensioning = contribs.stream()
-                        .filter(c -> c.securityScore() != null)
+        }
+
+        // Relaxation worker uniquement pour sélectionner le service dimensionnant ;
+        // le score reporté reste le score réel (cohérent hub service ↔ app).
+        // Score seulement si TOUS les services en ont un : sinon un service bloqué sans score
+        // laisserait l'application afficher le score d'un service sain (ex. 100/A + « non recommandé »).
+        boolean allScored = !contribs.isEmpty()
+                && contribs.stream().allMatch(c -> c.securityScore() != null);
+        dimensioning = allScored
+                ? contribs.stream()
                         .min(Comparator.comparingInt(ScanBatchAggregationService::adjustedScoreForSelection))
-                        .orElse(null);
-                if (dimensioning != null) {
-                    score = dimensioning.securityScore();
-                    grade = SecurityScoringService.scoreToGrade(score);
-                    if (score < 75 && "RECOMMENDED".equals(verdict)) {
-                        verdict = "WITH_WARNINGS";
-                    }
-                }
+                        .orElse(null)
+                : null;
+        if (dimensioning != null) {
+            score = dimensioning.securityScore();
+            grade = dimensioning.grade() != null && !dimensioning.grade().isBlank()
+                    ? dimensioning.grade()
+                    : SecurityScoringService.scoreToGrade(score);
+            if (score < 75 && "RECOMMENDED".equals(verdict)) {
+                verdict = "WITH_WARNINGS";
             }
         }
 
         Map<String, Object> extras = new LinkedHashMap<>();
         extras.put("aggregation", "D5_WORST_CASE_MIN_ADJUSTED");
+        extras.put("aggregationVersion", AGGREGATION_VERSION);
+        extras.put("serviceSource", contribs.stream().anyMatch(c -> c.fromSnapshot())
+                ? "SERVICE_QUALITY_GATE_SNAPSHOT"
+                : "CI_QUALITY_GATE_JSON");
         extras.put("workerScoreRelaxation", WORKER_SCORE_RELAXATION);
         extras.put("expectedServiceCount", batch != null ? batch.getExpectedServiceCount() : executions.size());
         extras.put("aggregatedServiceCount", contribs.size());
@@ -172,6 +195,35 @@ public class ScanBatchAggregationService {
                 indeterminateLabels.add(v.getId());
             }
         });
+
+        // Snapshot Quality Gate du service = ce que l'utilisateur voit sur la page du service :
+        // il prime pour le verdict et le score (cohérence application ↔ services).
+        Map<String, Object> snapshot = snapshotPayload(pe);
+        boolean fromSnapshot = false;
+        if (snapshot != null) {
+            String snapVerdict = snapshot.get("verdict") != null
+                    ? normalize(String.valueOf(snapshot.get("verdict")))
+                    : null;
+            if (snapVerdict != null && VERDICT_SEVERITY.contains(snapVerdict)) {
+                fromSnapshot = true;
+                verdict = snapVerdict;
+                violated = "NOT_RECOMMENDED".equals(snapVerdict);
+                indeterminate = "INDETERMINE".equals(snapVerdict);
+                if (!violated) {
+                    gateIds = List.of();
+                }
+                if (!indeterminate) {
+                    indeterminateLabels.clear();
+                }
+            }
+            Integer snapScore = snapshotScore(snapshot);
+            if (snapScore != null) {
+                score = snapScore;
+                String snapGrade = snapshotGrade(snapshot);
+                grade = snapGrade != null ? snapGrade : SecurityScoringService.scoreToGrade(snapScore);
+            }
+        }
+
         return new ServiceContribution(
                 pe.getId() != null ? pe.getId().toString() : null,
                 svc != null && svc.getId() != null ? svc.getId().toString() : null,
@@ -184,8 +236,44 @@ public class ScanBatchAggregationService {
                 violated,
                 indeterminate,
                 gateIds,
-                indeterminateLabels
+                indeterminateLabels,
+                fromSnapshot
         );
+    }
+
+    private Map<String, Object> snapshotPayload(PipelineExecution pe) {
+        if (pe == null || pe.getId() == null || qualityGateSnapshotRepository == null) {
+            return null;
+        }
+        try {
+            return qualityGateSnapshotRepository.findByPipelineExecutionId(pe.getId())
+                    .map(QualityGateSnapshot::getPayload)
+                    .filter(p -> p != null && !p.isEmpty())
+                    .orElse(null);
+        } catch (Exception e) {
+            log.debug("Snapshot QG illisible pour exec {}: {}", pe.getId(), e.getMessage());
+            return null;
+        }
+    }
+
+    /** {@code securityScore} du snapshot : objet {@code {score, grade}} ou nombre brut. */
+    static Integer snapshotScore(Map<String, Object> snapshot) {
+        Object raw = snapshot.get("securityScore");
+        Object value = raw instanceof Map<?, ?> m ? m.get("score") : raw;
+        if (value == null) {
+            return null;
+        }
+        int parsed = intObj(value, -1);
+        return parsed >= 0 ? Integer.valueOf(parsed) : null;
+    }
+
+    static String snapshotGrade(Map<String, Object> snapshot) {
+        Object raw = snapshot.get("securityScore");
+        if (raw instanceof Map<?, ?> m && m.get("grade") != null) {
+            String g = String.valueOf(m.get("grade")).trim();
+            return g.isEmpty() ? null : g;
+        }
+        return null;
     }
 
     static boolean isPubliclyExposed(AppService svc) {
