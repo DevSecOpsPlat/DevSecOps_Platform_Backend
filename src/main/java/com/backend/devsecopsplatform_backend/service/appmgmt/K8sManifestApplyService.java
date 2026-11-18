@@ -1896,6 +1896,12 @@ public class K8sManifestApplyService {
         if (deleteIngressIfExists(namespace, "app-ingress")) {
             removed.add("Ingress/app-ingress");
         }
+        if (deleteIngressIfExists(namespace, "app-ingress-preview")) {
+            removed.add("Ingress/app-ingress-preview");
+        }
+        if (deleteTraefikMiddlewareIfExists(namespace, "app-preview-frame")) {
+            removed.add("Middleware/app-preview-frame");
+        }
         if (deleteTraefikMiddlewareIfExists(namespace, "app-api-rewrite")) {
             removed.add("Middleware/app-api-rewrite");
         }

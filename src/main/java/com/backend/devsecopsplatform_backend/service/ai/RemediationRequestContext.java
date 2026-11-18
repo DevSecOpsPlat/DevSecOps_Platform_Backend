@@ -7,8 +7,19 @@ public record RemediationRequestContext(
         String ruleKey,
         String filePath,
         Integer line,
-        boolean deepAnalysis
+        boolean deepAnalysis,
+        RemediationEvidence evidence
 ) {
+    public RemediationRequestContext(String ruleKey, String filePath, Integer line, boolean deepAnalysis) {
+        this(ruleKey, filePath, line, deepAnalysis, RemediationEvidence.none());
+    }
+
+    public RemediationRequestContext {
+        if (evidence == null) {
+            evidence = RemediationEvidence.none();
+        }
+    }
+
     public static RemediationRequestContext fromFindingContext(String findingContext, boolean deepAnalysis) {
         String ruleKey = StaticRemediationTemplateService.extractRuleKey(findingContext);
         String filePath = extractLineValue(findingContext, "Fichier:");

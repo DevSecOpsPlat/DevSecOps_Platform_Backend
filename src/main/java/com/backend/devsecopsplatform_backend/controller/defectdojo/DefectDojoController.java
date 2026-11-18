@@ -225,7 +225,8 @@ public class DefectDojoController {
                 StaticRemediationTemplateService.extractRuleKey(ctx),
                 detail.getFilePath(),
                 detail.getLine(),
-                deepAnalysis
+                deepAnalysis,
+                defectDojoService.remediationEvidence(detail, codeContextSource)
         );
         FindingAiRemediationResponse out = aiAnalysisService.analyzeFindingRemediation(
                 applicationId, branch, ctx, snippet, reqCtx);

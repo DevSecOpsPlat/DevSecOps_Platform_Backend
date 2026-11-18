@@ -30,6 +30,13 @@ public class ApplicationManagementController {
 
     private final ApplicationManagementService service;
     private final ManagedAppScanService managedAppScanService;
+    private final com.backend.devsecopsplatform_backend.service.appmgmt.PostDeployService postDeployService;
+
+    /** DAST (ZAP) + smoke test d'un déploiement (par défaut : celui en cours, sinon le dernier). */
+    @GetMapping("/{id}/post-deploy")
+    public ResponseEntity<?> postDeploy(@PathVariable UUID id, @RequestParam(required = false) UUID deploymentId) {
+        return handle(() -> ResponseEntity.ok(postDeployService.summary(id, deploymentId)));
+    }
 
     // ---------- Applications ----------
 

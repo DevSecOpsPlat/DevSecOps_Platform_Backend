@@ -97,6 +97,38 @@ public class QualityGateService {
     private final QualityGateSnapshotRepository qualityGateSnapshotRepository;
     private final ScanBatchRepository scanBatchRepository;
     private final ObjectMapper objectMapper;
+    private final org.springframework.jdbc.core.JdbcTemplate jdbcTemplate;
+
+    /**
+     * Copie du quality_gate_json complétée par les clés présentes en base mais absentes de la
+     * copie en mémoire. Un calcul de snapshot (synchro des stages) peut charger l'exécution
+     * AVANT que l'ingestion CI n'y écrive verdict / secrets / Sonar, puis l'enregistrer APRÈS :
+     * sans cette fusion, il efface ces champs (constaté le 17/11/2026 : service « back »
+     * affiché « security-validation en échec » alors que le job avait réussi).
+     * Lecture JDBC directe : pas de flush Hibernate, on voit l'état réellement validé en base.
+     */
+    private Map<String, Object> gateWithCommittedKeys(PipelineExecution execution) {
+        Map<String, Object> gate = execution.getQualityGateJson() != null
+                ? new LinkedHashMap<>(execution.getQualityGateJson())
+                : new LinkedHashMap<>();
+        if (execution.getId() == null || jdbcTemplate == null) {
+            return gate;
+        }
+        try {
+            List<String> rows = jdbcTemplate.queryForList(
+                    "select cast(quality_gate_json as text) from pipeline_executions where id = ?",
+                    String.class, execution.getId());
+            String raw = rows.isEmpty() ? null : rows.get(0);
+            if (raw != null && !raw.isBlank()) {
+                Map<String, Object> committed = objectMapper.readValue(raw,
+                        new com.fasterxml.jackson.core.type.TypeReference<LinkedHashMap<String, Object>>() {});
+                committed.forEach(gate::putIfAbsent);
+            }
+        } catch (Exception e) {
+            log.debug("Relecture quality_gate_json {} impossible : {}", execution.getId(), e.getMessage());
+        }
+        return gate;
+    }
 
     @Transactional
     public void ingestFromPipeline(SecurityGateIngestRequest request) {
@@ -1014,6 +1046,9 @@ public class QualityGateService {
         DefectDojoDashboard2Response dd = fetchDefectDojoForSnapshot(
                 resolvedApp, execution, resolvedBranch, environmentId);
         Map<String, Object> sonar = fetchSonarForQualityGate(resolvedApp, resolvedBranch, execution);
+        // Les appels DefectDojo / Sonar prennent plusieurs secondes : l'ingestion CI a pu écrire
+        // le verdict entre-temps. On calcule le snapshot sur l'état validé en base, pas sur la copie chargée avant.
+        execution.setQualityGateJson(gateWithCommittedKeys(execution));
         QualityGateResultDto result = buildResult(
                 resolvedApp, resolvedBranch, execution, dd, sonar, environmentId);
         persistDisplaySnapshot(execution, result, appendHistory);
@@ -1036,10 +1071,7 @@ public class QualityGateService {
         if (execution == null) {
             return;
         }
-        Map<String, Object> gate = execution.getQualityGateJson();
-        if (gate == null) {
-            gate = new LinkedHashMap<>();
-        }
+        Map<String, Object> gate = gateWithCommittedKeys(execution);
 
         Map<String, Integer> bySev = new LinkedHashMap<>();
         bySev.put("critical", 0);
@@ -1767,10 +1799,7 @@ public class QualityGateService {
 
     @SuppressWarnings("unchecked")
     private void persistDisplaySnapshot(PipelineExecution execution, QualityGateResultDto dto, boolean appendHistory) {
-        Map<String, Object> gate = execution.getQualityGateJson();
-        if (gate == null) {
-            gate = new LinkedHashMap<>();
-        }
+        Map<String, Object> gate = gateWithCommittedKeys(execution);
         if (appendHistory && gate.get("displaySnapshot") != null) {
             appendSnapshotHistoryEntry(gate, gate);
         }
@@ -1906,8 +1935,14 @@ public class QualityGateService {
 
     private <T> T runWithSnapshotAuth(AppService app, PipelineExecution execution, Supplier<T> action) {
         Authentication existing = SecurityContextHolder.getContext().getAuthentication();
+        // Les rappels du pipeline (X-Pipeline-Secret) arrivent avec l'utilisateur anonyme de Spring
+        // Security (« anonymousUser ») : ce n'est pas un vrai compte. Sans ce test, DefectDojo était
+        // interrogé au nom de « anonymousUser » → « Utilisateur non trouvé » → étape
+        // import-defectdojo marquée « non exécutée » à tort dans la quality gate (constaté le 17/11/2026).
         boolean alreadyAuthenticated = existing != null
-                && existing.getName() != null && !existing.getName().isBlank();
+                && !(existing instanceof org.springframework.security.authentication.AnonymousAuthenticationToken)
+                && existing.getName() != null && !existing.getName().isBlank()
+                && userRepository.findByUsername(existing.getName()).isPresent();
         if (alreadyAuthenticated) {
             return action.get();
         }
@@ -1921,7 +1956,11 @@ public class QualityGateService {
                     new UsernamePasswordAuthenticationToken(username, null, List.of()));
             return action.get();
         } finally {
-            SecurityContextHolder.clearContext();
+            if (existing != null) {
+                SecurityContextHolder.getContext().setAuthentication(existing);
+            } else {
+                SecurityContextHolder.clearContext();
+            }
         }
     }
 

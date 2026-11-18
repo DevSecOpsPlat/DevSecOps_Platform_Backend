@@ -76,6 +76,10 @@ public class DefectDojoService {
     private final SourceSnippetFetcherService sourceSnippetFetcherService;
     private final DefectDojoHttpClientFactory httpClientFactory;
     private final com.backend.devsecopsplatform_backend.service.TranslationService translationService;
+    private final DastContextService dastContextService;
+
+    /** URL testées par finding DAST (stables pour un finding donné). */
+    private final Map<Integer, List<String>> findingUrlCache = new ConcurrentHashMap<>();
 
     private record EngagementContext(
             AppService application,
@@ -600,8 +604,64 @@ public class DefectDojoService {
         JsonNode testDetail = fetchTestDetails(f);
         DefectDojoFindingDetailResponse detail = mapFindingDetail(f, ctx, testDetail);
         enrichFindingCodeContext(detail, app, ctx.branch());
+        if (detail.isDynamicFinding()) {
+            detail.setAnalyzedUrls(resolveFindingUrls(f));
+            dastContextService.enrich(detail, app, ctx.branch());
+        }
         translateScannerTexts(detail, findingId);
         return detail;
+    }
+
+    /**
+     * URL testées par ZAP : statuts d'endpoint du finding → endpoints (protocole, hôte, chemin).
+     * Les anciennes versions de DefectDojo exposent directement des ids d'endpoint dans {@code endpoints}.
+     */
+    private List<String> resolveFindingUrls(JsonNode finding) {
+        int findingId = finding.path("id").asInt();
+        List<String> cached = findingUrlCache.get(findingId);
+        if (cached != null) {
+            return cached;
+        }
+        Set<Integer> endpointIds = new LinkedHashSet<>();
+        JsonNode statuses = get("/api/v2/endpoint_status/", Map.of("finding", String.valueOf(findingId), "limit", "20"));
+        if (statuses != null && statuses.path("results").isArray()) {
+            statuses.path("results").forEach(s -> {
+                if (s.path("endpoint").isInt()) endpointIds.add(s.path("endpoint").asInt());
+            });
+        }
+        if (endpointIds.isEmpty() && finding.path("endpoints").isArray()) {
+            finding.path("endpoints").forEach(e -> {
+                if (e.isInt()) endpointIds.add(e.asInt());
+            });
+        }
+        List<String> urls = new ArrayList<>();
+        for (Integer id : endpointIds) {
+            if (urls.size() >= 6) break;
+            JsonNode ep = get("/api/v2/endpoints/" + id + "/", null);
+            String url = endpointUrl(ep);
+            if (url != null && !urls.contains(url)) urls.add(url);
+        }
+        List<String> out = List.copyOf(urls);
+        if (!out.isEmpty()) {
+            findingUrlCache.put(findingId, out);
+        }
+        return out;
+    }
+
+    private static String endpointUrl(JsonNode ep) {
+        if (ep == null || ep.path("host").asText("").isBlank()) {
+            return null;
+        }
+        String protocol = ep.path("protocol").asText("https");
+        if (protocol.isBlank()) protocol = "https";
+        String host = ep.path("host").asText();
+        int port = ep.path("port").asInt(0);
+        boolean defaultPort = port == 0 || ("https".equals(protocol) && port == 443) || ("http".equals(protocol) && port == 80);
+        String path = ep.path("path").asText("");
+        if (!path.isEmpty() && !path.startsWith("/")) path = "/" + path;
+        String query = ep.path("query").asText("");
+        return protocol + "://" + host + (defaultPort ? "" : ":" + port) + (path.isEmpty() ? "/" : path)
+                + (query.isEmpty() ? "" : "?" + query);
     }
 
     /**
@@ -845,14 +905,104 @@ public class DefectDojoService {
         if ("DOCKERFILE".equalsIgnoreCase(nullToEmpty(d.getCodeContextSource()))) {
             sb.append("Note: finding conteneur — le snippet joint est le Dockerfile du dépôt, pas le chemin image.\n");
         }
-        if (d.getCodeContextHint() != null && !d.getCodeContextHint().isBlank()) {
+        if (!d.isDynamicFinding() && d.getCodeContextHint() != null && !d.getCodeContextHint().isBlank()) {
             sb.append("Contexte extrait: ").append(truncateField(d.getCodeContextHint(), 500)).append("\n");
+        }
+        if (d.isDynamicFinding()) {
+            appendDastContext(sb, d);
         }
         if (d.getDescription() != null) sb.append("Description scanner:\n").append(truncateField(d.getDescription(), 4000)).append("\n");
         if (d.getMitigation() != null) sb.append("Mitigation DefectDojo:\n").append(truncateField(d.getMitigation(), 2000)).append("\n");
         if (d.getImpact() != null) sb.append("Impact:\n").append(truncateField(d.getImpact(), 2000)).append("\n");
         if (d.getReferences() != null) sb.append("Références:\n").append(truncateField(d.getReferences(), 1000)).append("\n");
         return sb.toString();
+    }
+
+    /**
+     * Preuves connues du backend pour ce finding (bornent la confiance, scindent le cache).
+     *
+     * @param codeContextSource source effective de l'extrait envoyé à l'IA (MANUAL, GITHUB, GITLAB, DOCKERFILE, NONE…)
+     */
+    public com.backend.devsecopsplatform_backend.service.ai.RemediationEvidence remediationEvidence(
+            DefectDojoFindingDetailResponse d, String codeContextSource) {
+        String src = nullToEmpty(codeContextSource).toUpperCase(Locale.ROOT);
+        boolean manual = "MANUAL".equals(src);
+        boolean repo = !manual && !src.isBlank() && !"NONE".equals(src);
+        boolean scannerLocation = !d.isDynamicFinding()
+                && !nullToEmpty(d.getFilePath()).isBlank() && d.getLine() != null && d.getLine() > 0;
+        DefectDojoFindingDetailResponse.LiveHttpCheck check = d.getLiveCheck();
+        boolean live = check != null && check.getError() == null && check.getStatus() != null;
+
+        StringBuilder fp = new StringBuilder();
+        if (d.getAnalyzedUrls() != null) fp.append(String.join(",", d.getAnalyzedUrls()));
+        if (check != null) {
+            fp.append("|").append(check.getStatus()).append("|").append(check.getError() != null);
+            if (check.getHeaders() != null) {
+                new TreeMap<>(check.getHeaders()).forEach((k, v) -> {
+                    // Les cookies et dates changent à chaque requête : seuls les autres en-têtes décrivent la configuration.
+                    if (!"set-cookie".equals(k) && !"expires".equals(k)) fp.append("|").append(k).append("=").append(v);
+                });
+            }
+        }
+        fp.append("|").append(nullToEmpty(d.getCodeFilePath()));
+        return new com.backend.devsecopsplatform_backend.service.ai.RemediationEvidence(
+                d.isDynamicFinding(), repo, manual, scannerLocation, live,
+                d.getApplicationId() != null ? d.getApplicationId().toString() : "",
+                Integer.toHexString(fp.toString().hashCode()));
+    }
+
+    /**
+     * Blocs DAST, chacun étiqueté par sa provenance : constat ZAP, contrôle de la plateforme,
+     * chaîne d'exposition, fichier lu dans le dépôt. L'IA s'appuie sur ces étiquettes pour séparer
+     * constats et hypothèses.
+     */
+    private static void appendDastContext(StringBuilder sb, DefectDojoFindingDetailResponse d) {
+        sb.append("Type d'analyse: DAST (OWASP ZAP) — test dynamique de l'application DÉPLOYÉE via son URL ; ZAP n'a pas lu le code source.\n");
+        if (d.getToolRuleId() != null) sb.append("Règle ZAP (pluginid): ").append(d.getToolRuleId()).append("\n");
+        List<String> urls = d.getAnalyzedUrls() != null ? d.getAnalyzedUrls() : List.of();
+        if (!urls.isEmpty()) {
+            sb.append("[SCANNER] URL testées par ZAP: ").append(String.join(", ", urls)).append("\n");
+        } else {
+            sb.append("[SCANNER] URL testées par ZAP: non transmises par DefectDojo\n");
+        }
+        DefectDojoFindingDetailResponse.LiveHttpCheck check = d.getLiveCheck();
+        if (check != null) {
+            if (check.getError() != null && (check.getHeaders() == null || check.getHeaders().isEmpty())) {
+                sb.append("[CONTROLE_PLATEFORME] ").append(check.getError()).append("\n");
+            } else {
+                sb.append("[CONTROLE_PLATEFORME] Requête GET envoyée par EnviroTest le ").append(check.getCheckedAt())
+                        .append(" sur ").append(check.getUrl()).append(" → statut ").append(check.getStatus())
+                        .append(" (état ACTUEL, il peut différer du moment du scan)")
+                        .append(check.getCorsTestOrigin() != null ? " — en-tête Origin envoyé : " + check.getCorsTestOrigin() : "")
+                        .append("\n");
+                if (check.getError() != null) {
+                    sb.append("[CONTROLE_PLATEFORME] Attention : ").append(check.getError()).append("\n");
+                }
+                sb.append("  En-têtes présents:\n");
+                if (check.getHeaders() == null || check.getHeaders().isEmpty()) {
+                    sb.append("    (aucun en-tête de sécurité)\n");
+                } else {
+                    check.getHeaders().forEach((k, v) ->
+                            sb.append("    ").append(k).append(": ").append(truncateField(v, 600)).append("\n"));
+                }
+                if (check.getMissingHeaders() != null && !check.getMissingHeaders().isEmpty()) {
+                    sb.append("  En-têtes de sécurité ABSENTS: ").append(String.join(", ", check.getMissingHeaders())).append("\n");
+                }
+            }
+        }
+        if (d.getExposureChain() != null && !d.getExposureChain().isEmpty()) {
+            sb.append("[PLATEFORME] Chaîne d'exposition de cette adresse (déployée par EnviroTest):\n");
+            for (int i = 0; i < d.getExposureChain().size(); i++) {
+                sb.append("  ").append(i + 1).append(". ").append(d.getExposureChain().get(i)).append("\n");
+            }
+        }
+        if (d.getCodeFilePath() != null) {
+            sb.append("[DEPOT] Fichier lu dans le dépôt: ").append(d.getCodeFilePath())
+                    .append(d.getCodeContextHint() != null ? " (" + d.getCodeContextHint() + ")" : "")
+                    .append(" — extrait joint ci-dessous.\n");
+        } else {
+            sb.append("[DEPOT] Aucun fichier de l'application n'a pu être lu pour ce finding.\n");
+        }
     }
 
     private static String truncateField(String s, int maxChars) {
@@ -1317,7 +1467,17 @@ public class DefectDojoService {
                 .productName(ctx.productName())
                 .applicationId(ctx.application().getId())
                 .codeContextSource("NONE")
+                .toolRuleId(textOrNull(f.path("vuln_id_from_tool")))
+                .dynamicFinding(f.path("dynamic_finding").asBoolean(false)
+                        || "DAST".equals(classifyAnalysisType(item.getScanType()))
+                        || nullToEmpty(item.getToolName()).toLowerCase(Locale.ROOT).contains("zap"))
                 .build();
+    }
+
+    private static String textOrNull(JsonNode n) {
+        if (n == null || n.isNull() || n.isMissingNode()) return null;
+        String s = n.asText("").trim();
+        return s.isEmpty() ? null : s;
     }
 
     private static String buildStatusLabel(JsonNode f) {
