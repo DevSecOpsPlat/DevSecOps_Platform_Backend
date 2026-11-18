@@ -156,7 +156,8 @@ public class ApplicationManagementService {
     @Transactional
     public ManagedAppResponse updateApp(UUID id, UpdateManagedAppRequest request) {
         ManagedApplication app = loadOwnedApp(id);
-        app.setName(request.getName());
+        // Renommage : seul le nom affiché change ; le slug (adresse publique, namespaces) reste stable.
+        app.setName(request.getName() == null ? app.getName() : request.getName().trim());
         app.setDescription(request.getDescription());
         String previousHost = app.getCustomHostname();
         String newHost = AppDeploymentService.normalizeCustomHostname(request.getCustomHostname());
