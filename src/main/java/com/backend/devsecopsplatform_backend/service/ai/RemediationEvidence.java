@@ -16,6 +16,8 @@ package com.backend.devsecopsplatform_backend.service.ai;
  * @param liveCheck        le contrôle HTTP de la plateforme a donné une réponse exploitable
  * @param applicationScope id de l'application (portée du cache)
  * @param fingerprint      empreinte des preuves (URL, en-têtes observés, fichier lu)
+ * @param pipelineContextRelevant false quand un AUTRE service que celui du finding a répondu (DAST) :
+ *                         le contexte pipeline du service du finding décrirait alors la mauvaise application
  */
 public record RemediationEvidence(
         boolean dynamicFinding,
@@ -24,10 +26,11 @@ public record RemediationEvidence(
         boolean scannerLocation,
         boolean liveCheck,
         String applicationScope,
-        String fingerprint
+        String fingerprint,
+        boolean pipelineContextRelevant
 ) {
     public static RemediationEvidence none() {
-        return new RemediationEvidence(false, false, false, false, false, "", "");
+        return new RemediationEvidence(false, false, false, false, false, "", "", true);
     }
 
     /** Au moins un élément concret au-delà du texte générique du scanner. */

@@ -131,7 +131,7 @@ public class AiAnalysisService {
                     "additionalProperties": false,
                     "required":["type","id","url"],
                     "properties":{
-                      "type":{"type":"string","enum":["CWE","CVE","OWASP","DOC"]},
+                      "type":{"type":"string"},
                       "id":{"type":"string"},
                       "url":{"type":"string"}
                     }
@@ -877,7 +877,8 @@ public class AiAnalysisService {
                 : RemediationRequestContext.fromFindingContext(findingContextBlock, false);
         boolean compact = !meta.deepAnalysis();
         RemediationEvidence evidence = meta.evidence();
-        boolean pipelineCtxKnown = !pipelineKnowledgeService.getPipelineContextBlock(applicationId, branch).isBlank();
+        boolean pipelineCtxKnown = evidence.pipelineContextRelevant()
+                && !pipelineKnowledgeService.getPipelineContextBlock(applicationId, branch).isBlank();
         java.util.function.UnaryOperator<FindingAiRemediationResponse> policy =
                 r -> applyEvidencePolicy(r, evidence, pipelineCtxKnown, findingContextBlock);
 
@@ -948,9 +949,21 @@ public class AiAnalysisService {
             prompt = prompt.substring(0, maxPrompt) + "\n\n[... prompt tronqué ...]";
         }
 
-        String groqModelChoice = compact ? groqModelFast : groqModel;
-        // Le résultat d'un job Ollama asynchrone arrive plus tard : il doit recevoir le même bornage.
-        pendingRemediationPolicies.put(cacheKey, policy);
+        // DAST : raisonner sur plusieurs preuves (routage, fichiers, en-têtes) demande le grand modèle, même en
+        // analyse instantanée (essai du 18/11/2026 : le petit modèle cassait les guillemets de la CSP proposée).
+        // Prompt DAST ≈ 3 500 tokens : il tient dans le quota gratuit de 8 000 tokens/min du grand modèle.
+        String groqModelChoice = compact && !evidence.dynamicFinding() ? groqModelFast : groqModel;
+        // Le résultat d'un job Ollama asynchrone arrive plus tard : même bornage et même contrôle de qualité
+        // (une exception fait échouer le job, la page affiche alors le message au lieu d'une analyse hors sujet).
+        pendingRemediationPolicies.put(cacheKey, r -> {
+            FindingAiRemediationResponse p = policy.apply(r);
+            String problem = qualityProblem(p, findingContextBlock, evidence);
+            if (problem != null) {
+                log.warn("[AI] Réponse Ollama rejetée ({}) — model={}", problem, ollamaModel);
+                throw new IllegalStateException(rejectionMessage(problem, "ollama", ollamaModel));
+            }
+            return p;
+        });
         try {
             AiCallResult r = callAiProviderWithFallbackResult(
                     provider, prompt, "finding_remediation", REMEDIATION_SCHEMA, groqModelChoice, cacheKey);
@@ -958,6 +971,12 @@ public class AiAnalysisService {
             log.info("[AI] Remédiation OK — provider={} model={} fallback={}",
                     r.providerUsed(), r.modelUsed(), r.quotaFallbackUsed());
             FindingAiRemediationResponse out = policy.apply(parseFindingRemediationResponse(r.text()));
+            String problem = qualityProblem(out, findingContextBlock, evidence);
+            if (problem != null) {
+                // Réponse hors sujet (revue de code générale, anglais…) : ni affichée ni mise en cache.
+                log.warn("[AI] Réponse rejetée ({}) — provider={} model={}", problem, r.providerUsed(), r.modelUsed());
+                return rejectedRemediation(problem, r.providerUsed(), r.modelUsed());
+            }
             out = out.toBuilder()
                     .aiProviderUsed(r.providerUsed())
                     .aiModelUsed(r.modelUsed())
@@ -966,7 +985,8 @@ public class AiAnalysisService {
                     .responseSource(r.providerUsed() != null ? r.providerUsed().toUpperCase(Locale.ROOT) : null)
                     .status("COMPLETE")
                     .build();
-            if (remediationCacheEnabled) {
+            // Un modèle de secours (quota) n'est pas mis en cache : la prochaine ouverture retentera le modèle principal.
+            if (remediationCacheEnabled && !r.quotaFallbackUsed()) {
                 remediationCacheService.put(cacheKey, out, out.getResponseSource(), r.providerUsed(), r.modelUsed());
             }
             return out;
@@ -1101,16 +1121,27 @@ public class AiAnalysisService {
             Stack du projet testé : le bloc PIPELINE_CONTEXT (s'il est présent) contient des fichiers réellement lus par le dernier pipeline (requirements.txt, package.json, Dockerfile…). Utilise-le pour adapter commandes et exemples (pip vs npm vs mvn…), en le présentant comme « lu dans le dépôt », jamais comme une certitude sur le fichier responsable. Si un indice contredit filePath ou packageName du finding, privilégie les faits du finding.
             """;
 
+    /** Version courte du contexte plateforme pour le DAST (les règles SRI / pipeline ne s'y appliquent pas). */
+    private static final String REMEDIATION_DAST_AUDIENCE = """
+            Contexte plateforme : le développeur lit ce finding dans EnviroTest. Il peut modifier le dépôt de ses services, pousser, redéployer et relancer l'analyse depuis la plateforme. Il ne modifie ni les pipelines CI/CD, ni l'Ingress, ni Cloudflare (réservés à l'administrateur de la plateforme).
+            """;
+
     /** Règles propres aux findings DAST (OWASP ZAP), y compris l'architecture d'exposition EnviroTest. */
     private static final String REMEDIATION_DAST_RULES = """
             RÈGLES DAST (OWASP ZAP) — ce finding vient d'un test dynamique :
             - ZAP a testé l'application DÉPLOYÉE à travers son URL. Il ne connaît ni le dépôt, ni le framework, ni le fichier responsable : ne lui attribue jamais ces informations.
             - Sur EnviroTest, la réponse traverse : Cloudflare (TLS public) → Ingress Traefik généré par la plateforme (routage seul, hors du dépôt, non modifiable par le développeur) → conteneur de l'application. Un en-tête de réponse peut donc être posé par l'application elle-même (correction dans le dépôt, relayée telle quelle) ; au niveau Ingress ou Cloudflare, c'est une option à demander à l'administrateur de la plateforme.
             - Compare le constat ZAP et [CONTROLE_PLATEFORME] : si l'élément manquant est désormais présent, dis-le (finding peut-être déjà corrigé, à re-scanner) ; si le contrôle signale un environnement arrêté ou injoignable, ne t'appuie pas dessus.
-            - Si [DEPOT] fournit un fichier de l'application, cherche-y la configuration existante (middlewares, en-têtes, CORS…) et cite ce qui y est réellement écrit, avec le numéro de ligne. Sinon, la localisation exacte reste à confirmer.
+            - Raisonne sur le service indiqué par « Service qui a répondu » : c'est lui qui a produit la réponse observée par ZAP, même si DefectDojo range le finding sous un autre service.
+            - fixLayers : recommended=true va au niveau APPLICATION (le dépôt du service, que le développeur modifie). REVERSE_PROXY (Ingress Traefik) et CDN_TLS (Cloudflare) restent des options « à demander à l'administrateur de la plateforme », jamais recommandées.
+            - Si une dépendance appelle un service externe (ex. @supabase/supabase-js → API Supabase), la politique proposée doit l'autoriser (connect-src…) : sinon elle casse l'application.
+            - Les constats [DEPOT] (« aucune mention de … ») portent uniquement sur les fichiers lus : formule la cause ainsi — « Cause probable : aucune configuration X n'apparaît dans <fichier> ; l'absence dans l'application complète n'est pas confirmée ; reste à vérifier l'Ingress / Cloudflare ». Si l'en-tête y est mentionné, cite la ligne.
+            - Le fichier joint sert UNIQUEMENT à trouver la configuration HTTP liée à CE finding. N'évalue JAMAIS la qualité générale du code (structure, ORM, base de données, routes, injection de dépendances, gestion d'erreurs) et ne cite pas une configuration sans rapport (ex. CORS pour un finding CSP).
+            - Si le service est lancé par un serveur de DÉVELOPPEMENT (vite, npm run dev, react-scripts start…), dis-le : c'est la cause de fond ; en production on sert le build statique avec un serveur web (nginx…), où se pose l'en-tête.
+            - remediationSteps ne contient que des actions liées à CE finding (jamais « installer les dépendances », « mettre à jour les paquets » ou un contrôle CORS pour un en-tête CSP).
             Cas particuliers :
             - HSTS (Strict-Transport-Security) : n'a d'effet qu'en HTTPS ; ici TLS est terminé par Cloudflare. Niveaux possibles : CDN_TLS (réglage HSTS de Cloudflare), REVERSE_PROXY (middleware Traefik), APPLICATION (en-tête posé par l'application et relayé). Valeur : max-age=31536000 ; includeSubDomains seulement si tous les sous-domaines sont en HTTPS ; jamais preload par défaut.
-            - CSP (Content-Security-Policy) : n'impose pas une politique stricte à l'aveugle. Pars des ressources réellement chargées par l'application (si elles sont inconnues, dis-le), commence par Content-Security-Policy-Report-Only, observe les violations, puis passe en mode bloquant. Si une CSP existe déjà, complète-la au lieu de la remplacer.
+            - CSP (Content-Security-Policy) : n'impose pas une politique stricte à l'aveugle. Démarche attendue dans remediationSteps : (1) déterminer si la réponse est une page HTML (SPA, Swagger /docs…) ou seulement du JSON d'API ; (2) identifier le composant qui renvoie cette réponse (service, serveur web) ; (3) vérifier si une CSP y existe déjà ; (4) sinon définir une politique adaptée aux ressources réellement chargées (scripts, styles, polices, images, API appelées — ex. un client Supabase impose son URL dans connect-src) ; pour une API JSON seule, « default-src 'none'; frame-ancestors 'none' » suffit ; (5) la tester d'abord en Content-Security-Policy-Report-Only ; (6) l'appliquer, redéployer et relancer ZAP. Si une CSP existe déjà, complète-la au lieu de la remplacer.
             - CORS (Cross-Domain Misconfiguration) : lis Access-Control-Allow-Origin et Access-Control-Allow-Credentials observés (le contrôle envoie une Origin externe). « * » sans credentials sur des ressources publiques n'est pas exploitable en soi ; c'est grave si l'origine est reflétée avec credentials=true ou si des données privées sont servies. N'affirme jamais « wildcard » ou « réflexion d'origine » sans l'avoir observé.
             - Anti-clickjacking : vérifie d'abord si une CSP existe. Privilégie frame-ancestors AJOUTÉ à la CSP existante (sans écraser ses autres directives) et/ou X-Frame-Options DENY ou SAMEORIGIN. Si frame-ancestors est déjà présent, le finding est probablement résolu ou concerne une autre URL.
             - En-têtes informatifs (Server, X-Powered-By, Cache-Control…) : sévérité faible, ne pas dramatiser.
@@ -1127,6 +1158,8 @@ public class AiAnalysisService {
             - rootCauseStatus / locationStatus = CONFIRMED uniquement si un élément [DEPOT], [CONTROLE_PLATEFORME] ou le fichier:ligne du scanner l'établit directement ; PROBABLE si c'est une déduction cohérente avec ces éléments (ex. technologie lue dans requirements.txt mais configuration non lue) ; UNDETERMINED sinon.
             - location : où agir. Si c'est inconnu, écris-le (« Fichier responsable non identifié : … à vérifier »). N'invente jamais un chemin, un fichier, un framework ou une version.
             - fixLayers : les niveaux où la correction est possible (APPLICATION, REVERSE_PROXY, CDN_TLS, KUBERNETES, WEB_SERVER, BUILD, DEPENDENCY, OTHER), une phrase chacun avec ce qui reste à vérifier. recommended=true pour UN seul niveau : celui que le développeur peut réellement modifier ou le plus pertinent. Un seul élément si un seul niveau est pertinent (ex. faille dans le code : APPLICATION).
+
+            CHAMPS JSON, TOUS OBLIGATOIRES, dans cet ordre : problemSummary, diagnosis, rootCause, rootCauseStatus, location, locationStatus, fixLayers, impact, remediationSteps, suggestedPatch, patchLanguage, patchTarget, verificationCommands, verificationHints, bestPractices, references, confidence.
 
             CONTENU (sans répétition entre les champs) :
             - problemSummary : 1 à 3 phrases sur CETTE application (URL, fichier, composant). Pas de définition générique recopiée du scanner.
@@ -1171,11 +1204,16 @@ public class AiAnalysisService {
             playbooksBlock = playbooksBlock.substring(0, playbookMax) + "\n[...playbooks tronqués]";
         }
 
-        String pipelineCtx = compact
+        // DAST : le contexte pipeline décrit le service sous lequel DefectDojo range le finding. Si un autre
+        // service a répondu, il décrirait la mauvaise application ; si le dépôt du bon service a été lu, il est redondant.
+        boolean skipPipelineCtx = !ev.pipelineContextRelevant() || (ev.dynamicFinding() && ev.repositoryCode());
+        String pipelineCtx = skipPipelineCtx
+                ? ""
+                : compact
                 ? truncateField(pipelineKnowledgeService.getPipelineContextBlock(applicationId, branch), 1_800)
                 : pipelineKnowledgeService.getPipelineContextBlock(applicationId, branch);
         String appDocsBlock = "";
-        if (!compact) {
+        if (!compact && ev.pipelineContextRelevant()) {
             List<String> appDocs = pipelineKnowledgeService.retrieveAppDocs(applicationId, branch, findingContext, 1);
             appDocsBlock = appDocs.isEmpty() ? ""
                     : "\nDocuments spécifiques au projet analysé :\n" + String.join("\n---\n", appDocs) + "\n";
@@ -1237,7 +1275,8 @@ public class AiAnalysisService {
                 """.formatted(
                 RESPONSE_LANGUAGE_FR,
                 compact ? "(Mode compact — réponse concise en français, pas de verbosité.)" : "",
-                REMEDIATION_PLATFORM_AUDIENCE, secretRules,
+                ev.dynamicFinding() ? REMEDIATION_DAST_AUDIENCE : REMEDIATION_PLATFORM_AUDIENCE,
+                ev.dynamicFinding() && !secretOrCredentialFinding ? "" : secretRules,
                 ev.dynamicFinding() ? REMEDIATION_DAST_RULES : "",
                 pipelineCtx, appDocsBlock, playbooksBlock,
                 REMEDIATION_OUTPUT_RULES, findingContext, snippetSection);
@@ -1307,6 +1346,35 @@ public class AiAnalysisService {
     private static final Set<String> DIAGNOSIS_SOURCES = Set.of("SCANNER", "PLATFORM_CHECK", "REPOSITORY", "HYPOTHESIS");
     private static final Set<String> FIX_LAYERS = Set.of(
             "APPLICATION", "REVERSE_PROXY", "CDN_TLS", "KUBERNETES", "WEB_SERVER", "BUILD", "DEPENDENCY", "OTHER");
+
+    /**
+     * Liste de textes : accepte aussi les objets que certains modèles renvoient à la place des chaînes
+     * (« {"step": "…"} ») en prenant leur premier champ texte. Retire la numérotation « 1. » ajoutée par le modèle.
+     */
+    static List<String> readTextItems(JsonNode arr) {
+        List<String> out = new ArrayList<>();
+        if (arr == null || !arr.isArray()) {
+            return out;
+        }
+        for (JsonNode n : arr) {
+            String text = null;
+            if (n.isTextual()) {
+                text = n.asText();
+            } else if (n.isObject()) {
+                for (java.util.Iterator<JsonNode> it = n.elements(); it.hasNext(); ) {
+                    JsonNode v = it.next();
+                    if (v.isTextual() && !v.asText().isBlank()) {
+                        text = v.asText();
+                        break;
+                    }
+                }
+            }
+            if (text != null && !text.isBlank()) {
+                out.add(text.trim().replaceFirst("^\\d{1,2}[.)]\\s+", ""));
+            }
+        }
+        return out;
+    }
 
     private static List<FindingAiRemediationResponse.DiagnosisItem> readDiagnosis(JsonNode arr) {
         List<FindingAiRemediationResponse.DiagnosisItem> out = new ArrayList<>();
@@ -1409,6 +1477,7 @@ public class AiAnalysisService {
 
         String patch = r.getSuggestedPatch();
         if ("UNDETERMINED".equals(rootStatus) && "UNDETERMINED".equals(locStatus)) patch = "";
+        if (patch != null && !patch.isBlank() && !looksLikeCode(patch)) patch = "";
 
         List<String> commands = r.getVerificationCommands();
         if (e.dynamicFinding()) {
@@ -1452,6 +1521,100 @@ public class AiAnalysisService {
             case "PROBABLE" -> "probable";
             default -> "non déterminée";
         };
+    }
+
+    // ── Contrôle de qualité de la réponse ────────────────────────────────────────────────────
+
+    /**
+     * Raison de rejeter une réponse, ou null si elle est exploitable. Vise les dérives observées avec
+     * les petits modèles de secours : revue générale du code sans rapport avec le finding, réponse en anglais.
+     */
+    static String qualityProblem(FindingAiRemediationResponse r, String findingContext, RemediationEvidence ev) {
+        if (r == null) return "réponse vide";
+        String summary = r.getProblemSummary() == null ? "" : r.getProblemSummary();
+        String cause = r.getRootCause() == null ? "" : r.getRootCause();
+        List<String> steps = r.getRemediationSteps() == null ? List.of() : r.getRemediationSteps();
+        if (summary.isBlank() && steps.isEmpty()) return "réponse vide ou illisible";
+        String text = summary + " " + cause + " " + String.join(" ", steps);
+        if (looksEnglish(text)) return "réponse rédigée en anglais";
+        if (ev != null && ev.dynamicFinding()) {
+            List<String> terms = relevanceTerms(findingContext);
+            String norm = normalizeDashes(text).toLowerCase(Locale.ROOT);
+            if (!terms.isEmpty() && terms.stream().noneMatch(norm::contains)) {
+                return "réponse sans rapport avec le finding";
+            }
+        }
+        return null;
+    }
+
+    /** Termes dont au moins un doit apparaître dans une réponse sur ce finding DAST. */
+    static List<String> relevanceTerms(String findingContext) {
+        String ctx = findingContext != null ? findingContext : "";
+        Matcher rule = CTX_ZAP_RULE.matcher(ctx);
+        Matcher titleM = CTX_TITLE.matcher(ctx);
+        String id = rule.find() ? rule.group(1) : "";
+        String title = titleM.find() ? titleM.group(1).toLowerCase(Locale.ROOT) : "";
+        if (id.equals("10038") || id.equals("10055") || title.contains("content security policy")) {
+            return List.of("csp", "content-security-policy", "content security policy");
+        }
+        if (id.equals("10035") || title.contains("strict-transport")) return List.of("hsts", "strict-transport");
+        if (id.equals("10020") || title.contains("clickjacking")) return List.of("frame", "clickjacking");
+        if (id.equals("10021") || title.contains("x-content-type")) return List.of("x-content-type", "nosniff");
+        if (id.equals("10063") || title.contains("permissions policy")) return List.of("permissions-policy", "permissions policy");
+        if (id.equals("90004") || title.contains("cross-origin-")) return List.of("cross-origin");
+        if (id.equals("10098") || title.contains("cross-domain")) return List.of("cors", "access-control", "cross-domain", "origine");
+        if (title.contains("cookie")) return List.of("cookie");
+        if (title.contains("cache")) return List.of("cache");
+        return List.of();
+    }
+
+    private static String normalizeDashes(String s) {
+        return s.replaceAll("[\\u2010-\\u2015\\u00AD\\u2212]", "-");
+    }
+
+    static boolean looksEnglish(String text) {
+        String t = " " + text.toLowerCase(Locale.ROOT).replaceAll("[^a-zàâäçéèêëîïôöûùüÿœ']+", " ") + " ";
+        int en = countWords(t, " the ", " is ", " and ", " of ", " to ", " that ", " with ", " this ", " are ", " be ");
+        int fr = countWords(t, " le ", " la ", " les ", " est ", " des ", " une ", " pour ", " dans ", " que ", " du ", " et ");
+        return en >= 5 && en > fr * 2;
+    }
+
+    private static int countWords(String text, String... words) {
+        int n = 0;
+        for (String w : words) {
+            int i = text.indexOf(w);
+            while (i >= 0) {
+                n++;
+                i = text.indexOf(w, i + w.length() - 1);
+            }
+        }
+        return n;
+    }
+
+    /** Un « correctif » rédigé comme une phrase n'est pas du code : il n'est pas affiché en bloc de code. */
+    static boolean looksLikeCode(String patch) {
+        if (patch == null || patch.isBlank()) return false;
+        if (patch.trim().contains("\n")) return true;
+        long symbols = patch.chars().filter(ch -> "(){}[]=;:<>$|`\"'#/".indexOf(ch) >= 0).count();
+        return symbols >= 3;
+    }
+
+    private static String rejectionMessage(String problem, String provider, String model) {
+        String who = model != null && !model.isBlank() ? model : (provider != null ? provider : "le modèle");
+        boolean local = "ollama".equalsIgnoreCase(provider);
+        return "L'analyse produite par " + who + " a été écartée (" + problem + "). "
+                + (local
+                ? "Les modèles cloud sont momentanément saturés et le modèle local de secours n'est pas assez précis pour ce finding : réessayez dans une minute."
+                : "Relancez l'analyse dans quelques instants.");
+    }
+
+    private static FindingAiRemediationResponse rejectedRemediation(String problem, String provider, String model) {
+        return FindingAiRemediationResponse.builder()
+                .status("FAILED")
+                .problemSummary(rejectionMessage(problem, provider, model))
+                .aiProviderUsed(provider)
+                .aiModelUsed(model)
+                .build();
     }
 
     private static final Pattern CTX_ZAP_URLS = Pattern.compile("(?m)^\\[SCANNER\\] URL testées par ZAP: (.+)$");
@@ -1520,34 +1683,10 @@ public class AiAnalysisService {
         String toParse = extractJsonFromResponse(jsonText);
         try {
             JsonNode root = objectMapper.readTree(toParse);
-            List<String> steps = new ArrayList<>();
-            JsonNode arr = root.path("remediationSteps");
-            if (arr.isArray()) {
-                for (JsonNode s : arr) {
-                    if (s.isTextual()) steps.add(s.asText());
-                }
-            }
-            List<String> hints = new ArrayList<>();
-            JsonNode h = root.path("verificationHints");
-            if (h.isArray()) {
-                for (JsonNode x : h) {
-                    if (x.isTextual()) hints.add(x.asText());
-                }
-            }
-            List<String> verifyCmds = new ArrayList<>();
-            JsonNode vc = root.path("verificationCommands");
-            if (vc.isArray()) {
-                for (JsonNode x : vc) {
-                    if (x.isTextual()) verifyCmds.add(x.asText());
-                }
-            }
-            List<String> bestPractices = new ArrayList<>();
-            JsonNode bp = root.path("bestPractices");
-            if (bp.isArray()) {
-                for (JsonNode x : bp) {
-                    if (x.isTextual()) bestPractices.add(x.asText());
-                }
-            }
+            List<String> steps = readTextItems(root.path("remediationSteps"));
+            List<String> hints = readTextItems(root.path("verificationHints"));
+            List<String> verifyCmds = readTextItems(root.path("verificationCommands"));
+            List<String> bestPractices = readTextItems(root.path("bestPractices"));
             List<ReferenceItem> references = new ArrayList<>();
             JsonNode refs = root.path("references");
             if (refs.isArray()) {
@@ -2005,17 +2144,15 @@ public class AiAnalysisService {
         if (policy != null) {
             out = policy.apply(out);
         }
-        out = out.toBuilder()
+        // Pas de mise en cache : Ollama n'intervient qu'en secours (quota cloud) ; la prochaine ouverture
+        // retentera le modèle principal au lieu de resservir une analyse d'un petit modèle local.
+        return out.toBuilder()
                 .aiProviderUsed("ollama")
                 .aiModelUsed(ollamaModel)
                 .quotaFallbackUsed(true)
                 .responseSource("OLLAMA")
                 .status("COMPLETE")
                 .build();
-        if (remediationCacheEnabled) {
-            remediationCacheService.put(cacheKey, out, "OLLAMA", "ollama", ollamaModel);
-        }
-        return out;
     }
 
     private AiCallResult tryGroqQuotaFallbacksChat(List<java.util.Map<String, String>> messages) throws Exception {
@@ -2320,14 +2457,121 @@ public class AiAnalysisService {
             return callGroqOnce(prompt, model, schemaName, jsonSchema, strictSchema);
         } catch (HttpClientErrorException e) {
             // Groq a refusé la sortie structurée stricte (400 « does not match the expected schema »).
-            // Un seul réessai en json_object (sans schéma) : rapide, reste sur Groq, et corrige la
-            // plupart des cas. Si ce réessai échoue pour quota (429), le relais OpenRouter → Ollama
-            // prend le relais chez l'appelant.
             if (strictSchema && isGroqSchemaError(e)) {
+                // 1) La génération refusée est renvoyée dans l'erreur : souvent complète à quelques champs près.
+                //    La reprendre évite un 2e appel qui, sur l'offre gratuite (8 000 tokens/min), finit en 429.
+                String salvaged = salvageGroqFailedGeneration(e);
+                if (salvaged != null) {
+                    log.info("[AI] Groq : sortie hors schéma reprise (champs manquants laissés vides)");
+                    return salvaged;
+                }
+                // 2) Sinon un réessai en json_object, après la remise à zéro du quota si elle est proche.
                 log.warn("[AI] Groq schéma strict refusé (400) — réessai en json_object");
-                return callGroqOnce(prompt, model, schemaName, jsonSchema, false);
+                waitForGroqTokens(e, prompt);
+                return callGroqWithShortRetry(prompt, model, schemaName, jsonSchema, false);
+            }
+            if (jsonSchema != null && isGroqQuotaExceeded(e)) {
+                return retryGroqAfterShortWait(e, prompt, model, schemaName, jsonSchema, strictSchema);
             }
             throw e;
+        }
+    }
+
+    /** Délai maximal d'attente du quota Groq avant de passer aux modèles de secours. */
+    private static final long GROQ_MAX_WAIT_MS = 20_000;
+
+    private String callGroqWithShortRetry(String prompt, String model, String schemaName, String jsonSchema, boolean strict) {
+        try {
+            return callGroqOnce(prompt, model, schemaName, jsonSchema, strict);
+        } catch (HttpClientErrorException e) {
+            if (isGroqQuotaExceeded(e)) {
+                return retryGroqAfterShortWait(e, prompt, model, schemaName, jsonSchema, strict);
+            }
+            throw e;
+        }
+    }
+
+    /** 429 avec remise à zéro proche (quota de tokens/minute) : attendre puis réessayer une fois. */
+    private String retryGroqAfterShortWait(HttpClientErrorException e, String prompt, String model,
+                                           String schemaName, String jsonSchema, boolean strict) {
+        long waitMs = groqRetryAfterMs(e);
+        if (waitMs <= 0 || waitMs > GROQ_MAX_WAIT_MS) {
+            throw e;
+        }
+        log.info("[AI] Groq : quota de tokens/minute atteint — nouvel essai dans {} ms", waitMs);
+        sleepQuietly(waitMs + 300);
+        return callGroqOnce(prompt, model, schemaName, jsonSchema, strict);
+    }
+
+    /** Avant un 2e appel : si les tokens restants ne suffisent pas, attendre leur remise à zéro (≤ 20 s). */
+    private void waitForGroqTokens(HttpClientErrorException e, String prompt) {
+        HttpHeaders h = e.getResponseHeaders();
+        if (h == null) return;
+        try {
+            String remaining = h.getFirst("x-ratelimit-remaining-tokens");
+            long need = prompt.length() / 3L + 2_500;
+            if (remaining != null && Long.parseLong(remaining.trim()) >= need) return;
+            long reset = parseGroqDuration(h.getFirst("x-ratelimit-reset-tokens"));
+            if (reset > 0 && reset <= GROQ_MAX_WAIT_MS) {
+                log.info("[AI] Groq : {} tokens restants, attente de {} ms avant le réessai", remaining, reset);
+                sleepQuietly(reset + 300);
+            }
+        } catch (NumberFormatException ignored) {
+            // en-têtes absents ou inattendus : réessai immédiat
+        }
+    }
+
+    private long groqRetryAfterMs(HttpClientErrorException e) {
+        HttpHeaders h = e.getResponseHeaders();
+        if (h != null) {
+            String retryAfter = h.getFirst("retry-after");
+            if (retryAfter != null) {
+                try {
+                    return (long) (Double.parseDouble(retryAfter.trim()) * 1000);
+                } catch (NumberFormatException ignored) {
+                    // format inattendu
+                }
+            }
+            long reset = parseGroqDuration(h.getFirst("x-ratelimit-reset-tokens"));
+            if (reset > 0) return reset;
+        }
+        Matcher m = Pattern.compile("try again in ([0-9.]+m?s)").matcher(String.valueOf(e.getResponseBodyAsString()));
+        return m.find() ? parseGroqDuration(m.group(1)) : -1;
+    }
+
+    /** « 5.692s », « 1m26.4s », « 450ms » → millisecondes (-1 si illisible). */
+    static long parseGroqDuration(String s) {
+        if (s == null || s.isBlank()) return -1;
+        Matcher m = Pattern.compile("(?:(\\d+)m(?!s))?(?:([0-9.]+)s)?(?:([0-9.]+)ms)?").matcher(s.trim());
+        if (!m.matches()) return -1;
+        double ms = 0;
+        if (m.group(1) != null) ms += Long.parseLong(m.group(1)) * 60_000d;
+        if (m.group(2) != null) ms += Double.parseDouble(m.group(2)) * 1000d;
+        if (m.group(3) != null) ms += Double.parseDouble(m.group(3));
+        return ms > 0 ? (long) ms : -1;
+    }
+
+    private static void sleepQuietly(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /** JSON refusé par la validation stricte de Groq, réutilisable s'il contient l'essentiel. */
+    private String salvageGroqFailedGeneration(HttpClientErrorException e) {
+        try {
+            JsonNode root = objectMapper.readTree(e.getResponseBodyAsString());
+            String generated = root.path("error").path("failed_generation").asText(null);
+            if (generated == null || generated.isBlank()) return null;
+            String json = extractJsonFromResponse(generated);
+            JsonNode parsed = objectMapper.readTree(json);
+            boolean usable = !parsed.path("problemSummary").asText("").isBlank()
+                    && parsed.path("remediationSteps").isArray() && parsed.path("remediationSteps").size() > 0;
+            return usable ? json : null;
+        } catch (Exception ex) {
+            return null;
         }
     }
 

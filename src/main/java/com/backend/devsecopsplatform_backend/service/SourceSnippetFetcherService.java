@@ -157,6 +157,103 @@ public class SourceSnippetFetcherService {
         }
     }
 
+    /**
+     * Contenu COMPLET d'un fichier du dépôt (sans numéros de ligne), pour les analyses qui doivent
+     * savoir si une configuration est absente d'un fichier entier. Dépôt GitHub public : lecture via
+     * raw.githubusercontent.com (hors quota de l'API GitHub, 60 appels/h sans jeton).
+     */
+    public Optional<String> tryFetchFullFile(AppService app, String branch, String filePath) {
+        if (app == null || filePath == null || filePath.isBlank()) {
+            return Optional.empty();
+        }
+        String normalized = normalizeRepoRelativePath(filePath);
+        String repoUrl = app.getGitRepositoryUrl();
+        String ref = (branch != null && !branch.isBlank()) ? branch.trim() : "main";
+        try {
+            if (isGitHubUrl(repoUrl)) {
+                Optional<String[]> gh = parseGithubOwnerRepo(repoUrl);
+                if (gh.isEmpty()) return Optional.empty();
+                String token = safeToken(() -> applicationService.getDecryptedGithubToken(app.getId()));
+                Optional<String> raw = fetchGithubRaw(gh.get()[0], gh.get()[1], normalized, ref);
+                if (raw.isPresent() || token.isBlank()) {
+                    return raw;
+                }
+                return fetchGithubFullViaApi(gh.get()[0], gh.get()[1], normalized, ref, token);
+            }
+            if (isSameGitLabHostAsConfig(repoUrl)) {
+                Optional<String> projectPath = parseGitLabProjectPath(repoUrl);
+                if (projectPath.isEmpty()) return Optional.empty();
+                RepositoryFile rf = gitLabApi.getRepositoryFileApi().getFile(projectPath.get(), normalized, ref);
+                if (rf == null) return Optional.empty();
+                String full = rf.getDecodedContentAsString();
+                return Optional.ofNullable(full);
+            }
+        } catch (Exception e) {
+            log.debug("Lecture complète échouée (app={}, path={}): {}", app.getId(), normalized, e.getMessage());
+        }
+        return Optional.empty();
+    }
+
+    /** Numérote un contenu complet comme les autres extraits (« 12| code »). */
+    public static String numberLines(String content, int maxLines) {
+        String[] lines = content.split("\r\n|\n|\r", -1);
+        int end = Math.min(lines.length, maxLines);
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < end; i++) {
+            sb.append(String.format("%5d| %s%n", i + 1, lines[i]));
+        }
+        if (lines.length > end) {
+            sb.append("   ...| [").append(lines.length - end).append(" lignes non affichées]\n");
+        }
+        return sb.toString();
+    }
+
+    private Optional<String> fetchGithubRaw(String owner, String repo, String filePath, String ref) {
+        String encodedPath = java.util.Arrays.stream(filePath.split("/"))
+                .map(s -> java.net.URLEncoder.encode(s, StandardCharsets.UTF_8).replace("+", "%20"))
+                .reduce((a, b) -> a + "/" + b)
+                .orElse("");
+        String url = "https://raw.githubusercontent.com/" + owner + "/" + repo + "/"
+                + java.net.URLEncoder.encode(ref, StandardCharsets.UTF_8) + "/" + encodedPath;
+        try {
+            RestTemplate rest = com.backend.devsecopsplatform_backend.configuration.HttpTimeouts.restTemplate(5_000, 15_000);
+            ResponseEntity<String> response = rest.exchange(url, HttpMethod.GET, HttpEntity.EMPTY, String.class);
+            String body = response.getBody();
+            if (body == null || body.length() > 400_000) return Optional.empty();
+            return Optional.of(body);
+        } catch (HttpStatusCodeException e) {
+            log.debug("raw.githubusercontent {} pour {}: {}", e.getStatusCode(), filePath, e.getMessage());
+            return Optional.empty();
+        } catch (Exception e) {
+            log.debug("raw.githubusercontent erreur {}: {}", filePath, e.getMessage());
+            return Optional.empty();
+        }
+    }
+
+    private Optional<String> fetchGithubFullViaApi(String owner, String repo, String filePath, String ref, String token) {
+        String encodedPath = java.util.Arrays.stream(filePath.split("/"))
+                .map(s -> java.net.URLEncoder.encode(s, StandardCharsets.UTF_8))
+                .reduce((a, b) -> a + "/" + b)
+                .orElse("");
+        String url = "https://api.github.com/repos/" + owner + "/" + repo + "/contents/" + encodedPath
+                + "?ref=" + java.net.URLEncoder.encode(ref, StandardCharsets.UTF_8);
+        try {
+            RestTemplate rest = com.backend.devsecopsplatform_backend.configuration.HttpTimeouts.restTemplate(5_000, 15_000);
+            HttpHeaders headers = new HttpHeaders();
+            headers.setAccept(List.of(MediaType.parseMediaType("application/vnd.github+json")));
+            headers.setBearerAuth(token);
+            ResponseEntity<String> response = rest.exchange(url, HttpMethod.GET, new HttpEntity<>(headers), String.class);
+            if (response.getBody() == null) return Optional.empty();
+            JsonNode root = objectMapper.readTree(response.getBody());
+            String b64 = root.path("content").asText("").replaceAll("\\s", "");
+            if (b64.isEmpty()) return Optional.empty();
+            return Optional.of(new String(Base64.getDecoder().decode(b64), StandardCharsets.UTF_8));
+        } catch (Exception e) {
+            log.debug("GitHub API (fichier complet) {}: {}", filePath, e.getMessage());
+            return Optional.empty();
+        }
+    }
+
     /** Chemin DefectDojo typique d'un artefact dans l'image (pas dans le dépôt Git). */
     public static boolean isContainerFilesystemPath(String filePath) {
         if (filePath == null || filePath.isBlank()) {
@@ -265,6 +362,13 @@ public class SourceSnippetFetcherService {
 
     private Optional<String> fetchGithubFile(String owner, String repo, String filePath, String ref,
                                              Integer lineStart, Integer lineEnd, String token) {
+        if (token == null || token.isBlank()) {
+            // Dépôt public sans jeton : raw.githubusercontent.com n'entame pas le quota de l'API (60 appels/h).
+            Optional<String> raw = fetchGithubRaw(owner, repo, filePath, ref);
+            if (raw.isPresent()) {
+                return Optional.of(windowAroundLines(raw.get(), lineStart, lineEnd));
+            }
+        }
         String encodedPath = java.util.Arrays.stream(filePath.split("/"))
                 .map(s -> java.net.URLEncoder.encode(s, StandardCharsets.UTF_8))
                 .reduce((a, b) -> a + "/" + b)

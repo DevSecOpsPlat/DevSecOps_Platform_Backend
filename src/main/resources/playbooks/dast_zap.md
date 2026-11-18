@@ -40,7 +40,11 @@ add_header X-Content-Type-Options "nosniff" always;
 
 ### Cas particuliers
 - **HSTS** : n'a d'effet qu'en HTTPS. `max-age=31536000` ; `includeSubDomains` seulement si tous les sous-domaines sont en HTTPS ; jamais `preload` par défaut. Sur EnviroTest, TLS est terminé par Cloudflare : HSTS peut être posé par Cloudflare (administrateur) ou par l'application.
-- **CSP** : partir des ressources réellement chargées (scripts, styles, polices, API, images). Commencer par `Content-Security-Policy-Report-Only`, observer les violations, puis passer en mode bloquant. Une CSP stricte posée d'un coup casse souvent les scripts/styles inline d'une SPA. Si une CSP existe déjà, la compléter.
+- **CSP** : d'abord savoir QUI répond et QUOI (page HTML d'une SPA, Swagger `/docs`, ou JSON d'API).
+  1. API JSON seule : `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'` suffit.
+  2. Page HTML : partir des ressources réellement chargées (scripts, styles, polices, images, API appelées — un client Supabase ou Firebase impose son URL dans `connect-src` ; Swagger UI de FastAPI charge ses scripts depuis `cdn.jsdelivr.net`).
+  3. Commencer par `Content-Security-Policy-Report-Only`, observer les violations, puis passer en mode bloquant. Une CSP stricte posée d'un coup casse souvent les scripts/styles inline d'une SPA. Si une CSP existe déjà, la compléter.
+- **Serveur de développement exposé** (`vite`, `npm run dev`, `react-scripts start`) : c'est la cause de fond des en-têtes manquants. En production : `vite build`, puis servir `dist/` avec nginx (`add_header Content-Security-Policy … always;`). `server.headers` dans `vite.config.ts` ne s'applique qu'au serveur de développement.
 - **CORS** (Cross-Domain Misconfiguration) : regarder `Access-Control-Allow-Origin` et `Access-Control-Allow-Credentials` réellement renvoyés. `*` sans credentials sur des ressources publiques n'est pas exploitable en soi ; c'est grave si l'origine est reflétée avec `credentials: true` ou si des données privées sont servies.
 - **Anti-clickjacking** : si une CSP existe, ajouter `frame-ancestors 'none'` (ou `'self'`) à cette CSP sans écraser ses autres directives ; `X-Frame-Options: DENY` en complément pour les anciens navigateurs.
 - **Cookies** (Secure / HttpOnly / SameSite) : configuration de session de l'application.

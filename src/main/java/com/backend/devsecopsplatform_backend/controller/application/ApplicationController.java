@@ -44,7 +44,7 @@ public class ApplicationController {
     public ResponseEntity<ApplicationResponse> createApplication(
             @Valid @RequestBody CreateApplicationRequest request) {
 
-        log.info("📥 Création application: {}", request.getName());
+        log.info(" Création application: {}", request.getName());
 
         try {
             ApplicationResponse response = applicationService.createApplication(request);
