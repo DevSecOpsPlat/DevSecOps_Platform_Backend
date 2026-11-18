@@ -1,5 +1,7 @@
 package com.backend.devsecopsplatform_backend.controller.user;
 
+import com.backend.devsecopsplatform_backend.configuration.DisplayTime;
+
 import com.backend.devsecopsplatform_backend.configuration.JwtUtils;
 import com.backend.devsecopsplatform_backend.entity.AuditAction;
 import com.backend.devsecopsplatform_backend.entity.TwoFactorMethod;
@@ -209,16 +211,24 @@ public class AuthController {
 
         PendingLogin pending = pendingOpt.get();
         User user = userRepository.findOneById(pending.userId()).orElse(null);
-        if (user == null || !user.isTwoFactorEnabled() || user.getTwoFactorMethod() != TwoFactorMethod.EMAIL) {
+        if (user == null || !user.isTwoFactorEnabled()) {
             return ResponseEntity.badRequest().body(Map.of("message", "Renvoi de code non disponible."));
         }
 
+        // Méthode application : l'utilisateur peut recevoir à la place un code à l'e-mail du compte
+        // (téléphone indisponible). Le mot de passe a déjà été vérifié pour obtenir pendingLoginId.
+        boolean fallbackFromApp = user.getTwoFactorMethod() != TwoFactorMethod.EMAIL;
         EmailSendResult sent = twoFactorAuthService.sendLoginEmailCode(user, body.pendingLoginId(), pendingLoginService);
         if (!sent.sent()) {
             return ResponseEntity.badRequest().body(Map.of("message", sent.detail(), "emailSent", false));
         }
+        if (fallbackFromApp) {
+            log.info("Code de connexion envoyé par e-mail à la place de l'application pour {}", user.getUsername());
+        }
         return ResponseEntity.ok(Map.of(
-                "message", "Un nouveau code a été envoyé à votre adresse e-mail de compte.",
+                "message", fallbackFromApp
+                        ? "Un code a été envoyé à l'adresse e-mail de votre compte. Saisissez-le à la place du code de l'application."
+                        : "Un nouveau code a été envoyé à votre adresse e-mail de compte.",
                 "emailSent", true
         ));
     }
@@ -279,10 +289,10 @@ public class AuthController {
         body.put("message", String.format(
                 "Compte verrouillé pendant %d minutes après 3 tentatives incorrectes. Réessayez à partir du %s.",
                 LoginAuditService.LOCKOUT_MINUTES,
-                until != null ? until.format(LOCK_FMT) : "—"
+                DisplayTime.format(until, LOCK_FMT)
         ));
         body.put("accountLocked", true);
-        body.put("lockedUntil", until != null ? until.toString() : null);
+        body.put("lockedUntil", DisplayTime.iso(until));
         body.put("minutesRemaining", minutesLeft);
         body.put("remainingAttempts", 0);
         return ResponseEntity.status(HttpStatus.LOCKED).body(body);

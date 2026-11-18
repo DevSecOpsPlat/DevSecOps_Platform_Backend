@@ -1,5 +1,7 @@
 package com.backend.devsecopsplatform_backend.service.auth;
 
+import com.backend.devsecopsplatform_backend.configuration.DisplayTime;
+
 import com.backend.devsecopsplatform_backend.controller.user.TwoFactorSetupResponse;
 import com.backend.devsecopsplatform_backend.entity.AuditAction;
 import com.backend.devsecopsplatform_backend.entity.TwoFactorMethod;
@@ -49,7 +51,7 @@ public class TwoFactorAuthService {
                 "mandatory", true,
                 "method", method != null ? method.name() : "",
                 "accountEmail", user.getEmail() != null ? user.getEmail() : "",
-                "enabledAt", user.getTotpEnabledAt() != null ? user.getTotpEnabledAt().toString() : ""
+                "enabledAt", user.getTotpEnabledAt() != null ? DisplayTime.iso(user.getTotpEnabledAt()) : ""
         );
     }
 
@@ -136,6 +138,11 @@ public class TwoFactorAuthService {
                 return false;
             }
             return emailOtpFromPending.equals(code.replaceAll("\\s", ""));
+        }
+        // Méthode application : un code e-mail n'existe que si l'utilisateur l'a demandé à la place
+        // (téléphone indisponible) ; il est envoyé à l'adresse du compte et ne vaut que pour cette connexion.
+        if (emailOtpFromPending != null && code != null && emailOtpFromPending.equals(code.replaceAll("\\s", ""))) {
+            return true;
         }
         return totpService.verifyEncryptedSecret(user.getTotpSecretEncrypted(), code);
     }

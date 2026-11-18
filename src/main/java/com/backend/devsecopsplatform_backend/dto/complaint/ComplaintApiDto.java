@@ -1,5 +1,7 @@
 package com.backend.devsecopsplatform_backend.dto.complaint;
 
+import com.backend.devsecopsplatform_backend.configuration.DisplayTime;
+
 import com.backend.devsecopsplatform_backend.entity.Complaint;
 import com.backend.devsecopsplatform_backend.entity.ComplaintMessage;
 
@@ -30,7 +32,7 @@ public final class ComplaintApiDto {
                         m.getAuthor() != null ? m.getAuthor().getUsername() : null,
                         m.getAuthor() != null && m.getAuthor().isAdmin(),
                         m.getBody(),
-                        m.getCreatedAt() != null ? m.getCreatedAt().toString() : null
+                        DisplayTime.iso(m.getCreatedAt())
                 ))
                 .toList();
         return new ThreadDto(
@@ -39,8 +41,8 @@ public final class ComplaintApiDto {
                 c.getAuthor() != null ? c.getAuthor().getEmail() : null,
                 c.getSubject(),
                 c.getStatus() != null ? c.getStatus().name() : null,
-                c.getCreatedAt() != null ? c.getCreatedAt().toString() : null,
-                c.getUpdatedAt() != null ? c.getUpdatedAt().toString() : null,
+                DisplayTime.iso(c.getCreatedAt()),
+                DisplayTime.iso(c.getUpdatedAt()),
                 messages
         );
     }

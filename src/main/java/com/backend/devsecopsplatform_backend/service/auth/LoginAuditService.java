@@ -1,5 +1,7 @@
 package com.backend.devsecopsplatform_backend.service.auth;
 
+import com.backend.devsecopsplatform_backend.configuration.DisplayTime;
+
 import com.backend.devsecopsplatform_backend.entity.AlertType;
 import com.backend.devsecopsplatform_backend.entity.AuditAction;
 import com.backend.devsecopsplatform_backend.entity.LoginAttempt;
@@ -94,7 +96,7 @@ public class LoginAuditService {
                     user.getUsername(),
                     user.getEmail(),
                     ip,
-                    lockedUntil.format(FMT)
+                    DisplayTime.format(lockedUntil, FMT)
             );
             securityEventService.createAlert(AlertType.ACCOUNT_LOCKED, message, user, ip);
             securityEventService.recordAudit(

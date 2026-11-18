@@ -1,5 +1,7 @@
 package com.backend.devsecopsplatform_backend.service.appmgmt;
 
+import com.backend.devsecopsplatform_backend.configuration.DisplayTime;
+
 import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
 import com.backend.devsecopsplatform_backend.entity.PipelineStatus;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.ScanBatch;
@@ -93,7 +95,7 @@ public class ScanBatchCompletionService {
         payload.put("expectedServiceCount", expected);
         payload.put("finishedServiceCount", finished);
         payload.put("gitlabTerminalStatus", gitlabStatusRaw);
-        payload.put("updatedAt", LocalDateTime.now().toString());
+        payload.put("updatedAt", DisplayTime.iso(LocalDateTime.now()));
 
         // Pipeline mort sans aucun résultat → échec technique global
         if (finished == 0 && (gl == PipelineStatus.FAILED || gl == PipelineStatus.CANCELED)) {
@@ -258,7 +260,7 @@ public class ScanBatchCompletionService {
                 ? new LinkedHashMap<>(batch.getVerdictPayloadJson())
                 : new LinkedHashMap<>();
         payload.put("reason", reason != null ? reason : "Échec technique");
-        payload.put("updatedAt", LocalDateTime.now().toString());
+        payload.put("updatedAt", DisplayTime.iso(LocalDateTime.now()));
         batch.setVerdictPayloadJson(payload);
         scanBatchRepository.save(batch);
 
@@ -294,7 +296,7 @@ public class ScanBatchCompletionService {
         payload.put("expectedServiceCount", expected);
         payload.put("createdExecutionCount", executions.size());
         payload.put("finishedServiceCount", finished);
-        payload.put("updatedAt", LocalDateTime.now().toString());
+        payload.put("updatedAt", DisplayTime.iso(LocalDateTime.now()));
 
         if (finished < expected) {
             // PARTIAL n'est posé que via onGitlabPipelineTerminal (pipeline GitLab fini).

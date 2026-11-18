@@ -41,6 +41,7 @@ import com.backend.devsecopsplatform_backend.util.UsernamePolicy;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -49,6 +50,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.EnumMap;
 import java.util.HashMap;
@@ -179,14 +181,13 @@ public class AdminUserService {
         String email = user.getEmail();
         UUID uid = user.getId();
 
-        cleanupFindingOccurrences(uid);
+        List<UUID> envIds = cleanupPipelineData(uid);
         loginAttemptRepository.deleteAll(loginAttemptRepository.findByUser(user));
         activityLogRepository.deleteAll(activityLogRepository.findByUserOrderByCreatedAtDesc(user));
         complaintRepository.deleteAll(complaintRepository.findByAuthorWithMessages(user));
 
-        // 1. Environnements d'abord (FK vers app_service)
-        List<EphemeralEnvironment> envs =
-                ephemeralEnvironmentRepository.findByRequestedByOrderByCreatedAtDesc(user);
+        // 1. Environnements d'abord (FK vers app_service) : ceux de l'utilisateur et ceux créés sur ses services
+        List<EphemeralEnvironment> envs = ephemeralEnvironmentRepository.findAllById(envIds);
         if (!envs.isEmpty()) {
             ephemeralEnvironmentRepository.deleteAll(envs);
         }
@@ -217,15 +218,81 @@ public class AdminUserService {
         log.info("Compte {} supprimé par {}", username, admin.getUsername());
     }
 
-    private void cleanupFindingOccurrences(UUID userId) {
-        jdbcTemplate.update("""
-                DELETE FROM finding_occurrences fo
-                WHERE fo.pipeline_execution_id IN (
-                    SELECT pe.id FROM pipeline_executions pe
-                    INNER JOIN ephemeral_environments e ON e.id = pe.environment_id
-                    WHERE e.requested_by = ?
-                )
-                """, userId);
+    /**
+     * Supprime en SQL, dans l'ordre des clés étrangères, ce que JPA ne supprime pas en cascade :
+     * <ul>
+     *   <li>les exécutions de pipeline SANS environnement (historique restauré, lots de scan) qui pointent
+     *       vers les services de l'utilisateur — elles bloquaient la suppression des services
+     *       (« pipeline_executions » → « app_service ») ;</li>
+     *   <li>les résultats rattachés aux exécutions (occurrences, scans, recommandations) ;</li>
+     *   <li>les lots de scan et les ressources cloud des environnements.</li>
+     * </ul>
+     * Les exécutions rattachées à un environnement sont supprimées ensuite par JPA avec l'environnement.
+     *
+     * @return identifiants des environnements à supprimer (ceux de l'utilisateur et ceux créés sur ses services)
+     */
+    private List<UUID> cleanupPipelineData(UUID userId) {
+        NamedParameterJdbcTemplate named = new NamedParameterJdbcTemplate(jdbcTemplate);
+        Map<String, Object> u = Map.of("u", userId);
+        List<UUID> services = named.queryForList("""
+                SELECT s.id FROM app_service s
+                WHERE s.created_by = :u
+                   OR s.managed_application_id IN (SELECT a.id FROM applications a WHERE a.created_by = :u)
+                """, u, UUID.class);
+        List<UUID> envs = named.queryForList(
+                "SELECT e.id FROM ephemeral_environments e WHERE e.requested_by = :u"
+                        + (services.isEmpty() ? "" : " OR e.app_service_id IN (:svc)"),
+                Map.of("u", userId, "svc", services.isEmpty() ? List.of(userId) : services), UUID.class);
+        List<UUID> batches = named.queryForList("""
+                SELECT b.id FROM scan_batches b
+                WHERE b.triggered_by = :u
+                   OR b.managed_application_id IN (SELECT a.id FROM applications a WHERE a.created_by = :u)
+                """, u, UUID.class);
+
+        List<UUID> executions = new ArrayList<>();
+        List<UUID> detached = new ArrayList<>();
+        if (!services.isEmpty() || !envs.isEmpty()) {
+            Map<String, Object> p = Map.of(
+                    "svc", services.isEmpty() ? List.of(userId) : services,
+                    "env", envs.isEmpty() ? List.of(userId) : envs);
+            named.query("""
+                    SELECT pe.id, pe.environment_id FROM pipeline_executions pe
+                    WHERE pe.app_service_id IN (:svc) OR pe.environment_id IN (:env)
+                    """, p, rs -> {
+                UUID id = rs.getObject("id", UUID.class);
+                executions.add(id);
+                if (rs.getObject("environment_id") == null) detached.add(id);
+            });
+        }
+        if (!executions.isEmpty()) {
+            Map<String, Object> p = Map.of("pe", executions);
+            List<UUID> scans = named.queryForList(
+                    "SELECT id FROM security_scans WHERE pipeline_execution_id IN (:pe)", p, UUID.class);
+            if (!scans.isEmpty()) {
+                Map<String, Object> s = Map.of("scans", scans);
+                named.update("DELETE FROM vulnerability_recommendations WHERE security_scan_id IN (:scans)", s);
+                named.update("DELETE FROM finding_occurrences WHERE security_scan_id IN (:scans)", s);
+            }
+            named.update("DELETE FROM finding_occurrences WHERE pipeline_execution_id IN (:pe)", p);
+            if (!scans.isEmpty()) {
+                named.update("DELETE FROM security_scans WHERE id IN (:scans)", Map.of("scans", scans));
+            }
+        }
+        if (!batches.isEmpty()) {
+            named.update("UPDATE pipeline_executions SET scan_batch_id = NULL WHERE scan_batch_id IN (:b)", Map.of("b", batches));
+        }
+        if (!detached.isEmpty()) {
+            named.update("DELETE FROM pipeline_executions WHERE id IN (:pe)", Map.of("pe", detached));
+        }
+        if (!batches.isEmpty()) {
+            named.update("DELETE FROM scan_batches WHERE id IN (:b)", Map.of("b", batches));
+        }
+        if (!envs.isEmpty()) {
+            named.update("DELETE FROM cloud_resources WHERE environment_id IN (:env)", Map.of("env", envs));
+        }
+        log.info("Suppression de compte {} : {} service(s), {} environnement(s), {} exécution(s) dont {} sans environnement, {} lot(s) de scan",
+                userId, services.size(), envs.size(), executions.size(), detached.size(), batches.size());
+        return envs;
     }
 
     /**
