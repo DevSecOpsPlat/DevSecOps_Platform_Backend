@@ -81,6 +81,7 @@ public class ApplicationManagementService {
     @Value("${deployment.preview.nip.master-ip:192.168.92.10}")
     private String ingressProbeIp;
 
+
     public ApplicationManagementService(
             ManagedApplicationRepository appRepository,
             AppServiceRepository serviceRepository,
@@ -181,10 +182,33 @@ public class ApplicationManagementService {
         // nettoyage explicite, delete() échoue en violation de contrainte FK dès qu'un service a
         // été déployé ou scanné au moins une fois. Ordre important : PipelineExecution avant
         // EphemeralEnvironment (PipelineExecution.environment_id la référence aussi).
+        // Namespaces encore présents dans le cluster : sans ce nettoyage, l'application supprimée
+        // continuait de tourner (pods, base, Ingress sur la même adresse que son remplaçant —
+        // constaté le 18/11/2026 avec env-eventpass-b2063036 et avant avec env-aoo-1-a41f7905).
+        List<String> namespaces = deploymentRepository.findByApplication_IdOrderByCreatedAtDesc(id).stream()
+                .map(AppDeployment::getNamespace)
+                .filter(ns -> ns != null && !ns.isBlank() && !"pending".equals(ns))
+                .distinct()
+                .toList();
         pipelineExecutionRepository.deleteByAppService_ManagedApplication_Id(id);
         environmentRepository.deleteByService_ManagedApplication_Id(id);
         scanBatchRepository.deleteByManagedApplication_Id(id);
         appRepository.delete(app); // cascade services / databases / deployments
+        if (!namespaces.isEmpty() && k8sManifestApplyService.isConfigured()) {
+            // Suppression en tâche de fond : deleteNamespace attend jusqu'à 2 min par namespace.
+            Thread cleaner = new Thread(() -> {
+                for (String ns : namespaces) {
+                    try {
+                        k8sManifestApplyService.deleteNamespace(ns);
+                        log.info("Application {} supprimée — namespace {} supprimé", id, ns);
+                    } catch (Exception e) {
+                        log.warn("Application {} supprimée — namespace {} non supprimé : {}", id, ns, e.getMessage());
+                    }
+                }
+            }, "app-delete-namespaces");
+            cleaner.setDaemon(true);
+            cleaner.start();
+        }
     }
 
     // =====================================================================

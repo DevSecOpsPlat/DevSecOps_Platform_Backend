@@ -136,6 +136,10 @@ public class AppDeploymentService {
     @Value("${deployment.ingress.custom-base-domain:}")
     private String customBaseDomain;
 
+    /** Origines autorisées à afficher les applications dans l'aperçu de la plateforme (hôte apercu-…). */
+    @Value("${deployment.preview.frame-ancestors:https://envirotest.cloud http://localhost:4200}")
+    private String previewFrameAncestors;
+
     /** Schéma des URLs pour un hostname personnalisé (auto ou tapé) — https par défaut. */
     @Value("${deployment.ingress.custom-scheme:https}")
     private String customHostnameScheme;
@@ -955,6 +959,8 @@ public class AppDeploymentService {
             if (firstReady) {
                 deployment.setDeployedAt(Instant.now());
             }
+            // Un service vient d'être reconstruit : le smoke test précédent ne décrit plus l'application.
+            boolean rebuildJustFinished = isPartialRebuild(deployment);
             deployment.setStatus(AppDeploymentStatus.RUNNING);
             markServicesReady(deployment);
             clearPendingRebuild(deployment);
@@ -968,7 +974,7 @@ public class AppDeploymentService {
             // sans clé "smokeTest" du tout). deploy:trigger-backend (.gitlab-ci.yml) continue de
             // toute façon à sonder ce endpoint tant que appUrl est vide, donc ça retente à chaque
             // poll suivant jusqu'à ce qu'Ingress soit prêt, sans appel GitLab supplémentaire.
-            if (!hasSmokeTestResult(deployment)) {
+            if (!hasSmokeTestResult(deployment) || rebuildJustFinished) {
                 try {
                     runSmokeTest(deployment, shadow);
                 } catch (Exception smokeEx) {
@@ -1618,6 +1624,7 @@ public class AppDeploymentService {
                 .namespaceMemoryQuota(namespaceMemoryQuota)
                 .networkPolicyEnabled(networkPolicyEnabled)
                 .networkPolicyIngressNamespace(networkPolicyIngressNamespace)
+                .previewFrameAncestors(previewFrameAncestors)
                 .build();
     }
 
@@ -2335,6 +2342,14 @@ public class AppDeploymentService {
         // tout le déploiement multi-services. Les deux doivent être protégés ensemble : les services
         // non-représentants restent trouvables via findByGitlabPipelineIdAndApplicationId()
         // (scopé service+pipeline, pas environment_id) -- inchangé, voir garde ligne ~2390.
+        if (setAsEnvironmentPrimary && env.getPipelineExecution() != null
+                && !java.util.Objects.equals(env.getPipelineExecution().getGitlabPipelineId(), gitlabPipelineId)) {
+            // EphemeralEnvironment.pipelineExecution est en orphanRemoval : remplacer la référence
+            // SUPPRIME l'exécution précédente (et ses résultats). On garde donc la première.
+            log.info("Env {} déjà lié au pipeline #{} — exécution #{} non rattachée à l'environnement",
+                    env.getId(), env.getPipelineExecution().getGitlabPipelineId(), gitlabPipelineId);
+            setAsEnvironmentPrimary = false;
+        }
         if (setAsEnvironmentPrimary) {
             execution.setEnvironment(env);
             env.setPipelineExecution(execution);
@@ -2475,7 +2490,10 @@ public class AppDeploymentService {
 
         EphemeralEnvironment env = environmentRepository.findById(envId).orElse(null);
         if (env != null) {
-            linkDeployPipelineExecution(target, env, pipelineId, deployBranch);
+            // false : l'environnement reste lié à l'exécution du déploiement initial. Le passer au
+            // rebuild supprimait cette exécution (orphanRemoval) et ses résultats ZAP — constaté le
+            // 17/11/2026 : DAST du front perdu après la reconstruction du back.
+            linkDeployPipelineExecution(target, env, pipelineId, deployBranch, false);
         }
 
         log.info("Rebuild service in-place — app={} service={} ns={} deployment={} pipeline={}",
@@ -2791,6 +2809,45 @@ public class AppDeploymentService {
                 .message("Config appliquée sur " + String.join(", ", namespaces)
                         + " (env, port, replicas=" + replicas + ", Ingress) — pods synchronisés.")
                 .build();
+    }
+
+    /**
+     * Au démarrage : réapplique l'Ingress des applications en cours d'exécution, pour qu'elles
+     * reçoivent les routes ajoutées depuis leur déploiement (hôte d'aperçu apercu-…). Idempotent
+     * (server-side apply), en tâche de fond pour ne pas retarder le démarrage, une application à la fois.
+     */
+    @org.springframework.context.event.EventListener(org.springframework.boot.context.event.ApplicationReadyEvent.class)
+    public void resyncRunningIngressesOnStartup() {
+        if (!k8sManifestApplyService.isConfigured()) {
+            return;
+        }
+        Thread worker = new Thread(() -> {
+            try {
+                List<UUID> appIds = transactionTemplate.execute(status ->
+                        deploymentRepository.findByStatus(AppDeploymentStatus.RUNNING).stream()
+                                .map(d -> d.getApplication() != null ? d.getApplication().getId() : null)
+                                .filter(java.util.Objects::nonNull)
+                                .distinct()
+                                .toList());
+                for (UUID appId : appIds == null ? List.<UUID>of() : appIds) {
+                    try {
+                        transactionTemplate.executeWithoutResult(status ->
+                                deploymentRepository.findByStatus(AppDeploymentStatus.RUNNING).stream()
+                                        .map(AppDeployment::getApplication)
+                                        .filter(a -> a != null && appId.equals(a.getId()))
+                                        .findFirst()
+                                        .ifPresent(this::syncIngressHostname));
+                    } catch (Exception e) {
+                        log.warn("Réapplication Ingress au démarrage (app {}) : {}", appId, e.getMessage());
+                    }
+                }
+                log.info("Ingress réappliqués au démarrage pour {} application(s) en cours", appIds == null ? 0 : appIds.size());
+            } catch (Exception e) {
+                log.warn("Réapplication des Ingress au démarrage impossible : {}", e.getMessage());
+            }
+        }, "ingress-resync");
+        worker.setDaemon(true);
+        worker.start();
     }
 
     /**

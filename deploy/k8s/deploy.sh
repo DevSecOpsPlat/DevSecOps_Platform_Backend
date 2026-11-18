@@ -57,9 +57,50 @@ build_push() {
     echo "Attention : $svc contient des modifications non commitées (tag $tag)" >&2
   fi
   img="$REGISTRY/platform-$svc:$tag"
-  docker build "${args[@]}" -t "$img" "$dir" >&2
-  docker push "$img" >&2
+  docker build "${args[@]}" -t "$img" "$dir" >&2 || return 1
+  # Le registre GitLab renvoie parfois une erreur passagère sur une couche : on réessaie.
+  # « return 1 » explicite : set -e ne s'applique PAS dans une substitution $(...) — sans lui, un
+  # envoi raté laissait le script appliquer une image absente du registre (backend arrêté le 17/11/2026).
+  local n
+  for n in 1 2 3; do
+    docker push "$img" >&2 && break
+    if [ "$n" = 3 ]; then return 1; fi
+    echo "Envoi de $img : nouvel essai ($n/3)…" >&2
+    sleep 5
+  done
   echo "$img"
+}
+
+# Télécharge l'image du backend sur son nœud AVANT de basculer : le backend est en « Recreate »
+# (volume RWO), l'ancien pod s'arrête dès l'application. Sans ce préchargement, la plateforme
+# restait coupée pendant tout le téléchargement (~13 min avec la connexion actuelle).
+prepull() {
+  local img="$1" node pod="prepull-$(date +%s)" phase reason i failures=0
+  node="$(kc -n "$NS" get pod -l app=backend -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null || true)"
+  [ -n "$node" ] || return 0
+  echo "Préchargement de $img sur $node (l'ancien backend reste en ligne)…" >&2
+  kc -n "$NS" run "$pod" --image="$img" --restart=Never \
+    --overrides="{\"apiVersion\":\"v1\",\"spec\":{\"nodeName\":\"$node\",\"imagePullSecrets\":[{\"name\":\"gitlab-registry\"}]}}" \
+    --command -- sh -c 'exit 0' >/dev/null || return 1
+  for i in $(seq 1 180); do
+    phase="$(kc -n "$NS" get pod "$pod" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    case "$phase" in Succeeded|Failed) break ;; esac
+    reason="$(kc -n "$NS" get pod "$pod" -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || true)"
+    case "$reason" in
+      ErrImagePull|ImagePullBackOff|InvalidImageName)
+        # Une erreur passagère de téléchargement est réessayée par Kubernetes : on n'abandonne
+        # qu'après plusieurs constats (image réellement absente ou nom invalide).
+        failures=$((failures + 1))
+        if [ "$reason" = InvalidImageName ] || [ "$failures" -ge 12 ]; then
+          echo "Préchargement impossible ($reason) — rien n'est appliqué." >&2
+          kc -n "$NS" delete pod "$pod" --wait=false >/dev/null 2>&1 || true
+          return 1
+        fi ;;
+    esac
+    sleep 10
+  done
+  kc -n "$NS" delete pod "$pod" --wait=false >/dev/null 2>&1 || true
+  echo "Image préchargée sur $node." >&2
 }
 
 current_image() {
@@ -103,14 +144,16 @@ rollout() {
 
 case "${1:-}" in
   all)
-    BACKEND_IMAGE="$(build_push backend)"
-    FRONTEND_IMAGE="$(build_push frontend)"
+    BACKEND_IMAGE="$(build_push backend)" || { echo "Image backend non envoyée — aucun changement appliqué." >&2; exit 1; }
+    FRONTEND_IMAGE="$(build_push frontend)" || { echo "Image frontend non envoyée — aucun changement appliqué." >&2; exit 1; }
+    prepull "$BACKEND_IMAGE" || exit 1
     apply_secrets
     apply_manifests
     rollout backend frontend
     ;;
   backend|frontend)
-    img="$(build_push "$1")"
+    img="$(build_push "$1")" || { echo "Image $1 non envoyée — aucun changement appliqué." >&2; exit 1; }
+    if [ "$1" = backend ]; then prepull "$img" || exit 1; fi
     kc -n "$NS" set image "deploy/$1" "$1=$img"
     rollout "$1"
     ;;

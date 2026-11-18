@@ -186,6 +186,53 @@ class AppK8sManifestServiceTest {
         assertThat(yaml).doesNotContain("kind: NetworkPolicy");
     }
 
+    @Test
+    void addsFramablePreviewHostOnlyForThePlatform() {
+        AppService api = service("api-fast", AppServiceRole.BACKEND, 8000);
+        AppService web = service("vite", AppServiceRole.FRONTEND, 5173);
+        web.setDependsOnServiceId(api.getId());
+        ManagedApplication app = app(api, web);
+        AppK8sManifestService.ManifestOptions options =
+                AppK8sManifestService.ManifestOptions.builder()
+                        .pullSecretName("gitlab-registry")
+                        .ingressEnabled(true)
+                        .pathBasedRouting(true)
+                        .ingressController("traefik")
+                        .ingressClassName("traefik")
+                        .customHostname("demo.envirotest.cloud")
+                        .previewFrameAncestors("https://envirotest.cloud")
+                        .build();
+
+        String yaml = manifestService.generateIngressBundle(app, "env-demo", options);
+
+        assertThat(yaml)
+                .contains("name: app-ingress\n")
+                .contains("host: demo.envirotest.cloud")
+                .contains("name: app-ingress-preview")
+                .contains("host: apercu-demo.envirotest.cloud")
+                .contains("name: app-preview-frame")
+                .contains("frame-ancestors https://envirotest.cloud")
+                .contains("env-demo-app-preview-frame@kubernetescrd");
+    }
+
+    @Test
+    void noPreviewHostWithoutAllowedOrigins() {
+        AppService web = service("vite", AppServiceRole.FRONTEND, 5173);
+        ManagedApplication app = app(web);
+        AppK8sManifestService.ManifestOptions options =
+                AppK8sManifestService.ManifestOptions.builder()
+                        .pullSecretName("gitlab-registry")
+                        .ingressEnabled(true)
+                        .pathBasedRouting(true)
+                        .ingressController("traefik")
+                        .customHostname("demo.envirotest.cloud")
+                        .build();
+
+        String yaml = manifestService.generateIngressBundle(app, "env-demo", options);
+
+        assertThat(yaml).doesNotContain("app-ingress-preview").doesNotContain("app-preview-frame");
+    }
+
     private static AppService service(String name, AppServiceRole role, int port) {
         AppService service = new AppService();
         service.setId(UUID.randomUUID());

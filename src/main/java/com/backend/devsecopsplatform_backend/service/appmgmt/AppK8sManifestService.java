@@ -83,6 +83,30 @@ public class AppK8sManifestService {
         boolean networkPolicyEnabled;
         /** Namespace du contrôleur d'ingress (ex. kube-system sur K3s) — trafic autorisé en entrée. */
         String networkPolicyIngressNamespace;
+        /**
+         * Origines autorisées à afficher l'application dans l'aperçu de la plateforme
+         * (ex. « https://envirotest.cloud »). Si renseigné : Ingress supplémentaire
+         * {@code apercu-<hôte>} dont les réponses n'autorisent l'affichage en cadre que depuis
+         * ces origines. L'adresse publique de l'application garde ses propres en-têtes.
+         */
+        String previewFrameAncestors;
+    }
+
+    /** Préfixe de l'hôte d'aperçu : {@code eventpass.envirotest.cloud} → {@code apercu-eventpass.envirotest.cloud}. */
+    public static final String PREVIEW_HOST_PREFIX = "apercu-";
+
+    /** Hôte d'aperçu d'un hôte applicatif, ou null s'il dépasserait la longueur DNS d'un label (63). */
+    public static String previewHostFor(String host) {
+        if (host == null || host.isBlank()) {
+            return null;
+        }
+        String h = host.trim().toLowerCase();
+        int dot = h.indexOf('.');
+        String firstLabel = dot > 0 ? h.substring(0, dot) : h;
+        if (firstLabel.startsWith(PREVIEW_HOST_PREFIX) || PREVIEW_HOST_PREFIX.length() + firstLabel.length() > 63) {
+            return null;
+        }
+        return PREVIEW_HOST_PREFIX + h;
     }
 
     private String resolveServiceImage(String k8sName, ManifestOptions opts) {
@@ -187,6 +211,7 @@ public class AppK8sManifestService {
             Map<String, Object> ingress = applicationIngress(app, namespace, opts);
             if (ingress != null) {
                 docs.add(ingress);
+                appendPreviewIngressDocs(app, namespace, opts, docs);
             }
         } else {
             for (AppService svc : app.getServices()) {
@@ -835,6 +860,61 @@ public class AppK8sManifestService {
         m.put("metadata", metadata);
         m.put("spec", spec);
         return m;
+    }
+
+    /**
+     * Aperçu dans la plateforme : beaucoup d'applications interdisent d'être affichées dans un cadre
+     * (X-Frame-Options / CSP frame-ancestors — bonne pratique anti-clickjacking), donc l'aperçu
+     * restait vide. On publie la MÊME application sur un second hôte {@code apercu-<hôte>} dont
+     * les réponses n'autorisent l'affichage en cadre que depuis la plateforme. L'adresse publique
+     * n'est pas modifiée et garde sa protection.
+     */
+    @SuppressWarnings("unchecked")
+    private void appendPreviewIngressDocs(
+            ManagedApplication app,
+            String namespace,
+            ManifestOptions opts,
+            List<Map<String, Object>> docs
+    ) {
+        String ancestors = opts.getPreviewFrameAncestors();
+        if (ancestors == null || ancestors.isBlank() || !isTraefikIngress(opts)) {
+            return;
+        }
+        Map<String, Object> preview = applicationIngress(app, namespace, opts);
+        if (preview == null) {
+            return;
+        }
+        Map<String, Object> spec = (Map<String, Object>) preview.get("spec");
+        List<Map<String, Object>> rules = spec != null ? (List<Map<String, Object>>) spec.get("rules") : null;
+        if (rules == null || rules.isEmpty()) {
+            return;
+        }
+        String previewHost = previewHostFor(String.valueOf(rules.get(0).get("host")));
+        if (previewHost == null) {
+            return;
+        }
+        rules.get(0).put("host", previewHost);
+
+        Map<String, Object> metadata = (Map<String, Object>) preview.get("metadata");
+        metadata.put("name", "app-ingress-preview");
+        Map<String, String> annotations = metadata.get("annotations") instanceof Map<?, ?> a
+                ? new LinkedHashMap<>((Map<String, String>) a)
+                : new LinkedHashMap<>();
+        String frameRef = namespace + "-app-preview-frame@kubernetescrd";
+        String existing = annotations.get("traefik.ingress.kubernetes.io/router.middlewares");
+        annotations.put("traefik.ingress.kubernetes.io/router.middlewares",
+                existing == null || existing.isBlank() ? frameRef : existing + "," + frameRef);
+        metadata.put("annotations", annotations);
+
+        Map<String, Object> middleware = base("traefik.io/v1alpha1", "Middleware");
+        middleware.put("metadata", meta("app-preview-frame", namespace));
+        Map<String, String> headers = new LinkedHashMap<>();
+        headers.put("X-Frame-Options", ""); // valeur vide = en-tête retiré par Traefik
+        headers.put("Content-Security-Policy", "frame-ancestors " + ancestors.trim());
+        middleware.put("spec", Map.of("headers", Map.of("customResponseHeaders", headers)));
+
+        docs.add(middleware);
+        docs.add(preview);
     }
 
     private List<Map<String, Object>> applicationPathMiddlewares(

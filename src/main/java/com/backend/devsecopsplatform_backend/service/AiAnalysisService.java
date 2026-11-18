@@ -14,6 +14,7 @@ import org.springframework.beans.factory.annotation.Value;
 import com.backend.devsecopsplatform_backend.service.ai.AiRemediationCacheService;
 import com.backend.devsecopsplatform_backend.service.ai.AiRemediationJobService;
 import com.backend.devsecopsplatform_backend.service.ai.AsyncRemediationPendingException;
+import com.backend.devsecopsplatform_backend.service.ai.RemediationEvidence;
 import com.backend.devsecopsplatform_backend.service.ai.RemediationRequestContext;
 import com.backend.devsecopsplatform_backend.service.ai.StaticRemediationTemplateService;
 import org.springframework.http.*;
@@ -28,6 +29,7 @@ import java.util.ArrayList;
 import java.util.Optional;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.regex.Matcher;
@@ -54,10 +56,15 @@ public class AiAnalysisService {
     private static final int MAX_CODE_SNIPPET_CHARS = 10_000;
     private static final int MAX_CODE_SNIPPET_COMPACT = 6_000;
     private static final int MAX_TOTAL_PROMPT_CHARS = 28_000;
-    private static final int MAX_TOTAL_PROMPT_COMPACT = 16_000;
+    /** Règles de provenance (v2) ajoutées : ~3 000 caractères de plus qu'avant. */
+    private static final int MAX_TOTAL_PROMPT_COMPACT = 20_000;
     private static final int DEFAULT_RETRY_DELAY_SECONDS = 45;
     private static final int MAX_CHAT_TURNS = 24;
     private static final int MAX_CHAT_MESSAGE_CHARS = 10_000;
+
+    /** Bornage par les preuves en attente d'un résultat Ollama asynchrone (clé = clé de cache). */
+    private final Map<String, java.util.function.UnaryOperator<FindingAiRemediationResponse>> pendingRemediationPolicies =
+            new java.util.concurrent.ConcurrentHashMap<>();
 
     /** Chat pipeline streamé (SSE) : travail réseau/IO bloquant fait hors du thread Spring MVC. */
     private final java.util.concurrent.ExecutorService chatStreamExecutor =
@@ -68,27 +75,54 @@ public class AiAnalysisService {
         chatStreamExecutor.shutdownNow();
     }
 
-    /** JSON Schema pour la sortie structurée de la remédiation. */
+    /**
+     * JSON Schema (v2) de la remédiation : diagnostic sourcé, statuts de certitude, niveaux de
+     * correction. Les anciens champs redondants (businessRisk, reproduction, secureCodeBefore/After,
+     * fullFileRewrite) ne sont plus demandés ; le DTO les garde pour relire les anciennes analyses.
+     */
     private static final String REMEDIATION_SCHEMA = """
             {
               "type": "object",
               "additionalProperties": false,
-              "required": ["problemSummary","rootCause","impact","businessRisk","location",
-                           "reproduction","remediationSteps","suggestedPatch","secureCodeBefore",
-                           "secureCodeAfter","fullFileRewrite","bestPractices","references",
-                           "verificationHints","verificationCommands","confidence"],
+              "required": ["problemSummary","diagnosis","rootCause","rootCauseStatus","location","locationStatus",
+                           "fixLayers","impact","remediationSteps","suggestedPatch","patchLanguage","patchTarget",
+                           "verificationCommands","verificationHints","bestPractices","references","confidence"],
               "properties": {
                 "problemSummary":   {"type":"string"},
+                "diagnosis": {
+                  "type":"array",
+                  "items":{
+                    "type":"object",
+                    "additionalProperties": false,
+                    "required":["statement","source"],
+                    "properties":{
+                      "statement":{"type":"string"},
+                      "source":{"type":"string","enum":["SCANNER","PLATFORM_CHECK","REPOSITORY","HYPOTHESIS"]}
+                    }
+                  }
+                },
                 "rootCause":        {"type":"string"},
-                "impact":           {"type":"string"},
-                "businessRisk":     {"type":"string"},
+                "rootCauseStatus":  {"type":"string","enum":["CONFIRMED","PROBABLE","UNDETERMINED"]},
                 "location":         {"type":"string"},
-                "reproduction":     {"type":"string"},
+                "locationStatus":   {"type":"string","enum":["CONFIRMED","PROBABLE","UNDETERMINED"]},
+                "fixLayers": {
+                  "type":"array",
+                  "items":{
+                    "type":"object",
+                    "additionalProperties": false,
+                    "required":["layer","description","recommended"],
+                    "properties":{
+                      "layer":{"type":"string","enum":["APPLICATION","REVERSE_PROXY","CDN_TLS","KUBERNETES","WEB_SERVER","BUILD","DEPENDENCY","OTHER"]},
+                      "description":{"type":"string"},
+                      "recommended":{"type":"boolean"}
+                    }
+                  }
+                },
+                "impact":           {"type":"string"},
                 "remediationSteps": {"type":"array","items":{"type":"string"}},
                 "suggestedPatch":   {"type":"string"},
-                "secureCodeBefore": {"type":"string"},
-                "secureCodeAfter":  {"type":"string"},
-                "fullFileRewrite":  {"type":"string"},
+                "patchLanguage":    {"type":"string"},
+                "patchTarget":      {"type":"string"},
                 "bestPractices":    {"type":"array","items":{"type":"string"}},
                 "references": {
                   "type":"array",
@@ -842,10 +876,14 @@ public class AiAnalysisService {
                 ? reqCtx
                 : RemediationRequestContext.fromFindingContext(findingContextBlock, false);
         boolean compact = !meta.deepAnalysis();
+        RemediationEvidence evidence = meta.evidence();
+        boolean pipelineCtxKnown = !pipelineKnowledgeService.getPipelineContextBlock(applicationId, branch).isBlank();
+        java.util.function.UnaryOperator<FindingAiRemediationResponse> policy =
+                r -> applyEvidencePolicy(r, evidence, pipelineCtxKnown, findingContextBlock);
 
         String snippet = optionalCodeSnippet != null ? optionalCodeSnippet : "";
         String cacheKey = remediationCacheService.computeCacheKey(
-                meta.ruleKey(), meta.filePath(), meta.line(), snippet, meta.deepAnalysis());
+                meta.ruleKey(), meta.filePath(), meta.line(), snippet, meta.deepAnalysis(), evidence);
 
         Optional<FindingAiRemediationResponse> cached = remediationCacheEnabled
                 ? remediationCacheService.get(cacheKey)
@@ -864,11 +902,14 @@ public class AiAnalysisService {
             log.debug("[AI] Cache remédiation désactivé (ai.remediation.cache.enabled=false)");
         }
 
-        if (remediationStaticTemplatesEnabled && !meta.deepAnalysis()) {
+        // Les modèles statiques sont génériques (ex. CORS : « wildcard ou réflexion », patch Spring) :
+        // pour un finding DAST, seule une analyse appuyée sur les preuves observées est pertinente.
+        if (remediationStaticTemplatesEnabled && !meta.deepAnalysis() && !evidence.dynamicFinding()) {
             Optional<FindingAiRemediationResponse> staticHit =
                     staticRemediationTemplateService.match(findingContextBlock, false);
             if (staticHit.isPresent()) {
-                FindingAiRemediationResponse r = personalizeStaticResponse(staticHit.get(), findingContextBlock);
+                FindingAiRemediationResponse r = policy.apply(
+                        personalizeStaticResponse(staticHit.get(), findingContextBlock));
                 if (remediationCacheEnabled) {
                     remediationCacheService.put(cacheKey, r, "STATIC", "static-template", r.getAiModelUsed());
                 }
@@ -901,19 +942,22 @@ public class AiAnalysisService {
         }
 
         String prompt = buildFindingRemediationPrompt(applicationId, branch, ctx, snippet,
-                isLikelySecretOrCredentialFinding(ctx), compact);
+                isLikelySecretOrCredentialFinding(ctx), compact, evidence);
         if (prompt.length() > maxPrompt) {
             log.warn("[AI] Prompt trop long ({} chars) — troncature à {}", prompt.length(), maxPrompt);
             prompt = prompt.substring(0, maxPrompt) + "\n\n[... prompt tronqué ...]";
         }
 
         String groqModelChoice = compact ? groqModelFast : groqModel;
+        // Le résultat d'un job Ollama asynchrone arrive plus tard : il doit recevoir le même bornage.
+        pendingRemediationPolicies.put(cacheKey, policy);
         try {
             AiCallResult r = callAiProviderWithFallbackResult(
                     provider, prompt, "finding_remediation", REMEDIATION_SCHEMA, groqModelChoice, cacheKey);
+            pendingRemediationPolicies.remove(cacheKey);
             log.info("[AI] Remédiation OK — provider={} model={} fallback={}",
                     r.providerUsed(), r.modelUsed(), r.quotaFallbackUsed());
-            FindingAiRemediationResponse out = parseFindingRemediationResponse(r.text());
+            FindingAiRemediationResponse out = policy.apply(parseFindingRemediationResponse(r.text()));
             out = out.toBuilder()
                     .aiProviderUsed(r.providerUsed())
                     .aiModelUsed(r.modelUsed())
@@ -939,6 +983,7 @@ public class AiAnalysisService {
                     .confidence("MEDIUM")
                     .build();
         } catch (Exception e) {
+            pendingRemediationPolicies.remove(cacheKey);
             log.error("Erreur remédiation finding IA ({}): {}", provider, e.getMessage());
             return FindingAiRemediationResponse.builder()
                     .problemSummary(buildUserFriendlyErrorMessage(e, provider))
@@ -1053,7 +1098,46 @@ public class AiAnalysisService {
             INTERDIT sauf preuve explicite dans le contexte : « configure ton pipeline », « ajoute Semgrep dans le CI », « modifie le workflow GitHub Actions », « étape dans le pipeline » pour ce type de finding.
             Ne dis JAMAIS de mettre l'attribut HTML integrity (SRI) ou crossorigin dans des « variables d'environnement » : ce sont des attributs dans le HTML ou les templates du dépôt, pas des env vars serveur.
             À privilégier : fichier à ouvrir, modification concrète du code ou du markup, commandes sur la machine du développeur (openssl, npm, git, build local), puis commit/push et « relancer l'analyse / le scan depuis le tableau de bord de l'application ».
-            Stack du projet testé : le contexte finding commence par « TECHNOLOGIES_DEDUITES » (nom/description du projet sur la plateforme, dépôt GitHub/GitLab, chemins type package.json ou pom.xml, chemin d'artefact, extrait de code). Utilise ces indices pour proposer des commandes et exemples adaptés (npm/yarn/pnpm vs mvn/gradle vs pip, Angular/React, etc.). Si un indice contredit filePath ou packageName du finding, privilégie les faits du finding.
+            Stack du projet testé : le bloc PIPELINE_CONTEXT (s'il est présent) contient des fichiers réellement lus par le dernier pipeline (requirements.txt, package.json, Dockerfile…). Utilise-le pour adapter commandes et exemples (pip vs npm vs mvn…), en le présentant comme « lu dans le dépôt », jamais comme une certitude sur le fichier responsable. Si un indice contredit filePath ou packageName du finding, privilégie les faits du finding.
+            """;
+
+    /** Règles propres aux findings DAST (OWASP ZAP), y compris l'architecture d'exposition EnviroTest. */
+    private static final String REMEDIATION_DAST_RULES = """
+            RÈGLES DAST (OWASP ZAP) — ce finding vient d'un test dynamique :
+            - ZAP a testé l'application DÉPLOYÉE à travers son URL. Il ne connaît ni le dépôt, ni le framework, ni le fichier responsable : ne lui attribue jamais ces informations.
+            - Sur EnviroTest, la réponse traverse : Cloudflare (TLS public) → Ingress Traefik généré par la plateforme (routage seul, hors du dépôt, non modifiable par le développeur) → conteneur de l'application. Un en-tête de réponse peut donc être posé par l'application elle-même (correction dans le dépôt, relayée telle quelle) ; au niveau Ingress ou Cloudflare, c'est une option à demander à l'administrateur de la plateforme.
+            - Compare le constat ZAP et [CONTROLE_PLATEFORME] : si l'élément manquant est désormais présent, dis-le (finding peut-être déjà corrigé, à re-scanner) ; si le contrôle signale un environnement arrêté ou injoignable, ne t'appuie pas dessus.
+            - Si [DEPOT] fournit un fichier de l'application, cherche-y la configuration existante (middlewares, en-têtes, CORS…) et cite ce qui y est réellement écrit, avec le numéro de ligne. Sinon, la localisation exacte reste à confirmer.
+            Cas particuliers :
+            - HSTS (Strict-Transport-Security) : n'a d'effet qu'en HTTPS ; ici TLS est terminé par Cloudflare. Niveaux possibles : CDN_TLS (réglage HSTS de Cloudflare), REVERSE_PROXY (middleware Traefik), APPLICATION (en-tête posé par l'application et relayé). Valeur : max-age=31536000 ; includeSubDomains seulement si tous les sous-domaines sont en HTTPS ; jamais preload par défaut.
+            - CSP (Content-Security-Policy) : n'impose pas une politique stricte à l'aveugle. Pars des ressources réellement chargées par l'application (si elles sont inconnues, dis-le), commence par Content-Security-Policy-Report-Only, observe les violations, puis passe en mode bloquant. Si une CSP existe déjà, complète-la au lieu de la remplacer.
+            - CORS (Cross-Domain Misconfiguration) : lis Access-Control-Allow-Origin et Access-Control-Allow-Credentials observés (le contrôle envoie une Origin externe). « * » sans credentials sur des ressources publiques n'est pas exploitable en soi ; c'est grave si l'origine est reflétée avec credentials=true ou si des données privées sont servies. N'affirme jamais « wildcard » ou « réflexion d'origine » sans l'avoir observé.
+            - Anti-clickjacking : vérifie d'abord si une CSP existe. Privilégie frame-ancestors AJOUTÉ à la CSP existante (sans écraser ses autres directives) et/ou X-Frame-Options DENY ou SAMEORIGIN. Si frame-ancestors est déjà présent, le finding est probablement résolu ou concerne une autre URL.
+            - En-têtes informatifs (Server, X-Powered-By, Cache-Control…) : sévérité faible, ne pas dramatiser.
+            """;
+
+    /** Provenance, statuts de certitude et contenu attendu (format v2). */
+    private static final String REMEDIATION_OUTPUT_RULES = """
+            PROVENANCE DES INFORMATIONS (obligatoire) :
+            - Le contexte est étiqueté : [SCANNER] = constaté par l'outil ; [CONTROLE_PLATEFORME] = requête HTTP faite par EnviroTest (état actuel) ; [PLATEFORME] = architecture de déploiement EnviroTest (fait) ; [DEPOT] et PIPELINE_CONTEXT = fichiers réellement lus dans le dépôt. Tout le reste vient de tes connaissances ou de tes déductions.
+            - diagnosis : 2 à 5 éléments courts et distincts. source = SCANNER, PLATFORM_CHECK ou REPOSITORY selon l'étiquette dont l'élément est tiré ; HYPOTHESIS pour toute déduction de ta part, même probable.
+            - L'absence d'un en-tête HTTP est un constat sur une réponse, pas la preuve d'un défaut à un endroit précis du code.
+
+            STATUTS DE CERTITUDE :
+            - rootCauseStatus / locationStatus = CONFIRMED uniquement si un élément [DEPOT], [CONTROLE_PLATEFORME] ou le fichier:ligne du scanner l'établit directement ; PROBABLE si c'est une déduction cohérente avec ces éléments (ex. technologie lue dans requirements.txt mais configuration non lue) ; UNDETERMINED sinon.
+            - location : où agir. Si c'est inconnu, écris-le (« Fichier responsable non identifié : … à vérifier »). N'invente jamais un chemin, un fichier, un framework ou une version.
+            - fixLayers : les niveaux où la correction est possible (APPLICATION, REVERSE_PROXY, CDN_TLS, KUBERNETES, WEB_SERVER, BUILD, DEPENDENCY, OTHER), une phrase chacun avec ce qui reste à vérifier. recommended=true pour UN seul niveau : celui que le développeur peut réellement modifier ou le plus pertinent. Un seul élément si un seul niveau est pertinent (ex. faille dans le code : APPLICATION).
+
+            CONTENU (sans répétition entre les champs) :
+            - problemSummary : 1 à 3 phrases sur CETTE application (URL, fichier, composant). Pas de définition générique recopiée du scanner.
+            - rootCause : la cause, formulée avec le degré de certitude de rootCauseStatus (« La réponse … ne contient pas … », « Probablement … car … »).
+            - impact : risque technique concret et mesuré (sévérité, conditions d'exploitation), sans exagération ; une phrase sur la conséquence métier seulement si elle est réelle.
+            - remediationSteps : 3 à 6 étapes actionnables, dans l'ordre, sans redire le diagnostic.
+            - suggestedPatch : UNIQUEMENT si la technologie et le fichier ou composant visés sont connus (CONFIRMED, ou PROBABLE appuyé sur [DEPOT] / PIPELINE_CONTEXT). Sinon "". Un seul correctif, sans variantes. patchLanguage (python, javascript, typescript, java, yaml, nginx, http, bash, json, dockerfile…) et patchTarget (fichier ou composant visé) ; "" s'il n'y a pas de patch.
+            - verificationCommands : commandes exécutables ; pour une URL testée par ZAP, utilise CETTE URL publique (jamais localhost). verificationHints : ce qu'il faut observer pour conclure.
+            - bestPractices : 0 à 3 compléments NON couverts par remediationSteps ; [] s'il n'y a rien à ajouter.
+            - references : uniquement les CVE/CWE du contexte ou une documentation officielle (OWASP, MDN, éditeur) pertinente.
+            - confidence : HIGH seulement si cause ET localisation sont CONFIRMED ; MEDIUM si au mieux PROBABLE ; LOW si UNDETERMINED.
             """;
 
     /** Consigne langue injectée dans tous les appels LLM (Groq, OpenRouter, Ollama). */
@@ -1073,15 +1157,15 @@ public class AiAnalysisService {
     }
 
     private String buildFindingRemediationPrompt(UUID applicationId, String branch,
-                                                 String findingContext, String codeSnippet, boolean secretOrCredentialFinding) {
-        return buildFindingRemediationPrompt(applicationId, branch, findingContext, codeSnippet, secretOrCredentialFinding, false);
-    }
-
-    private String buildFindingRemediationPrompt(UUID applicationId, String branch,
                                                  String findingContext, String codeSnippet,
-                                                 boolean secretOrCredentialFinding, boolean compact) {
+                                                 boolean secretOrCredentialFinding, boolean compact,
+                                                 RemediationEvidence evidence) {
+        RemediationEvidence ev = evidence != null ? evidence : RemediationEvidence.none();
         String secretRules = remediationSecretRulesAppendix(secretOrCredentialFinding);
-        String playbooksBlock = buildPlaybooksBlockForPrompt(findingContext, codeSnippet, compact ? 1 : 2);
+        // En mode compact, les règles DAST remplacent le playbook ZAP (même contenu, plus précis) : place gagnée pour les preuves.
+        String playbooksBlock = (compact && ev.dynamicFinding())
+                ? ""
+                : buildPlaybooksBlockForPrompt(findingContext, codeSnippet, compact ? 1 : 2);
         int playbookMax = compact ? 3_500 : 9_000;
         if (playbooksBlock.length() > playbookMax) {
             playbooksBlock = playbooksBlock.substring(0, playbookMax) + "\n[...playbooks tronqués]";
@@ -1097,17 +1181,26 @@ public class AiAnalysisService {
                     : "\nDocuments spécifiques au projet analysé :\n" + String.join("\n---\n", appDocs) + "\n";
         }
 
-        String snippetSection = codeSnippet.isBlank()
-                ? "(Aucun extrait de code fourni — base-toi sur le contexte du scanner et propose une correction type : dépendance, config, ou pattern de code.)"
-                : """
-                Extrait de code fourni par l'utilisateur (peut être partiel) :
-                ```
-                %s
-                ```
-                """.formatted(codeSnippet);
+        String snippetSection;
+        if (codeSnippet.isBlank()) {
+            snippetSection = "[DEPOT] Aucun extrait de code disponible : n'invente pas le contenu d'un fichier ; "
+                    + "indique ce qui reste à vérifier et ne propose de patch que si la technologie est connue.";
+        } else {
+            String label = ev.manualSnippet()
+                    ? "Extrait collé par l'utilisateur (peut être partiel)"
+                    : "[DEPOT] Extrait réellement lu dans le dépôt (numéros de ligne à gauche)";
+            snippetSection = """
+                    %s :
+                    ```
+                    %s
+                    ```
+                    """.formatted(label, codeSnippet);
+        }
 
         return """
-                Tu es un expert senior en sécurité applicative (AppSec/DevSecOps). On te donne UN finding de scanner, pas tout le projet.
+                Tu es un expert senior en sécurité applicative (AppSec/DevSecOps). On te donne UN finding de scanner et les preuves que la plateforme EnviroTest a pu réunir. Ton rôle : un diagnostic fiable et une remédiation exploitable par le développeur — pas une reformulation de la description du scanner.
+
+                %s
 
                 %s
 
@@ -1124,31 +1217,30 @@ public class AiAnalysisService {
                 %s
 
                 HIÉRARCHIE DES SOURCES (ordre de priorité strict) :
-                1. Les données du finding ci-dessous (titre, sévérité, CVE/CWE, fichier, ligne, description scanner) = vérité terrain. Ne les contredis jamais.
-                2. L'extrait de code réel du dépôt s'il est fourni (méthode/fonction englobante si présent).
-                3. Le bloc PIPELINE_CONTEXT / TECHNOLOGIES_DEDUITES : adapte commandes et exemples.
-                4. Les playbooks fournis.
-                5. Tes connaissances générales — UNIQUEMENT pour les bonnes pratiques, JAMAIS pour inventer des faits.
+                1. Les données du finding et les blocs [SCANNER] / [CONTROLE_PLATEFORME] / [PLATEFORME] = faits. Ne les contredis jamais.
+                2. Le code réellement lu ([DEPOT]) et le bloc PIPELINE_CONTEXT.
+                3. Les playbooks fournis.
+                4. Tes connaissances générales — UNIQUEMENT pour les bonnes pratiques et les hypothèses signalées comme telles, JAMAIS pour inventer des faits.
 
                 RÈGLES ANTI-HALLUCINATION (obligatoires) :
-                - N'invente JAMAIS : identifiant CVE ou CWE absent du contexte, numéro de version, chemin de fichier, nom de package, URL.
-                - Si une information manque, mets "" ou "Non déterminable à partir du contexte".
-                - references : uniquement CVE/CWE du contexte avec URL canonique, ou OWASP cheat sheet pertinente, sinon [].
-                - confidence : HIGH si finding + code + playbook concordent ; MEDIUM si partiel ; LOW si extrapolation.
-                - reproduction : uniquement si observable de façon sûre, sinon "".
+                - N'invente JAMAIS : identifiant CVE ou CWE absent du contexte, numéro de version, chemin de fichier, nom de package, URL, configuration existante.
+                - Si une information manque, dis-le explicitement plutôt que de la deviner.
 
-                CONTENU ATTENDU : problemSummary (2-4 phrases), rootCause, impact, businessRisk, location, remediationSteps (4-8 étapes actionnables sans accès pipeline), suggestedPatch, secureCodeBefore/After si applicable, bestPractices (2-5), verificationCommands/Hints.
+                %s
 
-                La sortie est contrôlée par un schéma JSON strict. Remplis TOUS les champs.
+                La sortie est contrôlée par un schéma JSON strict. Remplis TOUS les champs (chaîne vide ou liste vide quand rien n'est pertinent).
 
-                Contexte du finding (métadonnées + evidence) :
+                Contexte du finding (métadonnées + preuves) :
                 %s
 
                 %s
                 """.formatted(
                 RESPONSE_LANGUAGE_FR,
                 compact ? "(Mode compact — réponse concise en français, pas de verbosité.)" : "",
-                REMEDIATION_PLATFORM_AUDIENCE, secretRules, pipelineCtx, appDocsBlock, playbooksBlock, findingContext, snippetSection);
+                REMEDIATION_PLATFORM_AUDIENCE, secretRules,
+                ev.dynamicFinding() ? REMEDIATION_DAST_RULES : "",
+                pipelineCtx, appDocsBlock, playbooksBlock,
+                REMEDIATION_OUTPUT_RULES, findingContext, snippetSection);
     }
 
     private static String truncateField(String s, int max) {
@@ -1208,6 +1300,220 @@ public class AiAnalysisService {
             return true;
         }
         return false;
+    }
+
+    // ── Format v2 : lecture tolérante (OpenRouter / Ollama ne respectent pas toujours le schéma) ──
+
+    private static final Set<String> DIAGNOSIS_SOURCES = Set.of("SCANNER", "PLATFORM_CHECK", "REPOSITORY", "HYPOTHESIS");
+    private static final Set<String> FIX_LAYERS = Set.of(
+            "APPLICATION", "REVERSE_PROXY", "CDN_TLS", "KUBERNETES", "WEB_SERVER", "BUILD", "DEPENDENCY", "OTHER");
+
+    private static List<FindingAiRemediationResponse.DiagnosisItem> readDiagnosis(JsonNode arr) {
+        List<FindingAiRemediationResponse.DiagnosisItem> out = new ArrayList<>();
+        if (!arr.isArray()) {
+            return out;
+        }
+        for (JsonNode n : arr) {
+            String statement = n.isTextual() ? n.asText() : n.path("statement").asText("");
+            if (statement.isBlank()) continue;
+            String source = n.isTextual() ? "HYPOTHESIS" : n.path("source").asText("HYPOTHESIS")
+                    .trim().toUpperCase(Locale.ROOT).replace(' ', '_').replace('-', '_');
+            if (!DIAGNOSIS_SOURCES.contains(source)) source = "HYPOTHESIS";
+            out.add(FindingAiRemediationResponse.DiagnosisItem.builder().statement(statement.trim()).source(source).build());
+        }
+        return out;
+    }
+
+    private static List<FindingAiRemediationResponse.FixLayer> readFixLayers(JsonNode arr) {
+        List<FindingAiRemediationResponse.FixLayer> out = new ArrayList<>();
+        if (!arr.isArray()) {
+            return out;
+        }
+        for (JsonNode n : arr) {
+            String description = n.path("description").asText("");
+            if (description.isBlank()) continue;
+            String layer = n.path("layer").asText("OTHER").trim().toUpperCase(Locale.ROOT).replace(' ', '_').replace('-', '_');
+            if (!FIX_LAYERS.contains(layer)) layer = "OTHER";
+            out.add(FindingAiRemediationResponse.FixLayer.builder()
+                    .layer(layer).description(description.trim()).recommended(n.path("recommended").asBoolean(false)).build());
+        }
+        return out;
+    }
+
+    private static String normalizeCertainty(String s) {
+        if (s == null || s.isBlank()) return null;
+        String v = s.trim().toUpperCase(Locale.ROOT);
+        if (v.startsWith("CONF")) return "CONFIRMED";
+        if (v.startsWith("PROB") || v.startsWith("LIKEL")) return "PROBABLE";
+        return "UNDETERMINED";
+    }
+
+    private static int confidenceRank(String c) {
+        if (c == null) return 1;
+        return switch (c.trim().toUpperCase(Locale.ROOT)) {
+            case "HIGH", "ÉLEVÉE", "ELEVEE" -> 2;
+            case "LOW", "FAIBLE" -> 0;
+            default -> 1;
+        };
+    }
+
+    private static String confidenceOf(int rank) {
+        return rank >= 2 ? "HIGH" : rank <= 0 ? "LOW" : "MEDIUM";
+    }
+
+    /**
+     * Borne ce que le modèle affirme par ce que le backend sait réellement :
+     * <ul>
+     *   <li>une provenance REPOSITORY / PLATFORM_CHECK sans fichier lu ni contrôle exploitable devient HYPOTHESIS ;</li>
+     *   <li>CONFIRMED sans preuve concrète devient PROBABLE ;</li>
+     *   <li>la confiance finale est le minimum entre celle du modèle et celle permise par les preuves ;</li>
+     *   <li>pas de patch quand cause ET localisation sont indéterminées ;</li>
+     *   <li>DAST : commandes de vérification sur l'URL réellement testée (jamais localhost).</li>
+     * </ul>
+     * S'applique aussi aux modèles statiques (qui déclaraient tous HIGH sans regarder le contexte).
+     */
+    static FindingAiRemediationResponse applyEvidencePolicy(FindingAiRemediationResponse r, RemediationEvidence ev,
+                                                     boolean pipelineCtxKnown, String findingContext) {
+        if (r == null) return null;
+        RemediationEvidence e = ev != null ? ev : RemediationEvidence.none();
+        boolean repoBacked = e.repositoryCode() || e.manualSnippet() || pipelineCtxKnown;
+        boolean locationEvidence = e.repositoryCode() || e.manualSnippet() || e.scannerLocation();
+
+        List<FindingAiRemediationResponse.DiagnosisItem> diagnosis = new ArrayList<>();
+        if (r.getDiagnosis() != null) {
+            for (FindingAiRemediationResponse.DiagnosisItem d : r.getDiagnosis()) {
+                String source = d.getSource();
+                if ("REPOSITORY".equals(source) && !repoBacked) source = "HYPOTHESIS";
+                if ("PLATFORM_CHECK".equals(source) && !e.dynamicFinding() && !e.liveCheck()) source = "HYPOTHESIS";
+                diagnosis.add(FindingAiRemediationResponse.DiagnosisItem.builder()
+                        .statement(d.getStatement()).source(source).build());
+            }
+        }
+
+        String rootStatus = r.getRootCauseStatus();
+        if ("CONFIRMED".equals(rootStatus) && !e.hasConcreteEvidence()) rootStatus = "PROBABLE";
+        String locStatus = r.getLocationStatus();
+        if ("CONFIRMED".equals(locStatus) && !locationEvidence) locStatus = "PROBABLE";
+
+        int cap;
+        if (rootStatus != null && locStatus != null) {
+            if ("UNDETERMINED".equals(rootStatus) || "UNDETERMINED".equals(locStatus)) cap = 0;
+            else if ("CONFIRMED".equals(rootStatus) && "CONFIRMED".equals(locStatus)) cap = 2;
+            else cap = 1;
+        } else {
+            cap = 2; // ancien format / modèle statique : seule la règle « pas de preuve concrète » s'applique
+        }
+        if (!e.hasConcreteEvidence()) cap = Math.min(cap, 1);
+        String modelConfidence = confidenceOf(confidenceRank(r.getConfidence()));
+        String finalConfidence = confidenceOf(Math.min(confidenceRank(r.getConfidence()), cap));
+
+        String patch = r.getSuggestedPatch();
+        if ("UNDETERMINED".equals(rootStatus) && "UNDETERMINED".equals(locStatus)) patch = "";
+
+        List<String> commands = r.getVerificationCommands();
+        if (e.dynamicFinding()) {
+            commands = dastVerificationCommands(commands, findingContext);
+        }
+
+        return r.toBuilder()
+                .diagnosis(diagnosis)
+                .rootCauseStatus(rootStatus)
+                .locationStatus(locStatus)
+                .suggestedPatch(patch)
+                .verificationCommands(commands)
+                .modelConfidence(modelConfidence)
+                .confidence(finalConfidence)
+                .confidenceReason(confidenceReason(e, pipelineCtxKnown, rootStatus, locStatus))
+                .build();
+    }
+
+    private static String confidenceReason(RemediationEvidence e, boolean pipelineCtxKnown, String rootStatus, String locStatus) {
+        List<String> parts = new ArrayList<>();
+        if (e.dynamicFinding()) {
+            parts.add(e.liveCheck()
+                    ? "constat ZAP vérifié par un contrôle HTTP de la plateforme"
+                    : "constat ZAP sur l'URL déployée (contrôle de la plateforme non exploitable)");
+        } else if (e.scannerLocation()) {
+            parts.add("fichier et ligne fournis par le scanner");
+        }
+        if (e.repositoryCode()) parts.add("code lu dans le dépôt");
+        else if (e.manualSnippet()) parts.add("extrait fourni manuellement");
+        else if (pipelineCtxKnown) parts.add("technologie connue par le dernier pipeline, fichier responsable non lu");
+        else parts.add("aucun fichier du dépôt lu");
+        if (rootStatus != null) parts.add("cause " + certaintyLabel(rootStatus));
+        if (locStatus != null) parts.add("localisation " + certaintyLabel(locStatus));
+        String s = String.join(" ; ", parts);
+        return s.isEmpty() ? null : Character.toUpperCase(s.charAt(0)) + s.substring(1) + ".";
+    }
+
+    private static String certaintyLabel(String status) {
+        return switch (status) {
+            case "CONFIRMED" -> "confirmée";
+            case "PROBABLE" -> "probable";
+            default -> "non déterminée";
+        };
+    }
+
+    private static final Pattern CTX_ZAP_URLS = Pattern.compile("(?m)^\\[SCANNER\\] URL testées par ZAP: (.+)$");
+    private static final Pattern CTX_ZAP_RULE = Pattern.compile("(?m)^Règle ZAP \\(pluginid\\): (\\S+)");
+    private static final Pattern CTX_TITLE = Pattern.compile("(?m)^Titre: (.+)$");
+
+    /** Commandes de vérification DAST : pas de localhost, au moins une commande sur l'URL réellement testée. */
+    static List<String> dastVerificationCommands(List<String> commands, String findingContext) {
+        String ctx = findingContext != null ? findingContext : "";
+        Matcher urls = CTX_ZAP_URLS.matcher(ctx);
+        String url = null;
+        if (urls.find()) {
+            String first = urls.group(1).split(",")[0].trim();
+            if (first.startsWith("http")) url = first;
+        }
+        List<String> kept = new ArrayList<>();
+        if (commands != null) {
+            for (String c : commands) {
+                if (c == null || c.isBlank()) continue;
+                String lower = c.toLowerCase(Locale.ROOT);
+                if (url != null && (lower.contains("localhost") || lower.contains("127.0.0.1") || lower.contains("0.0.0.0"))) continue;
+                kept.add(c);
+            }
+        }
+        if (url == null) {
+            return kept;
+        }
+        String host = url.replaceFirst("^https?://", "").split("[/:?]")[0];
+        if (kept.stream().noneMatch(c -> c.contains(host))) {
+            Matcher rule = CTX_ZAP_RULE.matcher(ctx);
+            Matcher title = CTX_TITLE.matcher(ctx);
+            kept.add(0, canonicalDastCheck(url, rule.find() ? rule.group(1) : "",
+                    title.find() ? title.group(1).toLowerCase(Locale.ROOT) : ""));
+        }
+        return kept;
+    }
+
+    private static String canonicalDastCheck(String url, String ruleId, String title) {
+        String quoted = "\"" + url + "\"";
+        if ("10098".equals(ruleId) || title.contains("cross-domain") || title.contains("cors")) {
+            return "curl -sI -H \"Origin: https://origine-externe.example\" " + quoted + " | grep -i \"access-control\"";
+        }
+        String pattern = switch (ruleId) {
+            case "10035" -> "strict-transport-security";
+            case "10038", "10055" -> "content-security-policy";
+            case "10020" -> "x-frame-options|content-security-policy";
+            case "10021" -> "x-content-type-options";
+            case "10063" -> "permissions-policy";
+            case "90004" -> "cross-origin";
+            case "10036", "10037" -> "server|x-powered-by";
+            case "10015", "10049" -> "cache-control|pragma|expires";
+            case "10010", "10011", "10054" -> "set-cookie";
+            default -> null;
+        };
+        if (pattern == null) {
+            if (title.contains("strict-transport")) pattern = "strict-transport-security";
+            else if (title.contains("content security policy") || title.contains("csp")) pattern = "content-security-policy";
+            else if (title.contains("clickjacking")) pattern = "x-frame-options|content-security-policy";
+        }
+        return pattern == null
+                ? "curl -sI " + quoted
+                : "curl -sI " + quoted + " | grep -iE \"" + pattern + "\"";
     }
 
     private FindingAiRemediationResponse parseFindingRemediationResponse(String jsonText) {
@@ -1270,6 +1576,12 @@ public class AiAnalysisService {
                     .verificationHints(hints)
                     .verificationCommands(verifyCmds)
                     .confidence(root.path("confidence").asText("MEDIUM"))
+                    .diagnosis(readDiagnosis(root.path("diagnosis")))
+                    .rootCauseStatus(normalizeCertainty(root.path("rootCauseStatus").asText(null)))
+                    .locationStatus(normalizeCertainty(root.path("locationStatus").asText(null)))
+                    .fixLayers(readFixLayers(root.path("fixLayers")))
+                    .patchLanguage(root.path("patchLanguage").asText(""))
+                    .patchTarget(root.path("patchTarget").asText(""))
                     .rawModelOutput(jsonText != null && jsonText.length() > 8000
                             ? jsonText.substring(0, 8000) + "..." : jsonText)
                     .build();
@@ -1407,8 +1719,9 @@ public class AiAnalysisService {
                 LANGUE : réponds EXCLUSIVEMENT en français. Jamais en anglais (sauf termes techniques CVE, commandes, code).
 
                 Contexte utilisateur : en général il n'a pas accès pour modifier les pipelines CI/CD depuis cet écran ; il peut éditer son code en local, pousser, et relancer une analyse depuis l'application. Ne lui impose pas « modifie ton pipeline GitLab », « ajoute une étape Semgrep au CI » ou des hypothèses d'accès qu'il n'a peut-être pas. Pour SRI (integrity sur link/script), ne dis pas de passer par des variables d'environnement : c'est dans le HTML ou les templates du dépôt.
-                Le bloc « TECHNOLOGIES_DEDUITES » en tête du contexte résume la stack probable du projet testé : tiens-en compte pour les commandes et exemples (npm vs mvn vs pip…).
-                Le bloc PIPELINE_CONTEXT (s'il est présent) décrit la stack RÉELLE mesurée par le dernier pipeline : il prime sur TECHNOLOGIES_DEDUITES en cas de contradiction.
+                Le bloc PIPELINE_CONTEXT (s'il est présent) contient des fichiers réellement lus par le dernier pipeline (requirements.txt, package.json, Dockerfile…) : sers-t'en pour les commandes et exemples (npm vs mvn vs pip…).
+                Provenance : le contexte est étiqueté [SCANNER] (constat de l'outil), [CONTROLE_PLATEFORME] (requête HTTP faite par EnviroTest, état actuel), [PLATEFORME] (architecture de déploiement EnviroTest) et [DEPOT] (fichier réellement lu). Distingue toujours ce qui est constaté de ce que tu déduis (« probablement… », « à vérifier… »). N'invente jamais un fichier, un framework, une configuration existante ou une valeur d'en-tête.
+                Finding DAST (OWASP ZAP) : ZAP a testé l'application déployée via son URL, pas le code. La réponse traverse Cloudflare → Ingress Traefik généré par EnviroTest (hors dépôt) → conteneur de l'application ; une correction dans le dépôt passe par l'application, les autres niveaux relèvent de l'administrateur de la plateforme.
 
                 %s
 
@@ -1686,7 +1999,12 @@ public class AiAnalysisService {
 
     private FindingAiRemediationResponse runOllamaRemediationJob(String prompt, String jsonSchema, String cacheKey) {
         String text = callOllama(prompt, jsonSchema);
+        java.util.function.UnaryOperator<FindingAiRemediationResponse> policy =
+                pendingRemediationPolicies.remove(cacheKey);
         FindingAiRemediationResponse out = parseFindingRemediationResponse(text);
+        if (policy != null) {
+            out = policy.apply(out);
+        }
         out = out.toBuilder()
                 .aiProviderUsed("ollama")
                 .aiModelUsed(ollamaModel)

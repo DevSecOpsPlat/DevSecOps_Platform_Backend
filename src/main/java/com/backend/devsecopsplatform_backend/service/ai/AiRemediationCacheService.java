@@ -23,9 +23,28 @@ public class AiRemediationCacheService {
     private final AiRemediationCacheRepository repository;
     private final ObjectMapper objectMapper;
 
+    /**
+     * Version du format de remédiation. L'augmenter invalide les analyses déjà en cache (nouveau
+     * prompt / nouveau schéma) sans toucher à la table : les anciennes clés ne sont plus demandées.
+     */
+    static final String FORMAT_VERSION = "v2";
+
     public String computeCacheKey(String ruleKey, String filePath, Integer line, String codeSnippet, boolean deepAnalysis) {
+        return computeCacheKey(ruleKey, filePath, line, codeSnippet, deepAnalysis, RemediationEvidence.none());
+    }
+
+    /**
+     * Clé de cache. Depuis v2 elle inclut l'application et l'empreinte des preuves : avant, une analyse
+     * (« le serveur FastAPI… ») était resservie à toute autre application ayant le même titre de finding.
+     */
+    public String computeCacheKey(String ruleKey, String filePath, Integer line, String codeSnippet,
+                                  boolean deepAnalysis, RemediationEvidence evidence) {
         String normSnippet = CodeContextExtractor.normalizeForCacheKey(codeSnippet);
-        String payload = (ruleKey != null ? ruleKey.strip().toLowerCase() : "")
+        RemediationEvidence ev = evidence != null ? evidence : RemediationEvidence.none();
+        String payload = FORMAT_VERSION
+                + "|" + (ev.applicationScope() != null ? ev.applicationScope() : "")
+                + "|" + (ev.fingerprint() != null ? ev.fingerprint() : "")
+                + "|" + (ruleKey != null ? ruleKey.strip().toLowerCase() : "")
                 + "|" + (filePath != null ? filePath.strip() : "")
                 + "|" + (line != null ? line : "")
                 + "|" + (deepAnalysis ? "deep" : "std")

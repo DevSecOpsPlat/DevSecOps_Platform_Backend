@@ -39,8 +39,50 @@ public class FindingAiRemediationResponse {
     private List<String> verificationHints = new ArrayList<>();
     @Builder.Default
     private List<String> verificationCommands = new ArrayList<>();
-    /** Confiance de l'IA : HIGH | MEDIUM | LOW. */
+    /** Confiance finale : HIGH | MEDIUM | LOW, bornée par les preuves réellement disponibles (backend). */
     private String confidence;
+    /** Pourquoi ce niveau de confiance (preuves présentes / manquantes), rédigé par le backend. */
+    private String confidenceReason;
+    /** Confiance déclarée par le modèle, avant bornage (transparence). */
+    private String modelConfidence;
+
+    // ── Format v2 (diagnostic sourcé) — absents des analyses antérieures et des modèles statiques ──
+
+    /** Éléments du diagnostic, chacun avec sa provenance. */
+    @Builder.Default
+    private List<DiagnosisItem> diagnosis = new ArrayList<>();
+    /** CONFIRMED | PROBABLE | UNDETERMINED */
+    private String rootCauseStatus;
+    /** CONFIRMED | PROBABLE | UNDETERMINED */
+    private String locationStatus;
+    /** Niveaux où la correction peut s'appliquer (application, reverse proxy, CDN…). */
+    @Builder.Default
+    private List<FixLayer> fixLayers = new ArrayList<>();
+    /** Langage du correctif pour la coloration (python, java, yaml, nginx, http, bash…). */
+    private String patchLanguage;
+    /** Fichier ou composant auquel s'applique le correctif. */
+    private String patchTarget;
+
+    @Data
+    @Builder
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class DiagnosisItem {
+        private String statement;
+        /** SCANNER | PLATFORM_CHECK | REPOSITORY | HYPOTHESIS */
+        private String source;
+    }
+
+    @Data
+    @Builder
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class FixLayer {
+        /** APPLICATION | REVERSE_PROXY | CDN_TLS | KUBERNETES | WEB_SERVER | BUILD | DEPENDENCY | OTHER */
+        private String layer;
+        private String description;
+        private boolean recommended;
+    }
     private String rawModelOutput;
     private String codeContextSource;
 

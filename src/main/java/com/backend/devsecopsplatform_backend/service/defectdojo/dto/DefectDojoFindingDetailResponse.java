@@ -3,6 +3,7 @@ package com.backend.devsecopsplatform_backend.service.defectdojo.dto;
 import lombok.Builder;
 import lombok.Data;
 
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -50,6 +51,38 @@ public class DefectDojoFindingDetailResponse {
     private String codeContextSource;
     /** Message UI : chemin conteneur, fallback Dockerfile, etc. */
     private String codeContextHint;
+    /** Fichier du dépôt dont provient {@link #codeSnippet} (ex. main.py déduit du Dockerfile pour un finding DAST). */
+    private String codeFilePath;
 
     private UUID applicationId;
+
+    // ── Analyse dynamique (OWASP ZAP) ────────────────────────────────────────────────────────
+
+    /** Identifiant de la règle chez l'outil (ZAP : pluginid, ex. 10035 pour HSTS). */
+    private String toolRuleId;
+    /** true = finding DAST : ZAP a testé l'application déployée (réponses HTTP), pas le code source. */
+    private boolean dynamicFinding;
+    /** URL(s) testées par ZAP pour ce finding (endpoints DefectDojo). */
+    private List<String> analyzedUrls;
+    /** Contrôle des en-têtes fait par la plateforme sur la 1re URL, au moment de l'analyse. */
+    private LiveHttpCheck liveCheck;
+    /** Couches réellement traversées par la réponse (Cloudflare, Ingress Traefik généré par EnviroTest, conteneur). */
+    private List<String> exposureChain;
+
+    @Data
+    @Builder
+    public static class LiveHttpCheck {
+        private String url;
+        private Integer status;
+        /** Date ISO du contrôle (peut être postérieur au scan ZAP). */
+        private String checkedAt;
+        /** En-têtes de sécurité utiles (noms en minuscules) ; valeurs des cookies masquées. */
+        private Map<String, String> headers;
+        /** En-têtes de sécurité attendus mais absents de la réponse. */
+        private List<String> missingHeaders;
+        /** Origine envoyée pour le test CORS (null si pas de test CORS). */
+        private String corsTestOrigin;
+        /** Message si le contrôle n'a pas pu être fait ou n'est pas exploitable (environnement arrêté…). */
+        private String error;
+    }
 }

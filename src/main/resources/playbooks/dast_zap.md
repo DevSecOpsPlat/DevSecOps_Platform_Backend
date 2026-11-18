@@ -1,60 +1,62 @@
 ## Playbook: DAST (OWASP ZAP)
 
 ### Quand ça arrive
-- ScanType DAST, outil `zap` (baseline scan) contre l'**environnement éphémère déployé** (URL live) — pas contre le code source.
+- ScanType DAST, outil `zap` (baseline scan) contre l'**application déployée** (URL publique) — pas contre le code source.
+- ZAP observe des réponses HTTP (en-têtes, cookies, contenu). Il ne connaît ni le framework, ni le fichier responsable.
 
-### La cible est l'application DÉPLOYÉE
-- Le finding pointe une **URL/réponse HTTP**, jamais un fichier:ligne. On corrige la **configuration** (framework, serveur ou ingress) dans le dépôt, on redéploie, on re-scanne.
-- Un seul correctif d'en-têtes règle souvent 4-5 alertes d'un coup.
+### Ce qui est un fait, ce qui est à vérifier
+- Fait : « la réponse de l'URL X ne contient pas l'en-tête Y » (constat ZAP, éventuellement revérifié par le contrôle HTTP de la plateforme).
+- À vérifier : quel composant devrait poser l'en-tête, et si une configuration existe déjà ailleurs.
+- Ne jamais présenter un fichier (main.py, SecurityConfig.java…) comme responsable sans l'avoir lu.
 
-### Alerte n°1 : en-têtes de sécurité manquants (CSP, X-Frame-Options, HSTS, X-Content-Type-Options, Referrer-Policy)
-Choisir UNE couche d'application selon la stack (PIPELINE_CONTEXT) :
+### Chaîne d'exposition sur EnviroTest
+1. **Cloudflare** (tunnel) : TLS public, proxy. Peut ajouter HSTS (réglage de la zone) — administrateur de la plateforme.
+2. **Traefik** : Ingress Kubernetes **généré par EnviroTest** (routage, strip de préfixe). Il n'ajoute aucun en-tête de sécurité et n'est **pas dans le dépôt** du développeur — un middleware d'en-têtes est une option à demander à l'administrateur.
+3. **Conteneur de l'application** : l'application elle-même (ou le nginx d'une SPA). C'est le seul niveau que le développeur modifie dans son dépôt ; les en-têtes qu'il pose sont relayés tels quels.
+
+### Correctif au niveau application (quand la technologie est connue)
+**FastAPI / Starlette** :
+```python
+@app.middleware("http")
+async def security_headers(request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    return response
+```
 
 **Spring Boot (Spring Security)** :
 ```java
 http.headers(h -> h
-    .contentSecurityPolicy(csp -> csp.policyDirectives("default-src 'self'"))
-    .frameOptions(f -> f.deny())
-    .httpStrictTransportSecurity(hsts -> hsts.includeSubDomains(true).maxAgeInSeconds(31536000)));
+    .contentTypeOptions(Customizer.withDefaults())
+    .httpStrictTransportSecurity(hsts -> hsts.maxAgeInSeconds(31536000)));
 ```
 
-**Node/Express** :
-```js
-import helmet from "helmet";
-app.use(helmet());   // pose CSP, X-Frame-Options, HSTS, noSniff, etc.
-```
+**Node/Express** : `helmet()` (vérifier sa CSP par défaut avant de l'activer en production).
 
-**Django** : `SECURE_HSTS_SECONDS`, `X_FRAME_OPTIONS = "DENY"`, `SECURE_CONTENT_TYPE_NOSNIFF = True` dans settings.py (+ django-csp). **ASP.NET** : middleware d'en-têtes dans `Program.cs`.
-
-**SPA servie par nginx / Ingress K8s** (cas fréquent ici — l'app front n'a pas de « serveur » applicatif) :
+**SPA servie par nginx** :
 ```nginx
-add_header X-Frame-Options "DENY" always;
 add_header X-Content-Type-Options "nosniff" always;
-add_header Content-Security-Policy "default-src 'self'" always;
 ```
-ou annotations/`configuration-snippet` sur l'Ingress, versionnées dans le dépôt.
 
-### Alerte n°2 : cookies sans attributs (Secure / HttpOnly / SameSite)
-- Spring : `server.servlet.session.cookie.secure=true`, `.http-only=true`, `.same-site=lax`
-- Express : options de `express-session` (`cookie: { secure: true, httpOnly: true, sameSite: "lax" }`)
-
-### Alerte n°3 : divulgation d'information
-Stack traces / pages d'erreur détaillées → désactiver en prod ; masquer `Server` / `X-Powered-By` (Express : `app.disable("x-powered-by")`).
-
-### CSP : démarrer sans rien casser
-Commencer en mode rapport : en-tête `Content-Security-Policy-Report-Only`, observer les violations, puis basculer en bloquant. Une CSP trop stricte posée d'un coup casse souvent les scripts/styles inline d'une SPA.
+### Cas particuliers
+- **HSTS** : n'a d'effet qu'en HTTPS. `max-age=31536000` ; `includeSubDomains` seulement si tous les sous-domaines sont en HTTPS ; jamais `preload` par défaut. Sur EnviroTest, TLS est terminé par Cloudflare : HSTS peut être posé par Cloudflare (administrateur) ou par l'application.
+- **CSP** : partir des ressources réellement chargées (scripts, styles, polices, API, images). Commencer par `Content-Security-Policy-Report-Only`, observer les violations, puis passer en mode bloquant. Une CSP stricte posée d'un coup casse souvent les scripts/styles inline d'une SPA. Si une CSP existe déjà, la compléter.
+- **CORS** (Cross-Domain Misconfiguration) : regarder `Access-Control-Allow-Origin` et `Access-Control-Allow-Credentials` réellement renvoyés. `*` sans credentials sur des ressources publiques n'est pas exploitable en soi ; c'est grave si l'origine est reflétée avec `credentials: true` ou si des données privées sont servies.
+- **Anti-clickjacking** : si une CSP existe, ajouter `frame-ancestors 'none'` (ou `'self'`) à cette CSP sans écraser ses autres directives ; `X-Frame-Options: DENY` en complément pour les anciens navigateurs.
+- **Cookies** (Secure / HttpOnly / SameSite) : configuration de session de l'application.
+- **Divulgation d'information** (Server, X-Powered-By) : sévérité faible.
 
 ### Étapes
-1) Identifier l'alerte ZAP exacte (nom + evidence) et l'URL testée.
-2) Localiser la couche qui produit la réponse (framework applicatif, nginx, ingress).
-3) Appliquer le correctif DANS LE DÉPÔT (config versionnée), commit/push.
-4) Redéployer l'environnement puis relancer l'analyse depuis la plateforme (ZAP re-testera l'URL).
+1) Lire l'alerte ZAP (nom, URL testée) et le contrôle HTTP de la plateforme.
+2) Identifier la couche qui doit poser l'en-tête et vérifier qu'aucune configuration existante ne l'écrase.
+3) Corriger dans le dépôt (application) ou demander le réglage à l'administrateur (Cloudflare / Ingress).
+4) Redéployer puis relancer l'analyse depuis la plateforme (ZAP re-testera l'URL).
 
-### Vérification locale
+### Vérification
 ```bash
-curl -sI https://mon-env.example.com | grep -iE "content-security|x-frame|strict-transport|x-content-type|referrer-policy|set-cookie"
+curl -sI https://mon-app.envirotest.cloud/ | grep -iE "content-security|x-frame|strict-transport|x-content-type|referrer-policy|access-control|set-cookie"
 ```
 
 ### Notes
-- Beaucoup d'alertes baseline sont Low/Info : prioriser CSP, HSTS, cookies avant le cosmétique.
-- HSTS n'a de sens qu'en HTTPS ; sur un environnement éphémère en HTTP, certaines alertes sont structurelles à l'environnement, pas au code — le signaler plutôt qu'inventer un correctif.
+- Beaucoup d'alertes baseline sont Low/Info : prioriser CSP, cookies et CORS réellement exploitables avant le cosmétique.
+- Un seul middleware d'en-têtes règle souvent plusieurs alertes d'un coup.
