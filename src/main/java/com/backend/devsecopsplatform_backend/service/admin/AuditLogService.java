@@ -1,5 +1,7 @@
 package com.backend.devsecopsplatform_backend.service.admin;
 
+import com.backend.devsecopsplatform_backend.configuration.DisplayTime;
+
 import com.backend.devsecopsplatform_backend.entity.AuditAction;
 import com.backend.devsecopsplatform_backend.entity.AuditLog;
 import com.backend.devsecopsplatform_backend.repository.AuditLogRepository;
@@ -162,7 +164,7 @@ public class AuditLogService {
                             username,
                             count,
                             lastAction,
-                            lastAt != null ? lastAt.format(DISPLAY_DT) : "—"
+                            DisplayTime.format(lastAt, DISPLAY_DT)
                     );
                     return new AdminAuditTopUser(username, count, tooltip, lastAction, lastAt);
                 })
@@ -195,7 +197,7 @@ public class AuditLogService {
                     long failed = e.getValue()[1];
                     long total = success + failed;
                     double rate = total > 0 ? (success * 100.0 / total) : 0;
-                    String timeLabel = e.getKey().format(DateTimeFormatter.ofPattern("HH:mm"));
+                    String timeLabel = DisplayTime.format(e.getKey(), DateTimeFormatter.ofPattern("HH:mm"));
                     String tooltip = String.format(
                             "%s — Succès : %d, Échecs : %d. Taux de succès : %.0f%%.%s",
                             timeLabel,
@@ -206,7 +208,7 @@ public class AuditLogService {
                                     ? String.format(" Pic d'échecs (%d échec(s)).", peakFailed)
                                     : ""
                     );
-                    return new AdminAuditLoginHourPoint(e.getKey().format(HOUR_FMT), success, failed, tooltip);
+                    return new AdminAuditLoginHourPoint(DisplayTime.format(e.getKey(), HOUR_FMT), success, failed, tooltip);
                 })
                 .toList();
     }
@@ -250,7 +252,7 @@ public class AuditLogService {
                             ip,
                             burstCount,
                             SUSPICIOUS_IP_WINDOW_MINUTES,
-                            lastAt != null ? lastAt.format(DISPLAY_DT) : "—"
+                            DisplayTime.format(lastAt, DISPLAY_DT)
                     ),
                     lastAt
             ));
@@ -268,7 +270,7 @@ public class AuditLogService {
                         existing.tooltip() + String.format(
                                 " Compte verrouillé %d fois — dernier verrouillage : %s.",
                                 lockCount,
-                                lastAt != null ? lastAt.format(DISPLAY_DT) : "—"
+                                DisplayTime.format(lastAt, DISPLAY_DT)
                         ),
                         lastAt != null && (existing.lastFailureAt() == null || lastAt.isAfter(existing.lastFailureAt()))
                                 ? lastAt
@@ -282,7 +284,7 @@ public class AuditLogService {
                                 "IP %s : compte verrouillé %d fois (historique complet). Dernier verrouillage : %s.",
                                 ip,
                                 lockCount,
-                                lastAt != null ? lastAt.format(DISPLAY_DT) : "—"
+                                DisplayTime.format(lastAt, DISPLAY_DT)
                         ),
                         lastAt
                 ));
@@ -457,7 +459,7 @@ public class AuditLogService {
         return new AdminAuditKpiPanelItem(
                 actionLabel(log.getAction().name()),
                 actor + (StringUtils.hasText(log.getDetails()) ? " — " + truncate(log.getDetails(), 100) : ""),
-                "IP : " + formatIp(log.getIpAddress()) + " · " + log.getCreatedAt().format(DISPLAY_DT),
+                "IP : " + formatIp(log.getIpAddress()) + " · " + DisplayTime.format(log.getCreatedAt(), DISPLAY_DT),
                 log.getIpAddress(),
                 log.getCreatedAt()
         );

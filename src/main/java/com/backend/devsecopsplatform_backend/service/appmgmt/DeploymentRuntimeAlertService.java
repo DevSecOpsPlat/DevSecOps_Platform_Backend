@@ -1,5 +1,7 @@
 package com.backend.devsecopsplatform_backend.service.appmgmt;
 
+import com.backend.devsecopsplatform_backend.configuration.DisplayTime;
+
 import com.backend.devsecopsplatform_backend.entity.Alert;
 import com.backend.devsecopsplatform_backend.entity.AlertStatus;
 import com.backend.devsecopsplatform_backend.entity.AlertType;
@@ -445,7 +447,7 @@ public class DeploymentRuntimeAlertService {
         row.put("type", a.getType().name());
         row.put("message", a.getMessage());
         row.put("status", a.getStatus().name());
-        row.put("createdAt", a.getCreatedAt() != null ? a.getCreatedAt().toString() : null);
+        row.put("createdAt", DisplayTime.iso(a.getCreatedAt()));
         row.put("source", "history");
         row.put("severity", severityFromType(a.getType()));
         row.put("kind", kindFromType(a.getType(), a.getMessage()));

@@ -1,5 +1,7 @@
 package com.backend.devsecopsplatform_backend.service.admin;
 
+import com.backend.devsecopsplatform_backend.configuration.DisplayTime;
+
 import com.backend.devsecopsplatform_backend.entity.Alert;
 import com.backend.devsecopsplatform_backend.entity.AlertStatus;
 import com.backend.devsecopsplatform_backend.entity.AlertType;
@@ -203,7 +205,7 @@ public class AlertService {
                 .map(a -> new AdminKpiPanelItem(
                         typeLabelForAlert(a),
                         truncate(a.getMessage(), 100),
-                        a.getStatus().name() + " · " + a.getCreatedAt().format(DISPLAY_DT),
+                        a.getStatus().name() + " · " + DisplayTime.format(a.getCreatedAt(), DISPLAY_DT),
                         a.getIpAddress(),
                         a.getCreatedAt()
                 ))
@@ -224,7 +226,7 @@ public class AlertService {
                         b.ip(),
                         b.reason(),
                         (b.currentlyActive() ? "Actif — jusqu'au " : "Expiré — était jusqu'au ")
-                                + b.blockedUntil().format(DISPLAY_DT),
+                                + DisplayTime.format(b.blockedUntil(), DISPLAY_DT),
                         b.ip(),
                         b.createdAt()
                 ))
@@ -246,7 +248,7 @@ public class AlertService {
                 .map(a -> new AdminKpiPanelItem(
                         typeLabelForAlert(a),
                         truncate(a.getMessage(), 120),
-                        "IP : " + formatIp(a.getIpAddress()) + " · " + a.getCreatedAt().format(DISPLAY_DT),
+                        "IP : " + formatIp(a.getIpAddress()) + " · " + DisplayTime.format(a.getCreatedAt(), DISPLAY_DT),
                         a.getIpAddress(),
                         a.getCreatedAt()
                 ))
@@ -364,17 +366,18 @@ public class AlertService {
         if (all.isEmpty()) {
             return List.of();
         }
+        // Jours de l'utilisateur (Tunisie), pas jours UTC : une alerte à 00:30 locale compte pour ce jour-là.
         LocalDate start = all.stream()
-                .map(a -> a.getCreatedAt().toLocalDate())
+                .map(a -> DisplayTime.toDisplay(a.getCreatedAt()).toLocalDate())
                 .min(LocalDate::compareTo)
-                .orElse(LocalDate.now());
-        LocalDate end = LocalDate.now();
+                .orElse(DisplayTime.today());
+        LocalDate end = DisplayTime.today();
         Map<LocalDate, List<Alert>> byDay = new LinkedHashMap<>();
         for (LocalDate d = start; !d.isAfter(end); d = d.plusDays(1)) {
             byDay.put(d, new ArrayList<>());
         }
         for (Alert alert : all) {
-            LocalDate day = alert.getCreatedAt().toLocalDate();
+            LocalDate day = DisplayTime.toDisplay(alert.getCreatedAt()).toLocalDate();
             byDay.computeIfAbsent(day, k -> new ArrayList<>()).add(alert);
         }
         return byDay.entrySet().stream()

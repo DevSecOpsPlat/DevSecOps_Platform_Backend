@@ -1,5 +1,7 @@
 package com.backend.devsecopsplatform_backend.service.security.monitoring;
 
+import com.backend.devsecopsplatform_backend.configuration.DisplayTime;
+
 import com.backend.devsecopsplatform_backend.configuration.SecurityMonitoringProperties;
 import com.backend.devsecopsplatform_backend.entity.AlertType;
 import com.backend.devsecopsplatform_backend.entity.AuditAction;
@@ -115,7 +117,7 @@ public class SecurityMonitoringService {
         String message = String.format(
                 "IP bloquée automatiquement — %s — jusqu'au %s — %s",
                 ip,
-                until.format(FMT),
+                DisplayTime.format(until, FMT),
                 reason
         );
         if (shouldEmitAlert(ip, AlertType.IP_BLOCKED.name())) {

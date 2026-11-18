@@ -1,6 +1,7 @@
 package com.backend.devsecopsplatform_backend.configuration;
 
 import com.backend.devsecopsplatform_backend.service.CustomUserDetailsService;
+import jakarta.servlet.DispatcherType;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
@@ -80,6 +81,11 @@ public class SecurityConfig {
                         .accessDeniedHandler(securityExceptionHandlers)
                 )
                 .authorizeHttpRequests(auth -> auth
+                        // Fin d'une réponse en flux (SSE de l'assistant pipeline) : Spring repasse la requête
+                        // dans la chaîne de filtres (dispatch ASYNC) sans le JWT, déjà vérifié au 1er passage.
+                        // Refusée, elle coupait la connexion en pleine réponse (« Connexion au flux IA impossible »,
+                        // ERR_QUIC_PROTOCOL_ERROR côté navigateur). ERROR : page d'erreur d'une requête déjà traitée.
+                        .dispatcherTypeMatchers(DispatcherType.ASYNC, DispatcherType.ERROR).permitAll()
                         // CORS preflight (OPTIONS) doit toujours passer
                         .requestMatchers(HttpMethod.OPTIONS, "/**").permitAll()
                         // Endpoint error Spring (évite 401 sur /error en cas d'exception 500)

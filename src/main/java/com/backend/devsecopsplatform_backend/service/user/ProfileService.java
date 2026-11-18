@@ -1,5 +1,7 @@
 package com.backend.devsecopsplatform_backend.service.user;
 
+import com.backend.devsecopsplatform_backend.configuration.DisplayTime;
+
 import com.backend.devsecopsplatform_backend.controller.user.ChangePasswordRequest;
 import com.backend.devsecopsplatform_backend.controller.user.ProfileResponse;
 import com.backend.devsecopsplatform_backend.controller.user.UpdateEmailRequest;
@@ -107,7 +109,7 @@ public class ProfileService {
         List<String> roles = user.getRoles() == null
                 ? List.of()
                 : user.getRoles().stream().map(Role::name).toList();
-        String createdAt = user.getCreatedAt() != null ? user.getCreatedAt().toString() : null;
+        String createdAt = DisplayTime.iso(user.getCreatedAt());
         return new ProfileResponse(
                 user.getId(),
                 user.getUsername(),

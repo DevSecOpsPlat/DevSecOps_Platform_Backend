@@ -11,6 +11,10 @@ import org.springframework.web.bind.annotation.*;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
 /**
  * API pour l'analyse des artifacts de pipeline par l'IA (vulnérabilités + remédiations).
@@ -26,6 +30,13 @@ public class AiAnalysisController {
 
     private final AiAnalysisService aiAnalysisService;
     private final ObjectMapper objectMapper;
+
+    /** Signaux de maintien des flux SSE (un seul fil suffit : un envoi ne dure que quelques ms). */
+    private static final ScheduledExecutorService HEARTBEAT = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "sse-heartbeat");
+        t.setDaemon(true);
+        return t;
+    });
 
     /**
      * Analyse un artifact de pipeline (rapport de scan) et renvoie les vulnérabilités
@@ -66,6 +77,18 @@ public class AiAnalysisController {
         log.info("Demande d'explication logs IA (stream) (job={}, stage={})", request.getJobName(), request.getStageName());
         // Timeout large : le routage « diagnostic » (7B local) peut prendre jusqu'à ~420s.
         SseEmitter emitter = new SseEmitter(480_000L);
+        // Cloudflare coupe une réponse sans données pendant 100 s : un commentaire SSE toutes les 15 s
+        // garde la connexion ouverte pendant que le modèle réfléchit (ignoré par le navigateur).
+        ScheduledFuture<?> heartbeat = HEARTBEAT.scheduleAtFixedRate(() -> {
+            try {
+                emitter.send(SseEmitter.event().comment("ping"));
+            } catch (Exception ignored) {
+                // flux déjà terminé : l'annulation suit via onCompletion/onError
+            }
+        }, 15, 15, TimeUnit.SECONDS);
+        emitter.onCompletion(() -> heartbeat.cancel(false));
+        emitter.onTimeout(() -> heartbeat.cancel(false));
+        emitter.onError(e -> heartbeat.cancel(false));
         aiAnalysisService.streamExplainPipelineLogs(
                 request,
                 deep -> {
