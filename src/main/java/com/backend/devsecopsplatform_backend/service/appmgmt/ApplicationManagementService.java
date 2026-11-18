@@ -73,6 +73,7 @@ public class ApplicationManagementService {
     private final ImageTagAvailabilityService imageTagAvailability;
     private final K8sManifestApplyService k8sManifestApplyService;
     private final GitLabService gitLabService;
+    private final GitAccessVerifier gitAccessVerifier;
     private final DeploymentRuntimeAlertService deploymentRuntimeAlertService;
     private final DeploymentMetricsSamplerService deploymentMetricsSamplerService;
     private final TransactionTemplate readOnlyTx;
@@ -98,6 +99,7 @@ public class ApplicationManagementService {
             ImageTagAvailabilityService imageTagAvailability,
             K8sManifestApplyService k8sManifestApplyService,
             GitLabService gitLabService,
+            GitAccessVerifier gitAccessVerifier,
             @Lazy DeploymentRuntimeAlertService deploymentRuntimeAlertService,
             DeploymentMetricsSamplerService deploymentMetricsSamplerService,
             PlatformTransactionManager transactionManager
@@ -117,6 +119,7 @@ public class ApplicationManagementService {
         this.imageTagAvailability = imageTagAvailability;
         this.k8sManifestApplyService = k8sManifestApplyService;
         this.gitLabService = gitLabService;
+        this.gitAccessVerifier = gitAccessVerifier;
         this.deploymentRuntimeAlertService = deploymentRuntimeAlertService;
         this.deploymentMetricsSamplerService = deploymentMetricsSamplerService;
         this.readOnlyTx = new TransactionTemplate(transactionManager);
@@ -219,13 +222,14 @@ public class ApplicationManagementService {
     public AppServiceResponse addService(UUID appId, AppServiceRequest request) {
         ManagedApplication app = loadOwnedApp(appId);
         validateServiceRequest(app, request, null);
+        verifyRepositoryAccess(request.getGitRepositoryUrl(), request.getGitToken(), false);
 
         AppService svc = new AppService();
         svc.setManagedApplication(app);
         svc.setCreatedBy(app.getCreatedBy());
         applyServiceScalars(svc, request);
         if (request.getGitToken() != null && !request.getGitToken().isBlank() && !MASK.equals(request.getGitToken())) {
-            svc.setGitToken(request.getGitToken());
+            svc.setGitToken(request.getGitToken().trim());
         }
         AppService saved = serviceRepository.save(svc);
         syncEnvVars(saved, request.getEnvVars());
@@ -238,9 +242,10 @@ public class ApplicationManagementService {
         AppService svc = serviceRepository.findByIdAndManagedApplication_Id(serviceId, appId)
                 .orElseThrow(() -> new AppValidationException("Service introuvable dans cette application."));
         validateServiceRequest(svc.getManagedApplication(), request, serviceId);
+        verifyRepositoryAccess(request.getGitRepositoryUrl(), request.getGitToken(), svc.getGitToken() != null && !svc.getGitToken().isBlank());
         applyServiceScalars(svc, request);
         if (request.getGitToken() != null && !request.getGitToken().isBlank() && !MASK.equals(request.getGitToken())) {
-            svc.setGitToken(request.getGitToken());
+            svc.setGitToken(request.getGitToken().trim());
         }
         syncEnvVars(svc, request.getEnvVars());
         return mapService(serviceRepository.save(svc));
@@ -311,10 +316,59 @@ public class ApplicationManagementService {
         svc.setHardenedSecurityContext(request.isHardenedSecurityContext());
     }
 
+    /**
+     * Jeton d'accès Git (GitHub ghp_… / github_pat_…, GitLab glpat-…, Bitbucket…) : lettres, chiffres, « _ - . ».
+     * Un mot de passe saisi ici (« @ », espace…) cassait l'URL de clone du pipeline (« URL rejected: Bad hostname »)
+     * et le service n'était jamais construit.
+     */
+    private static final java.util.regex.Pattern GIT_TOKEN_PATTERN = java.util.regex.Pattern.compile("^[A-Za-z0-9_.\\-]{20,255}$");
+
+    private static void validateGitToken(String token) {
+        if (token == null || token.isBlank() || MASK.equals(token)) {
+            return;
+        }
+        if (!GIT_TOKEN_PATTERN.matcher(token.trim()).matches()) {
+            throw new AppValidationException("Le token Git doit être un jeton d'accès personnel (ghp_…, github_pat_… ou glpat-…), "
+                    + "pas un mot de passe : au moins 20 caractères, sans espace ni « @ », « : », « / ». "
+                    + "Laissez le champ vide pour un dépôt public.");
+        }
+    }
+
+    /**
+     * Accès au dépôt vérifié à l'enregistrement (et non plus au clone du pipeline, des minutes plus tard) :
+     * token renseigné → vérifié auprès de GitHub / GitLab ; token vide → le dépôt doit être public.
+     * Fournisseur injoignable ou hôte inconnu : enregistrement accepté.
+     *
+     * @param storedToken un token est déjà enregistré et conservé (champ laissé masqué)
+     */
+    private void verifyRepositoryAccess(String repoUrl, String requestToken, boolean storedToken) {
+        String repo = repoUrl == null ? "" : repoUrl.trim();
+        boolean newToken = requestToken != null && !requestToken.isBlank() && !MASK.equals(requestToken);
+        String provider = repo.toLowerCase(java.util.Locale.ROOT).contains("github") ? "GitHub" : "GitLab";
+        if (newToken) {
+            switch (gitAccessVerifier.verifyToken(repo, requestToken.trim())) {
+                case INVALID -> throw new AppValidationException("Le token Git est refusé par " + provider
+                        + " : il est invalide, révoqué ou expiré. Pour un dépôt public, laissez le champ vide.");
+                case NO_ACCESS -> throw new AppValidationException("Ce token Git est valide mais n'a pas accès au dépôt " + repo
+                        + " (ou ce dépôt n'existe pas) : vérifiez l'URL et donnez-lui le droit de lecture du dépôt.");
+                default -> { }
+            }
+            return;
+        }
+        if (storedToken || !gitAccessVerifier.isKnownHost(repo)) {
+            return;
+        }
+        if (gitAccessVerifier.checkAnonymousAccess(repo) == GitAccessVerifier.Status.PRIVATE_OR_MISSING) {
+            throw new AppValidationException("Dépôt introuvable ou privé : " + repo
+                    + ". Vérifiez l'URL ; si le dépôt est privé, renseignez un token d'accès en lecture.");
+        }
+    }
+
     private void validateServiceRequest(ManagedApplication app, AppServiceRequest request, UUID selfId) {
         if (request.getRole() == null) {
             throw new AppValidationException("Le rôle du service est obligatoire.");
         }
+        validateGitToken(request.getGitToken());
         AppServiceRole role = request.getRole();
 
         String name = request.getName() == null ? "" : request.getName().trim();
