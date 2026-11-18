@@ -945,10 +945,14 @@ public class DefectDojoService {
             }
         }
         fp.append("|").append(nullToEmpty(d.getCodeFilePath()));
+        fp.append("|").append(d.getRespondingServiceId());
+        if (d.getRepositoryFacts() != null) fp.append("|").append(String.join("¤", d.getRepositoryFacts()));
+        boolean pipelineContextRelevant = !d.isDynamicFinding() || d.getRespondingServiceId() == null
+                || d.getRespondingServiceId().equals(d.getApplicationId());
         return new com.backend.devsecopsplatform_backend.service.ai.RemediationEvidence(
                 d.isDynamicFinding(), repo, manual, scannerLocation, live,
                 d.getApplicationId() != null ? d.getApplicationId().toString() : "",
-                Integer.toHexString(fp.toString().hashCode()));
+                Integer.toHexString(fp.toString().hashCode()), pipelineContextRelevant);
     }
 
     /**
@@ -967,17 +971,16 @@ public class DefectDojoService {
         }
         DefectDojoFindingDetailResponse.LiveHttpCheck check = d.getLiveCheck();
         if (check != null) {
-            if (check.getError() != null && (check.getHeaders() == null || check.getHeaders().isEmpty())) {
-                sb.append("[CONTROLE_PLATEFORME] ").append(check.getError()).append("\n");
+            if (check.getError() != null) {
+                // Environnement arrêté, erreur serveur… : les en-têtes reçus ne sont pas ceux de l'application scannée.
+                sb.append("[CONTROLE_PLATEFORME] Contrôle NON exploitable : ").append(check.getError())
+                        .append(" Ne t'appuie que sur le constat ZAP.\n");
             } else {
                 sb.append("[CONTROLE_PLATEFORME] Requête GET envoyée par EnviroTest le ").append(check.getCheckedAt())
                         .append(" sur ").append(check.getUrl()).append(" → statut ").append(check.getStatus())
                         .append(" (état ACTUEL, il peut différer du moment du scan)")
                         .append(check.getCorsTestOrigin() != null ? " — en-tête Origin envoyé : " + check.getCorsTestOrigin() : "")
                         .append("\n");
-                if (check.getError() != null) {
-                    sb.append("[CONTROLE_PLATEFORME] Attention : ").append(check.getError()).append("\n");
-                }
                 sb.append("  En-têtes présents:\n");
                 if (check.getHeaders() == null || check.getHeaders().isEmpty()) {
                     sb.append("    (aucun en-tête de sécurité)\n");
@@ -996,12 +999,25 @@ public class DefectDojoService {
                 sb.append("  ").append(i + 1).append(". ").append(d.getExposureChain().get(i)).append("\n");
             }
         }
+        if (d.getRespondingService() != null) {
+            boolean other = d.getRespondingServiceId() != null && d.getApplicationId() != null
+                    && !d.getRespondingServiceId().equals(d.getApplicationId());
+            sb.append("[PLATEFORME] Service qui a répondu à l'URL testée: ").append(d.getRespondingService())
+                    .append(d.getRoutingReason() != null ? " (" + d.getRoutingReason() + ")" : "")
+                    .append(other ? " — ce n'est PAS le service sous lequel DefectDojo range ce finding : raisonne sur ce service-là." : "")
+                    .append("\n");
+        }
+        if (d.getRepositoryFacts() != null && !d.getRepositoryFacts().isEmpty()) {
+            sb.append("[DEPOT] Constats établis par la plateforme dans le dépôt de ce service (fichiers lus) :\n");
+            d.getRepositoryFacts().forEach(f -> sb.append("  - ").append(f).append("\n"));
+            sb.append("  (une absence dans ces fichiers ne prouve pas l'absence dans tout le projet, ni au niveau de l'Ingress ou de Cloudflare)\n");
+        }
         if (d.getCodeFilePath() != null) {
-            sb.append("[DEPOT] Fichier lu dans le dépôt: ").append(d.getCodeFilePath())
+            sb.append("[DEPOT] Fichier joint ci-dessous: ").append(d.getCodeFilePath())
                     .append(d.getCodeContextHint() != null ? " (" + d.getCodeContextHint() + ")" : "")
-                    .append(" — extrait joint ci-dessous.\n");
+                    .append(".\n");
         } else {
-            sb.append("[DEPOT] Aucun fichier de l'application n'a pu être lu pour ce finding.\n");
+            sb.append("[DEPOT] Aucun fichier du service n'a pu être lu pour ce finding.\n");
         }
     }
 

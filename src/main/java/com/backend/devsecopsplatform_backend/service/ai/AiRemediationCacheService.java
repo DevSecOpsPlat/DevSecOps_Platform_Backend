@@ -27,7 +27,7 @@ public class AiRemediationCacheService {
      * Version du format de remédiation. L'augmenter invalide les analyses déjà en cache (nouveau
      * prompt / nouveau schéma) sans toucher à la table : les anciennes clés ne sont plus demandées.
      */
-    static final String FORMAT_VERSION = "v2";
+    static final String FORMAT_VERSION = "v3";
 
     public String computeCacheKey(String ruleKey, String filePath, Integer line, String codeSnippet, boolean deepAnalysis) {
         return computeCacheKey(ruleKey, filePath, line, codeSnippet, deepAnalysis, RemediationEvidence.none());

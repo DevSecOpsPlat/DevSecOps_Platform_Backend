@@ -34,7 +34,7 @@ class RemediationEvidencePolicyTest {
 
     @Test
     void dastWithoutEvidenceCannotBeConfirmedNorHighConfidence() {
-        RemediationEvidence ev = new RemediationEvidence(true, false, false, false, false, "app-1", "x");
+        RemediationEvidence ev = new RemediationEvidence(true, false, false, false, false, "app-1", "x", true);
         FindingAiRemediationResponse out = AiAnalysisService.applyEvidencePolicy(
                 modelAnswer("CONFIRMED", "CONFIRMED", "HIGH"), ev, false, DAST_CTX);
 
@@ -55,7 +55,7 @@ class RemediationEvidencePolicyTest {
 
     @Test
     void codeReadAndScannerLocationAllowHighConfidence() {
-        RemediationEvidence ev = new RemediationEvidence(false, true, false, true, false, "app-1", "x");
+        RemediationEvidence ev = new RemediationEvidence(false, true, false, true, false, "app-1", "x", true);
         FindingAiRemediationResponse out = AiAnalysisService.applyEvidencePolicy(
                 modelAnswer("CONFIRMED", "CONFIRMED", "HIGH"), ev, true, "Titre: SQL injection\n");
 
@@ -68,7 +68,7 @@ class RemediationEvidencePolicyTest {
 
     @Test
     void undeterminedCauseAndLocationDropThePatch() {
-        RemediationEvidence ev = new RemediationEvidence(true, false, false, false, true, "app-1", "x");
+        RemediationEvidence ev = new RemediationEvidence(true, false, false, false, true, "app-1", "x", true);
         FindingAiRemediationResponse out = AiAnalysisService.applyEvidencePolicy(
                 modelAnswer("UNDETERMINED", "UNDETERMINED", "HIGH"), ev, false, DAST_CTX);
 
@@ -85,19 +85,77 @@ class RemediationEvidencePolicyTest {
         assertEquals("MEDIUM", out.getConfidence());
     }
 
+    private static final String CSP_CTX = """
+            Titre: Content Security Policy (CSP) Header Not Set
+            Type d'analyse: DAST (OWASP ZAP)
+            Règle ZAP (pluginid): 10038
+            [SCANNER] URL testées par ZAP: https://aoo-1.envirotest.cloud/
+            """;
+
+    @Test
+    void genericCodeReviewInEnglishIsRejected() {
+        // Réponse réelle du modèle de secours qwen2.5-coder:1.5b sur le finding CSP (18/11/2026).
+        FindingAiRemediationResponse r = FindingAiRemediationResponse.builder()
+                .problemSummary("The provided code snippet is a Python FastAPI application that interacts with a PostgreSQL database "
+                        + "to manage Docker configuration files. It includes routes for creating, listing, and updating configurations.")
+                .rootCause("No specific root cause was identified based on the provided information.")
+                .remediationSteps(List.of("Ensure that all dependencies are installed correctly using pip or poetry."))
+                .build();
+        RemediationEvidence ev = new RemediationEvidence(true, true, false, false, false, "app", "x", true);
+        assertNotNull(AiAnalysisService.qualityProblem(r, CSP_CTX, ev));
+    }
+
+    @Test
+    void offTopicFrenchAnswerIsRejectedButARelevantOneIsKept() {
+        RemediationEvidence ev = new RemediationEvidence(true, true, false, false, false, "app", "x", true);
+        FindingAiRemediationResponse offTopic = FindingAiRemediationResponse.builder()
+                .problemSummary("Le code est bien structuré et suit les bonnes pratiques Python.")
+                .remediationSteps(List.of("Installer les dépendances avec pip."))
+                .build();
+        assertEquals("réponse sans rapport avec le finding", AiAnalysisService.qualityProblem(offTopic, CSP_CTX, ev));
+
+        FindingAiRemediationResponse relevant = FindingAiRemediationResponse.builder()
+                .problemSummary("La page d'accueil servie par le service front ne renvoie pas d'en-tête Content‑Security‑Policy.")
+                .remediationSteps(List.of("Définir une CSP adaptée aux ressources chargées, d'abord en Report-Only."))
+                .build();
+        assertNull(AiAnalysisService.qualityProblem(relevant, CSP_CTX, ev));
+    }
+
+    @Test
+    void proseIsNotAPatch() {
+        assertFalse(AiAnalysisService.looksLikeCode(
+                "The suggested patch would be to install all dependencies using pip or poetry and configure the proxy."));
+        assertTrue(AiAnalysisService.looksLikeCode("add_header Content-Security-Policy \"default-src 'self'\" always;"));
+    }
+
+    @Test
+    void stepsReturnedAsObjectsAreRead() throws Exception {
+        com.fasterxml.jackson.databind.JsonNode arr = new com.fasterxml.jackson.databind.ObjectMapper()
+                .readTree("[{\"step\":\"1. Ouvrir vite.config.ts\"},\"2) Ajouter server.headers\",{\"n\":3}]");
+        assertEquals(List.of("Ouvrir vite.config.ts", "Ajouter server.headers"), AiAnalysisService.readTextItems(arr));
+    }
+
+    @Test
+    void groqDurationsAreParsed() {
+        assertEquals(5692, AiAnalysisService.parseGroqDuration("5.692s"));
+        assertEquals(86400, AiAnalysisService.parseGroqDuration("1m26.4s"));
+        assertEquals(450, AiAnalysisService.parseGroqDuration("450ms"));
+        assertEquals(-1, AiAnalysisService.parseGroqDuration("bientôt"));
+    }
+
     @Test
     void cacheKeyIsScopedByApplicationAndEvidence() {
         AiRemediationCacheService cache = new AiRemediationCacheService(null, null);
         String rule = "cwe-319|strict-transport-security header not set";
         String a = cache.computeCacheKey(rule, "", null, "", false,
-                new RemediationEvidence(true, false, false, false, true, "app-a", "f1"));
+                new RemediationEvidence(true, false, false, false, true, "app-a", "f1", true));
         String b = cache.computeCacheKey(rule, "", null, "", false,
-                new RemediationEvidence(true, false, false, false, true, "app-b", "f1"));
+                new RemediationEvidence(true, false, false, false, true, "app-b", "f1", true));
         String c = cache.computeCacheKey(rule, "", null, "", false,
-                new RemediationEvidence(true, false, false, false, true, "app-a", "f2"));
+                new RemediationEvidence(true, false, false, false, true, "app-a", "f2", true));
         assertNotEquals(a, b);
         assertNotEquals(a, c);
         assertEquals(a, cache.computeCacheKey(rule, "", null, "", false,
-                new RemediationEvidence(true, false, false, false, true, "app-a", "f1")));
+                new RemediationEvidence(true, false, false, false, true, "app-a", "f1", true)));
     }
 }

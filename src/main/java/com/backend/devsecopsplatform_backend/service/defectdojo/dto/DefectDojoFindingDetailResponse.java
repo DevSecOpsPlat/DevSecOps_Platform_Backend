@@ -68,6 +68,16 @@ public class DefectDojoFindingDetailResponse {
     private LiveHttpCheck liveCheck;
     /** Couches réellement traversées par la réponse (Cloudflare, Ingress Traefik généré par EnviroTest, conteneur). */
     private List<String> exposureChain;
+    /** Service qui a répondu à l'URL testée (routage de l'Ingress), ex. « front (FRONTEND) — dépôt x/y ». */
+    private String respondingService;
+    private UUID respondingServiceId;
+    /** Pourquoi ce service (chemin « / » → frontend, « /api » → backend…). */
+    private String routingReason;
+    /** Constats vérifiables lus dans le dépôt de ce service (« vite.config.ts : aucune mention de … »). */
+    private List<String> repositoryFacts;
+    /** Extrait envoyé à l'IA : fichier entier s'il est court, sinon lignes de configuration HTTP. */
+    @com.fasterxml.jackson.annotation.JsonIgnore
+    private String aiCodeExcerpt;
 
     @Data
     @Builder

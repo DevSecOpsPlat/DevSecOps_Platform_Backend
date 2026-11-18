@@ -216,7 +216,9 @@ public class DefectDojoController {
             snippet = request.getCodeSnippet().strip();
             codeContextSource = "MANUAL";
         } else if (detail.getCodeSnippet() != null && !detail.getCodeSnippet().isBlank()) {
-            snippet = detail.getCodeSnippet().strip();
+            // DAST : l'IA reçoit l'extrait ciblé (configuration HTTP), pas tout le fichier (routes, base de données…).
+            String excerpt = detail.getAiCodeExcerpt();
+            snippet = (excerpt != null && !excerpt.isBlank() ? excerpt : detail.getCodeSnippet()).strip();
             codeContextSource = detail.getCodeContextSource() != null ? detail.getCodeContextSource() : "REPO";
         }
         String ctx = defectDojoService.buildAiContext(detail);
@@ -249,7 +251,9 @@ public class DefectDojoController {
     ) {
         DefectDojoFindingDetailResponse detail = defectDojoService.getFindingDetail(applicationId, findingId, branch);
         String ctx = defectDojoService.buildAiContext(detail);
-        String snippet = detail.getCodeSnippet() != null ? detail.getCodeSnippet() : "";
+        String snippet = detail.getAiCodeExcerpt() != null && !detail.getAiCodeExcerpt().isBlank()
+                ? detail.getAiCodeExcerpt()
+                : (detail.getCodeSnippet() != null ? detail.getCodeSnippet() : "");
         String reply = aiAnalysisService.chatAboutFinding(
                 applicationId, branch,
                 ctx,
