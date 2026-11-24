@@ -1,6 +1,6 @@
 package com.backend.devsecopsplatform_backend.configuration;
 
-import com.backend.devsecopsplatform_backend.service.CustomUserDetailsService;
+import com.backend.devsecopsplatform_backend.service.auth.CustomUserDetailsService;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;

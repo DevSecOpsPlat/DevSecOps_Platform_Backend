@@ -3,8 +3,8 @@ package com.backend.devsecopsplatform_backend.service.admin;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDeployment;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDeploymentStatus;
 import com.backend.devsecopsplatform_backend.repository.AppDeploymentRepository;
-import com.backend.devsecopsplatform_backend.service.appmgmt.AppValidationException;
-import com.backend.devsecopsplatform_backend.service.appmgmt.K8sManifestApplyService;
+import com.backend.devsecopsplatform_backend.service.application.AppValidationException;
+import com.backend.devsecopsplatform_backend.service.deployment.K8sManifestApplyService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -20,7 +20,7 @@ import java.util.stream.Collectors;
 /**
  * Monitoring cluster-wide réservé admin (console `/admin/monitoring`, protégée globalement par
  * {@code hasAuthority("ROLE_ADMIN")} sur {@code /api/admin/**} — voir SecurityConfig). Distinct de
- * {@link com.backend.devsecopsplatform_backend.service.appmgmt.ApplicationManagementService},
+ * {@link com.backend.devsecopsplatform_backend.service.application.ApplicationManagementService},
  * qui reste scopé par propriétaire (un utilisateur normal ne voit que ses propres apps) — ici on
  * lit tous les environnements RUNNING de tous les utilisateurs, tous les nœuds du cluster.
  * Chantier "monitoring persistant", 18 août 2026.

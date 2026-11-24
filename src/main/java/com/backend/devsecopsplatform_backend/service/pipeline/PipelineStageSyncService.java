@@ -1,0 +1,305 @@
+package com.backend.devsecopsplatform_backend.service.pipeline;
+
+import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
+import com.backend.devsecopsplatform_backend.entity.PipelineStatus;
+import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
+import com.backend.devsecopsplatform_backend.service.environment.EnvironmentLifecycleService;
+import com.backend.devsecopsplatform_backend.service.qualitygate.QualityGateService;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.Instant;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import com.backend.devsecopsplatform_backend.service.gitlab.GitLabService;
+
+/**
+ * Synchronise les stages/jobs des pipelines GitLab vers la base de données (stages_json).
+ * Les stages sont récupérés via l'API GitLab puis persistés dans PipelineExecution.stagesJson.
+ * Un même gitlabPipelineId peut avoir plusieurs exécutions (scan multi-services) :
+ * la synchro propage le résumé GitLab à toutes les lignes.
+ */
+@Service
+@Slf4j
+@RequiredArgsConstructor
+public class PipelineStageSyncService {
+
+    private static final DateTimeFormatter ISO_FORMAT = DateTimeFormatter.ISO_INSTANT;
+
+    private final GitLabService gitLabService;
+    private final PipelineExecutionRepository pipelineExecutionRepository;
+    private final QualityGateService qualityGateService;
+    private final EnvironmentLifecycleService environmentLifecycleService;
+    private final ObjectMapper objectMapper;
+
+    /**
+     * Met à jour les stages en base pour un pipeline donné (appel API GitLab puis sauvegarde).
+     * Propage vers toutes les {@link PipelineExecution} partageant ce gitlabPipelineId.
+     *
+     * @param pipelineId ID du pipeline GitLab
+     * @return true si la synchro a réussi, false sinon
+     */
+    @Transactional
+    public boolean syncStagesForPipeline(Long pipelineId) {
+        if (pipelineId == null || pipelineId <= 0) {
+            return false;
+        }
+        List<PipelineExecution> executions =
+                pipelineExecutionRepository.findAllByGitlabPipelineIdOrderByCreatedAtAsc(pipelineId);
+        if (executions.isEmpty()) {
+            return false;
+        }
+        return doSync(executions, pipelineId);
+    }
+
+    /**
+     * Construit le map à stocker dans stages_json à partir du résumé renvoyé par getPipelineSummary.
+     * Format: jobs (liste), jobStatusCount, lastSyncedAt, status, webUrl, ref, shortSha, duration.
+     */
+    @SuppressWarnings("unchecked")
+    public Map<String, Object> buildStagesJsonFromSummary(Map<String, Object> summary) {
+        Map<String, Object> stages = new HashMap<>();
+        stages.put("jobs", summary.get("jobs") != null ? summary.get("jobs") : List.of());
+        stages.put("jobStatusCount", summary.get("jobStatusCount") != null ? summary.get("jobStatusCount") : Map.of());
+        stages.put("lastSyncedAt", ISO_FORMAT.format(Instant.now()));
+        stages.put("status", summary.get("status"));
+        stages.put("webUrl", summary.get("webUrl"));
+        stages.put("ref", summary.get("ref"));
+        stages.put("shortSha", summary.get("shortSha"));
+        stages.put("duration", summary.get("duration"));
+        stages.put("totalJobs", summary.get("totalJobs") != null ? summary.get("totalJobs") : 0);
+        return stages;
+    }
+
+    /**
+     * Extrait la liste des jobs depuis stagesJson (pour fallback quand l'API GitLab est indisponible).
+     */
+    @SuppressWarnings("unchecked")
+    public List<Map<String, Object>> getJobsFromStagesJson(PipelineExecution execution) {
+        Map<String, Object> stages = execution.getStagesJson();
+        if (stages == null) {
+            return List.of();
+        }
+        return parseJobsList(stages.get("jobs"));
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> parseJobsList(Object jobs) {
+        if (jobs == null) {
+            return List.of();
+        }
+        if (jobs instanceof List<?> list) {
+            List<Map<String, Object>> out = new ArrayList<>();
+            for (Object item : list) {
+                if (item instanceof Map<?, ?> map) {
+                    out.add((Map<String, Object>) map);
+                }
+            }
+            if (!out.isEmpty()) {
+                return out;
+            }
+        }
+        try {
+            List<Map<String, Object>> converted = objectMapper.convertValue(
+                    jobs, new TypeReference<List<Map<String, Object>>>() {});
+            return converted != null ? converted : List.of();
+        } catch (Exception e) {
+            log.warn("Impossible de lire jobs depuis stages_json: {}", e.getMessage());
+            return List.of();
+        }
+    }
+
+    private int countJobsInStages(Map<String, Object> stages) {
+        if (stages == null) {
+            return 0;
+        }
+        return parseJobsList(stages.get("jobs")).size();
+    }
+
+    /**
+     * Empreinte stable de la liste des jobs (id + statut, triés) : change dès qu'un job est relancé
+     * ou change d'état, reste identique quand un pipeline terminé est simplement relu.
+     */
+    private String jobsSignature(Map<String, Object> stages) {
+        if (stages == null) {
+            return "";
+        }
+        return parseJobsList(stages.get("jobs")).stream()
+                .map(job -> String.valueOf(job.get("id")) + ":" + String.valueOf(job.get("status")))
+                .sorted()
+                .collect(java.util.stream.Collectors.joining("|"));
+    }
+
+    /**
+     * Extrait jobStatusCount depuis stagesJson pour le fallback.
+     */
+    @SuppressWarnings("unchecked")
+    public Map<String, Long> getJobStatusCountFromStagesJson(PipelineExecution execution) {
+        Map<String, Object> stages = execution.getStagesJson();
+        if (stages == null) return Map.of();
+        Object count = stages.get("jobStatusCount");
+        if (count instanceof Map) {
+            return (Map<String, Long>) count;
+        }
+        return Map.of();
+    }
+
+    private boolean doSync(List<PipelineExecution> executions, Long pipelineId) {
+        try {
+            Map<String, Object> summary = gitLabService.fetchPipelineSummaryLive(pipelineId);
+
+            Object newJobsObj = summary.get("jobs");
+            int newJobsCount = newJobsObj instanceof List<?> list ? list.size() : 0;
+            int existingJobsCount = executions.stream()
+                    .mapToInt(e -> countJobsInStages(e.getStagesJson()))
+                    .max()
+                    .orElse(0);
+            // Timeout GitLab → fallback vide : ne pas écraser une vue BDD valide
+            if (newJobsCount == 0) {
+                if (existingJobsCount > 0) {
+                    log.warn("⚠️ Sync pipeline #{} ignorée: GitLab a renvoyé 0 jobs (conservation BDD)", pipelineId);
+                } else {
+                    log.warn("⚠️ Sync pipeline #{} ignorée: GitLab a renvoyé 0 jobs", pipelineId);
+                }
+                return false;
+            }
+            if ("UNKNOWN".equals(summary.get("status")) && existingJobsCount > 0) {
+                log.warn("⚠️ Sync pipeline #{} ignorée: statut UNKNOWN (conservation BDD)", pipelineId);
+                return false;
+            }
+
+            Map<String, Object> stagesJson = buildStagesJsonFromSummary(summary);
+            PipelineStatus newStatus = PipelineStatus.fromGitLabStatus((String) summary.get("status"));
+            LocalDateTime createdAt = toLocalDateTime(summary.get("createdAt"));
+            LocalDateTime finishedAt = toLocalDateTime(summary.get("finishedAt"));
+
+            // État AVANT la synchro, pour ne recalculer le snapshot QG que si quelque chose a changé.
+            // Recalculer à chaque affichage (pipeline déjà terminé, jobs inchangés) relançait DefectDojo
+            // et SonarQube en boucle, saturait le pool de connexions BDD et provoquait des 524 Cloudflare.
+            String newJobsSignature = jobsSignature(stagesJson);
+            Map<UUID, Boolean> recaptureNeeded = new HashMap<>();
+            for (PipelineExecution execution : executions) {
+                boolean wasFinished = execution.getStatus() != null && execution.getStatus().isFinished();
+                boolean jobsChanged = !newJobsSignature.equals(jobsSignature(execution.getStagesJson()));
+                recaptureNeeded.put(execution.getId(), !wasFinished || jobsChanged);
+            }
+
+            for (PipelineExecution execution : executions) {
+                applySummaryToExecution(execution, stagesJson, newStatus, createdAt, finishedAt, summary);
+            }
+            pipelineExecutionRepository.saveAll(executions);
+            log.info("✅ Stages synchronisés en BDD pour le pipeline #{} ({} jobs, {} exécution(s))",
+                    pipelineId, stagesJson.get("totalJobs"), executions.size());
+
+            if (newStatus != null && newStatus.isFinished()) {
+                for (PipelineExecution execution : executions) {
+                    if (!Boolean.TRUE.equals(recaptureNeeded.get(execution.getId()))) {
+                        continue;
+                    }
+                    try {
+                        qualityGateService.captureSnapshotAfterStagesSync(execution);
+                    } catch (Exception e) {
+                        log.warn("Snapshot QG après sync #{} (exec {}): {}",
+                                pipelineId, execution.getId(), e.getMessage());
+                    }
+                }
+            }
+            return true;
+        } catch (Exception e) {
+            log.warn("⚠️ Impossible de synchroniser les stages pour le pipeline #{}: {}", pipelineId, e.getMessage());
+            return false;
+        }
+    }
+
+    private void applySummaryToExecution(
+            PipelineExecution execution,
+            Map<String, Object> stagesJson,
+            PipelineStatus newStatus,
+            LocalDateTime createdAt,
+            LocalDateTime finishedAt,
+            Map<String, Object> summary
+    ) {
+        // Copie défensive : chaque ligne a sa propre map (évite aliasing Hibernate/jsonb)
+        execution.setStagesJson(new HashMap<>(stagesJson));
+
+        PipelineStatus oldStatus = execution.getStatus();
+        if (newStatus != null && oldStatus != newStatus) {
+            execution.setStatus(newStatus);
+        }
+
+        if (execution.getStartedAt() == null && createdAt != null) {
+            execution.setStartedAt(createdAt);
+        }
+        if (newStatus != null && newStatus.isFinished()) {
+            if (execution.getFinishedAt() == null && finishedAt != null) {
+                execution.setFinishedAt(finishedAt);
+            } else if (execution.getFinishedAt() == null) {
+                execution.setFinishedAt(LocalDateTime.now());
+            }
+
+            // Pipeline CI : seule transition env = FAILED si encore PENDING/BUILDING
+            if (execution.getEnvironment() != null
+                    && (newStatus == PipelineStatus.FAILED || newStatus == PipelineStatus.CANCELED)) {
+                String reason = buildPipelineFailureReason(summary);
+                environmentLifecycleService.onPipelineFailed(execution.getEnvironment().getId(), reason);
+            }
+        }
+    }
+
+    private LocalDateTime toLocalDateTime(Object v) {
+        if (v == null) {
+            return null;
+        }
+        if (v instanceof LocalDateTime ldt) {
+            return ldt;
+        }
+        if (v instanceof Instant i) {
+            return LocalDateTime.ofInstant(i, ZoneId.systemDefault());
+        }
+        if (v instanceof Date d) {
+            return LocalDateTime.ofInstant(d.toInstant(), ZoneId.systemDefault());
+        }
+        // Si GitLab4J renvoie une string ISO par sérialisation
+        if (v instanceof String s && !s.isBlank()) {
+            try {
+                return LocalDateTime.ofInstant(Instant.parse(s), ZoneId.systemDefault());
+            } catch (Exception ignored) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    @SuppressWarnings("unchecked")
+    private String buildPipelineFailureReason(Map<String, Object> summary) {
+        Object jobsObj = summary.get("jobs");
+        if (jobsObj instanceof List<?> jobs) {
+            for (Object item : jobs) {
+                if (!(item instanceof Map<?, ?> job)) {
+                    continue;
+                }
+                String status = String.valueOf(job.get("status")).toLowerCase();
+                if ("failed".equals(status) || "canceled".equals(status)) {
+                    Object stage = job.get("stage");
+                    if (stage == null || String.valueOf(stage).isBlank()) {
+                        stage = job.get("name");
+                    }
+                    return "Déploiement échoué au stage " + stage;
+                }
+            }
+        }
+        String pipelineStatus = summary.get("status") != null ? String.valueOf(summary.get("status")) : "failed";
+        return "Pipeline en échec (" + pipelineStatus + ")";
+    }
+}

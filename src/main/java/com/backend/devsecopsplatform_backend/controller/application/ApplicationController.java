@@ -5,7 +5,7 @@ import com.backend.devsecopsplatform_backend.service.application.ApplicationServ
 import com.backend.devsecopsplatform_backend.service.environment.EnvironmentLifecycleService;
 import com.backend.devsecopsplatform_backend.service.environment.EnvironmentService;
 import com.backend.devsecopsplatform_backend.service.environment.ServiceEnvironmentResolver;
-import com.backend.devsecopsplatform_backend.service.PipelineStageSyncService;
+import com.backend.devsecopsplatform_backend.service.pipeline.PipelineStageSyncService;
 import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
 import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
 import com.backend.devsecopsplatform_backend.entity.PipelineStatus;
@@ -21,6 +21,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.stream.Collectors;
+import com.backend.devsecopsplatform_backend.controller.application.dto.ApplicationResponse;
+import com.backend.devsecopsplatform_backend.controller.application.dto.CreateApplicationRequest;
+import com.backend.devsecopsplatform_backend.controller.application.dto.DeploymentHistoryItem;
+import com.backend.devsecopsplatform_backend.controller.application.dto.DeploymentMetricsDto;
 
 @RestController
 @RequestMapping("/api/applications")

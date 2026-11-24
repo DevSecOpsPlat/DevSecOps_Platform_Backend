@@ -1,6 +1,6 @@
 package com.backend.devsecopsplatform_backend.service.auth;
 
-import com.backend.devsecopsplatform_backend.service.EncryptionService;
+import com.backend.devsecopsplatform_backend.service.security.EncryptionService;
 import dev.samstevens.totp.code.*;
 import dev.samstevens.totp.secret.DefaultSecretGenerator;
 import dev.samstevens.totp.secret.SecretGenerator;

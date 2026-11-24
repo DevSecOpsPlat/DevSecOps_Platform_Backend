@@ -4,10 +4,10 @@ import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
 import com.backend.devsecopsplatform_backend.entity.User;
 import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
 import com.backend.devsecopsplatform_backend.repository.UserRepository;
-import com.backend.devsecopsplatform_backend.service.GitLabService;
+import com.backend.devsecopsplatform_backend.service.gitlab.GitLabService;
 import com.backend.devsecopsplatform_backend.service.environment.EnvironmentService;
 import com.fasterxml.jackson.databind.JsonNode;
-import com.backend.devsecopsplatform_backend.service.appmgmt.AppDeploymentService;
+import com.backend.devsecopsplatform_backend.service.deployment.AppDeploymentService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -23,6 +23,12 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import com.backend.devsecopsplatform_backend.controller.environment.dto.CiDeployRequest;
+import com.backend.devsecopsplatform_backend.controller.environment.dto.DeployRequest;
+import com.backend.devsecopsplatform_backend.controller.environment.dto.DeployResponse;
+import com.backend.devsecopsplatform_backend.controller.environment.dto.EnvironmentSummaryResponse;
+import com.backend.devsecopsplatform_backend.controller.environment.dto.PipelineScanResponse;
+import com.backend.devsecopsplatform_backend.controller.environment.dto.SecuritySummaryResponse;
 
 @RestController
 @RequestMapping("/api")
@@ -68,7 +74,7 @@ public class EnvironmentController {
                 CiDeployRequest ciRequest = objectMapper.treeToValue(body, CiDeployRequest.class);
                 log.info("📥 CI deploy: namespace={} deploymentId={}", ciRequest.getNamespace(), ciRequest.getDeploymentId());
                 return ResponseEntity.accepted().body(appDeploymentService.scheduleCiDeploy(ciRequest));
-            } catch (com.backend.devsecopsplatform_backend.service.appmgmt.AppValidationException e) {
+            } catch (com.backend.devsecopsplatform_backend.service.application.AppValidationException e) {
                 return ResponseEntity.badRequest().body(Map.of("message", e.getMessage()));
             } catch (Exception e) {
                 log.error("❌ Erreur CI deploy: {}", e.getMessage(), e);
@@ -107,7 +113,7 @@ public class EnvironmentController {
         }
         try {
             return ResponseEntity.ok(appDeploymentService.getCiDeployStatus(deploymentId));
-        } catch (com.backend.devsecopsplatform_backend.service.appmgmt.AppValidationException e) {
+        } catch (com.backend.devsecopsplatform_backend.service.application.AppValidationException e) {
             return ResponseEntity.status(404).body(Map.of("message", e.getMessage()));
         }
     }

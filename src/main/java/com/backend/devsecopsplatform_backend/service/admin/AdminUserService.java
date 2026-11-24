@@ -1,8 +1,8 @@
 package com.backend.devsecopsplatform_backend.service.admin;
 
-import com.backend.devsecopsplatform_backend.controller.admin.CreateUserRequest;
-import com.backend.devsecopsplatform_backend.controller.admin.CreateUserResponse;
-import com.backend.devsecopsplatform_backend.dto.complaint.ComplaintApiDto;
+import com.backend.devsecopsplatform_backend.controller.admin.dto.CreateUserRequest;
+import com.backend.devsecopsplatform_backend.controller.admin.dto.CreateUserResponse;
+import com.backend.devsecopsplatform_backend.controller.complaint.dto.ComplaintApiDto;
 import com.backend.devsecopsplatform_backend.entity.AccountStatus;
 import com.backend.devsecopsplatform_backend.entity.AppService;
 import com.backend.devsecopsplatform_backend.entity.appmgmt.ManagedApplication;

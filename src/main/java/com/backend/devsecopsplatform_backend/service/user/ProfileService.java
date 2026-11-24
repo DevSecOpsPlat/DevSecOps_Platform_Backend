@@ -2,9 +2,9 @@ package com.backend.devsecopsplatform_backend.service.user;
 
 import com.backend.devsecopsplatform_backend.configuration.DisplayTime;
 
-import com.backend.devsecopsplatform_backend.controller.user.ChangePasswordRequest;
-import com.backend.devsecopsplatform_backend.controller.user.ProfileResponse;
-import com.backend.devsecopsplatform_backend.controller.user.UpdateEmailRequest;
+import com.backend.devsecopsplatform_backend.controller.user.dto.ChangePasswordRequest;
+import com.backend.devsecopsplatform_backend.controller.user.dto.ProfileResponse;
+import com.backend.devsecopsplatform_backend.controller.user.dto.UpdateEmailRequest;
 import com.backend.devsecopsplatform_backend.entity.AlertType;
 import com.backend.devsecopsplatform_backend.entity.Role;
 import com.backend.devsecopsplatform_backend.entity.User;

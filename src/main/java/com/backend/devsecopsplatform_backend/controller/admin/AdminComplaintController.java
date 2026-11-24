@@ -1,6 +1,6 @@
 package com.backend.devsecopsplatform_backend.controller.admin;
 
-import com.backend.devsecopsplatform_backend.dto.complaint.ComplaintApiDto;
+import com.backend.devsecopsplatform_backend.controller.complaint.dto.ComplaintApiDto;
 import com.backend.devsecopsplatform_backend.entity.Complaint;
 import com.backend.devsecopsplatform_backend.entity.ComplaintStatus;
 import com.backend.devsecopsplatform_backend.service.complaint.ComplaintService;

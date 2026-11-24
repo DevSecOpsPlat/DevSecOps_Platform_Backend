@@ -2,7 +2,7 @@ package com.backend.devsecopsplatform_backend.service.auth;
 
 import com.backend.devsecopsplatform_backend.configuration.DisplayTime;
 
-import com.backend.devsecopsplatform_backend.controller.user.TwoFactorSetupResponse;
+import com.backend.devsecopsplatform_backend.controller.auth.dto.TwoFactorSetupResponse;
 import com.backend.devsecopsplatform_backend.entity.AuditAction;
 import com.backend.devsecopsplatform_backend.entity.TwoFactorMethod;
 import com.backend.devsecopsplatform_backend.entity.User;

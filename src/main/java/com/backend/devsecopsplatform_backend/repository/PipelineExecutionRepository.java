@@ -32,7 +32,7 @@ public interface PipelineExecutionRepository extends JpaRepository<PipelineExecu
 
     /**
      * Cache du commit HEAD (obsolescence) jamais vérifié ou périmé -- pour le rafraîchissement en
-     * arrière-plan ({@link com.backend.devsecopsplatform_backend.service.appmgmt.HeadCacheRefreshScheduler}).
+     * arrière-plan ({@link com.backend.devsecopsplatform_backend.service.scan.HeadCacheRefreshScheduler}).
      * JOIN FETCH pe.appService obligatoire : ces entités sortent détachées de cette requête (pas de
      * transaction ouverte par l'appelant au moment de l'appel) puis sont lues plus tard dans une
      * AUTRE transaction (ManagedAppScanService#refreshHeadCacheIfStale) -- rouvrir une session

@@ -1,8 +1,8 @@
 package com.backend.devsecopsplatform_backend.controller.qualitygate;
 
 import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
-import com.backend.devsecopsplatform_backend.service.PipelineStageSyncService;
-import com.backend.devsecopsplatform_backend.service.appmgmt.ScanBatchCompletionService;
+import com.backend.devsecopsplatform_backend.service.pipeline.PipelineStageSyncService;
+import com.backend.devsecopsplatform_backend.service.scan.ScanBatchCompletionService;
 import com.backend.devsecopsplatform_backend.service.finding.FindingIngestionService;
 import com.backend.devsecopsplatform_backend.service.qualitygate.QualityGateService;
 import com.backend.devsecopsplatform_backend.service.qualitygate.SnapshotCaptureRejectedException;

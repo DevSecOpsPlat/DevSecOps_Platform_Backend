@@ -1,6 +1,6 @@
 package com.backend.devsecopsplatform_backend.controller.pipeline;
 
-import com.backend.devsecopsplatform_backend.controller.environment.PipelineScanResponse;
+import com.backend.devsecopsplatform_backend.controller.environment.dto.PipelineScanResponse;
 import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
 import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
 import com.backend.devsecopsplatform_backend.entity.PipelineExecutionKind;
@@ -10,9 +10,9 @@ import com.backend.devsecopsplatform_backend.repository.ManagedApplicationReposi
 import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
 import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
 import com.backend.devsecopsplatform_backend.repository.UserRepository;
-import com.backend.devsecopsplatform_backend.service.GitLabService;
-import com.backend.devsecopsplatform_backend.service.PipelineStageSyncService;
-import com.backend.devsecopsplatform_backend.service.appmgmt.ScanBatchCompletionService;
+import com.backend.devsecopsplatform_backend.service.gitlab.GitLabService;
+import com.backend.devsecopsplatform_backend.service.pipeline.PipelineStageSyncService;
+import com.backend.devsecopsplatform_backend.service.scan.ScanBatchCompletionService;
 import com.fasterxml.jackson.databind.JsonNode;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;

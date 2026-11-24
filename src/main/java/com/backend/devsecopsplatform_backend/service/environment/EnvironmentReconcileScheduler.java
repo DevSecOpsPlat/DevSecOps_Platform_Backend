@@ -3,7 +3,7 @@ package com.backend.devsecopsplatform_backend.service.environment;
 import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
 import com.backend.devsecopsplatform_backend.entity.EnvironmentStatus;
 import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
-import com.backend.devsecopsplatform_backend.service.appmgmt.K8sManifestApplyService;
+import com.backend.devsecopsplatform_backend.service.deployment.K8sManifestApplyService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;

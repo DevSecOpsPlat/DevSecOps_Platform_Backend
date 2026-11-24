@@ -6,7 +6,7 @@ import com.backend.devsecopsplatform_backend.repository.FindingRepository;
 import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
 import com.backend.devsecopsplatform_backend.repository.SecurityScanRepository;
 import com.backend.devsecopsplatform_backend.repository.VulnerabilityRecommendationRepository;
-import com.backend.devsecopsplatform_backend.service.GitLabService;
+import com.backend.devsecopsplatform_backend.service.gitlab.GitLabService;
 import com.backend.devsecopsplatform_backend.service.qualitygate.PipelineArtifactsIngestedEvent;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;

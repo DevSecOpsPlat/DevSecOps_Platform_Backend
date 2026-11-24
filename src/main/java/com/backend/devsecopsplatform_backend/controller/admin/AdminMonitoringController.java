@@ -1,7 +1,7 @@
 package com.backend.devsecopsplatform_backend.controller.admin;
 
 import com.backend.devsecopsplatform_backend.service.admin.AdminMonitoringService;
-import com.backend.devsecopsplatform_backend.service.appmgmt.AppValidationException;
+import com.backend.devsecopsplatform_backend.service.application.AppValidationException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;

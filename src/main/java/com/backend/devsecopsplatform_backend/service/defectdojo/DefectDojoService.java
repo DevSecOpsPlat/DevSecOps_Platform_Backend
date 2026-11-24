@@ -7,7 +7,7 @@ import com.backend.devsecopsplatform_backend.entity.User;
 import com.backend.devsecopsplatform_backend.repository.AppServiceRepository;
 import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
 import com.backend.devsecopsplatform_backend.repository.UserRepository;
-import com.backend.devsecopsplatform_backend.service.SourceSnippetFetcherService;
+import com.backend.devsecopsplatform_backend.service.remediation.SourceSnippetFetcherService;
 import com.backend.devsecopsplatform_backend.service.defectdojo.dto.*;
 import com.fasterxml.jackson.databind.JsonNode;
 import lombok.RequiredArgsConstructor;
@@ -75,7 +75,7 @@ public class DefectDojoService {
     private final UserRepository userRepository;
     private final SourceSnippetFetcherService sourceSnippetFetcherService;
     private final DefectDojoHttpClientFactory httpClientFactory;
-    private final com.backend.devsecopsplatform_backend.service.TranslationService translationService;
+    private final com.backend.devsecopsplatform_backend.service.translation.TranslationService translationService;
     private final DastContextService dastContextService;
 
     /** URL testées par finding DAST (stables pour un finding donné). */
@@ -923,7 +923,7 @@ public class DefectDojoService {
      *
      * @param codeContextSource source effective de l'extrait envoyé à l'IA (MANUAL, GITHUB, GITLAB, DOCKERFILE, NONE…)
      */
-    public com.backend.devsecopsplatform_backend.service.ai.RemediationEvidence remediationEvidence(
+    public com.backend.devsecopsplatform_backend.service.remediation.RemediationEvidence remediationEvidence(
             DefectDojoFindingDetailResponse d, String codeContextSource) {
         String src = nullToEmpty(codeContextSource).toUpperCase(Locale.ROOT);
         boolean manual = "MANUAL".equals(src);
@@ -949,7 +949,7 @@ public class DefectDojoService {
         if (d.getRepositoryFacts() != null) fp.append("|").append(String.join("¤", d.getRepositoryFacts()));
         boolean pipelineContextRelevant = !d.isDynamicFinding() || d.getRespondingServiceId() == null
                 || d.getRespondingServiceId().equals(d.getApplicationId());
-        return new com.backend.devsecopsplatform_backend.service.ai.RemediationEvidence(
+        return new com.backend.devsecopsplatform_backend.service.remediation.RemediationEvidence(
                 d.isDynamicFinding(), repo, manual, scannerLocation, live,
                 d.getApplicationId() != null ? d.getApplicationId().toString() : "",
                 Integer.toHexString(fp.toString().hashCode()), pipelineContextRelevant);

@@ -8,6 +8,9 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.Map;
+import com.backend.devsecopsplatform_backend.controller.user.dto.ChangePasswordRequest;
+import com.backend.devsecopsplatform_backend.controller.user.dto.ProfileResponse;
+import com.backend.devsecopsplatform_backend.controller.user.dto.UpdateEmailRequest;
 
 @RestController
 @RequestMapping("/api/profile")

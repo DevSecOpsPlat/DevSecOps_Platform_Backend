@@ -1,6 +1,6 @@
 package com.backend.devsecopsplatform_backend.configuration;
 
-import com.backend.devsecopsplatform_backend.service.CustomUserDetailsService;
+import com.backend.devsecopsplatform_backend.service.auth.CustomUserDetailsService;
 import jakarta.servlet.DispatcherType;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;

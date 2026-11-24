@@ -1,16 +1,20 @@
 package com.backend.devsecopsplatform_backend.service.environment;
 
-import com.backend.devsecopsplatform_backend.controller.environment.*;
+import com.backend.devsecopsplatform_backend.controller.environment.dto.DeployRequest;
+import com.backend.devsecopsplatform_backend.controller.environment.dto.DeployResponse;
+import com.backend.devsecopsplatform_backend.controller.environment.dto.EnvironmentSummaryResponse;
+import com.backend.devsecopsplatform_backend.controller.environment.dto.PipelineScanResponse;
+import com.backend.devsecopsplatform_backend.controller.environment.dto.SecuritySummaryResponse;
 import com.backend.devsecopsplatform_backend.entity.*;
 import com.backend.devsecopsplatform_backend.repository.CloudResourceRepository;
 import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
 import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
 import com.backend.devsecopsplatform_backend.repository.UserRepository;
 import com.backend.devsecopsplatform_backend.service.application.ApplicationService;
-import com.backend.devsecopsplatform_backend.service.EncryptionService;
-import com.backend.devsecopsplatform_backend.service.GitHubValidationService;
-import com.backend.devsecopsplatform_backend.service.GitLabService;
-import com.backend.devsecopsplatform_backend.service.PipelineStageSyncService;
+import com.backend.devsecopsplatform_backend.service.security.EncryptionService;
+import com.backend.devsecopsplatform_backend.service.github.GitHubValidationService;
+import com.backend.devsecopsplatform_backend.service.gitlab.GitLabService;
+import com.backend.devsecopsplatform_backend.service.pipeline.PipelineStageSyncService;
 import com.fasterxml.jackson.databind.JsonNode;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;

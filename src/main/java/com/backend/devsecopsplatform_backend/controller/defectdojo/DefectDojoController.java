@@ -1,11 +1,11 @@
 package com.backend.devsecopsplatform_backend.controller.defectdojo;
 
-import com.backend.devsecopsplatform_backend.controller.finding.FindingAiRemediationRequest;
-import com.backend.devsecopsplatform_backend.controller.finding.FindingAiRemediationResponse;
-import com.backend.devsecopsplatform_backend.controller.finding.FindingChatRequest;
-import com.backend.devsecopsplatform_backend.service.AiAnalysisService;
-import com.backend.devsecopsplatform_backend.service.ai.RemediationRequestContext;
-import com.backend.devsecopsplatform_backend.service.ai.StaticRemediationTemplateService;
+import com.backend.devsecopsplatform_backend.controller.finding.dto.FindingAiRemediationRequest;
+import com.backend.devsecopsplatform_backend.controller.finding.dto.FindingAiRemediationResponse;
+import com.backend.devsecopsplatform_backend.controller.finding.dto.FindingChatRequest;
+import com.backend.devsecopsplatform_backend.service.remediation.AiAnalysisService;
+import com.backend.devsecopsplatform_backend.service.remediation.RemediationRequestContext;
+import com.backend.devsecopsplatform_backend.service.remediation.StaticRemediationTemplateService;
 import com.backend.devsecopsplatform_backend.service.defectdojo.DefectDojoService;
 import com.backend.devsecopsplatform_backend.service.defectdojo.dto.DefectDojoDashboard2Response;
 import com.backend.devsecopsplatform_backend.service.defectdojo.dto.DefectDojoDashboardCharts;

@@ -1,13 +1,13 @@
 package com.backend.devsecopsplatform_backend.service.application;
 
-import com.backend.devsecopsplatform_backend.controller.application.ApplicationResponse;
-import com.backend.devsecopsplatform_backend.controller.application.CreateApplicationRequest;
+import com.backend.devsecopsplatform_backend.controller.application.dto.ApplicationResponse;
+import com.backend.devsecopsplatform_backend.controller.application.dto.CreateApplicationRequest;
 import com.backend.devsecopsplatform_backend.entity.AppService;
 import com.backend.devsecopsplatform_backend.entity.User;
 import com.backend.devsecopsplatform_backend.repository.AppServiceRepository;
 import com.backend.devsecopsplatform_backend.repository.UserRepository;
-import com.backend.devsecopsplatform_backend.service.EncryptionService;
-import com.backend.devsecopsplatform_backend.service.GitHubValidationService;
+import com.backend.devsecopsplatform_backend.service.security.EncryptionService;
+import com.backend.devsecopsplatform_backend.service.github.GitHubValidationService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.security.core.Authentication;

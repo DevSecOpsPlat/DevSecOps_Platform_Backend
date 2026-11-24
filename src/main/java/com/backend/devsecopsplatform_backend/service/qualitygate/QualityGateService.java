@@ -17,9 +17,8 @@ import com.backend.devsecopsplatform_backend.repository.PipelineExecutionReposit
 import com.backend.devsecopsplatform_backend.repository.QualityGateSnapshotRepository;
 import com.backend.devsecopsplatform_backend.repository.UserRepository;
 import com.backend.devsecopsplatform_backend.repository.appmgmt.ScanBatchRepository;
-import com.backend.devsecopsplatform_backend.service.AiAnalysisService;
-import com.backend.devsecopsplatform_backend.service.GitLabService;
-import com.backend.devsecopsplatform_backend.service.SonarBranchResolution;
+import com.backend.devsecopsplatform_backend.service.remediation.AiAnalysisService;
+import com.backend.devsecopsplatform_backend.service.gitlab.GitLabService;
 import com.backend.devsecopsplatform_backend.service.defectdojo.DefectDojoService;
 import com.backend.devsecopsplatform_backend.service.defectdojo.dto.DefectDojoDashboard2Response;
 import com.backend.devsecopsplatform_backend.service.qualitygate.dto.HardGateViolationDto;
@@ -5264,7 +5263,7 @@ public class QualityGateService {
             if (reachable instanceof Boolean b && !b) {
                 return false;
             }
-        } else if (branchResolution instanceof com.backend.devsecopsplatform_backend.service.SonarBranchResolution br) {
+        } else if (branchResolution instanceof com.backend.devsecopsplatform_backend.service.qualitygate.SonarBranchResolution br) {
             if (!br.isSonarReachable()) {
                 return false;
             }
@@ -5323,7 +5322,7 @@ public class QualityGateService {
                 resolvedBranch = stringVal(merged.get("requested_branch"));
             }
             merged.put("branch_resolution",
-                    com.backend.devsecopsplatform_backend.service.SonarBranchResolution.builder()
+                    com.backend.devsecopsplatform_backend.service.qualitygate.SonarBranchResolution.builder()
                             .sonarReachable(true)
                             .resolvedBranch(resolvedBranch)
                             .requestedBranch(resolvedBranch)
