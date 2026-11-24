@@ -1,9 +1,9 @@
 package com.backend.devsecopsplatform_backend.configuration;
 
-import com.backend.devsecopsplatform_backend.entity.AccountStatus;
-import com.backend.devsecopsplatform_backend.entity.Role;
-import com.backend.devsecopsplatform_backend.entity.User;
-import com.backend.devsecopsplatform_backend.repository.UserRepository;
+import com.backend.devsecopsplatform_backend.entity.user.AccountStatus;
+import com.backend.devsecopsplatform_backend.entity.user.Role;
+import com.backend.devsecopsplatform_backend.entity.user.User;
+import com.backend.devsecopsplatform_backend.repository.user.UserRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.CommandLineRunner;

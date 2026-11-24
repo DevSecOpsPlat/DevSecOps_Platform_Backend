@@ -2,8 +2,8 @@ package com.backend.devsecopsplatform_backend.controller.complaint.dto;
 
 import com.backend.devsecopsplatform_backend.configuration.DisplayTime;
 
-import com.backend.devsecopsplatform_backend.entity.Complaint;
-import com.backend.devsecopsplatform_backend.entity.ComplaintMessage;
+import com.backend.devsecopsplatform_backend.entity.complaint.Complaint;
+import com.backend.devsecopsplatform_backend.entity.complaint.ComplaintMessage;
 
 import java.util.Comparator;
 import java.util.List;

@@ -1,7 +1,7 @@
 package com.backend.devsecopsplatform_backend.service.application;
 
-import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDatabase;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.DbEngine;
+import com.backend.devsecopsplatform_backend.entity.application.AppDatabase;
+import com.backend.devsecopsplatform_backend.entity.application.DbEngine;
 
 import java.util.Locale;
 import java.util.Map;

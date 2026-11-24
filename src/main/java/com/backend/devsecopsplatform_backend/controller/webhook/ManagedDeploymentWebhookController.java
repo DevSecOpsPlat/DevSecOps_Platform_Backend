@@ -1,6 +1,6 @@
 package com.backend.devsecopsplatform_backend.controller.webhook;
 
-import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDeployment;
+import com.backend.devsecopsplatform_backend.entity.deployment.AppDeployment;
 import com.backend.devsecopsplatform_backend.service.deployment.AppDeploymentService;
 import com.backend.devsecopsplatform_backend.service.application.AppValidationException;
 import lombok.RequiredArgsConstructor;

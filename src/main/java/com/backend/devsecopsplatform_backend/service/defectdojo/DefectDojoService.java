@@ -1,12 +1,12 @@
 package com.backend.devsecopsplatform_backend.service.defectdojo;
 
 import com.backend.devsecopsplatform_backend.configuration.DefectDojoProperties;
-import com.backend.devsecopsplatform_backend.entity.AppService;
-import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
-import com.backend.devsecopsplatform_backend.entity.User;
-import com.backend.devsecopsplatform_backend.repository.AppServiceRepository;
-import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
-import com.backend.devsecopsplatform_backend.repository.UserRepository;
+import com.backend.devsecopsplatform_backend.entity.application.AppService;
+import com.backend.devsecopsplatform_backend.entity.environment.EphemeralEnvironment;
+import com.backend.devsecopsplatform_backend.entity.user.User;
+import com.backend.devsecopsplatform_backend.repository.application.AppServiceRepository;
+import com.backend.devsecopsplatform_backend.repository.environment.EphemeralEnvironmentRepository;
+import com.backend.devsecopsplatform_backend.repository.user.UserRepository;
 import com.backend.devsecopsplatform_backend.service.remediation.SourceSnippetFetcherService;
 import com.backend.devsecopsplatform_backend.service.defectdojo.dto.*;
 import com.fasterxml.jackson.databind.JsonNode;

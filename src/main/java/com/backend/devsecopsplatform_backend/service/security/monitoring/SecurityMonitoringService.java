@@ -3,9 +3,9 @@ package com.backend.devsecopsplatform_backend.service.security.monitoring;
 import com.backend.devsecopsplatform_backend.configuration.DisplayTime;
 
 import com.backend.devsecopsplatform_backend.configuration.SecurityMonitoringProperties;
-import com.backend.devsecopsplatform_backend.entity.AlertType;
-import com.backend.devsecopsplatform_backend.entity.AuditAction;
-import com.backend.devsecopsplatform_backend.entity.User;
+import com.backend.devsecopsplatform_backend.entity.admin.AlertType;
+import com.backend.devsecopsplatform_backend.entity.admin.AuditAction;
+import com.backend.devsecopsplatform_backend.entity.user.User;
 import com.backend.devsecopsplatform_backend.service.security.SecurityEventService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;

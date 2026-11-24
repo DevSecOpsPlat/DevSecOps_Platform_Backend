@@ -1,8 +1,8 @@
 package com.backend.devsecopsplatform_backend.service.finding;
 
-import com.backend.devsecopsplatform_backend.entity.AppService;
-import com.backend.devsecopsplatform_backend.entity.Finding;
-import com.backend.devsecopsplatform_backend.entity.FindingOccurrence;
+import com.backend.devsecopsplatform_backend.entity.application.AppService;
+import com.backend.devsecopsplatform_backend.entity.finding.Finding;
+import com.backend.devsecopsplatform_backend.entity.finding.FindingOccurrence;
 
 import java.util.LinkedHashSet;
 import java.util.Locale;

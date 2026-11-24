@@ -1,7 +1,7 @@
 package com.backend.devsecopsplatform_backend.controller.application.dto;
 
-import com.backend.devsecopsplatform_backend.entity.appmgmt.DbEngine;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.DbFamily;
+import com.backend.devsecopsplatform_backend.entity.application.DbEngine;
+import com.backend.devsecopsplatform_backend.entity.application.DbFamily;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import lombok.Data;

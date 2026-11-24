@@ -1,7 +1,7 @@
 package com.backend.devsecopsplatform_backend.controller.complaint;
 
 import com.backend.devsecopsplatform_backend.controller.complaint.dto.ComplaintApiDto;
-import com.backend.devsecopsplatform_backend.entity.Complaint;
+import com.backend.devsecopsplatform_backend.entity.complaint.Complaint;
 import com.backend.devsecopsplatform_backend.service.complaint.ComplaintService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;

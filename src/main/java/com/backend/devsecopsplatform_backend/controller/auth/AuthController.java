@@ -3,10 +3,10 @@ package com.backend.devsecopsplatform_backend.controller.auth;
 import com.backend.devsecopsplatform_backend.configuration.DisplayTime;
 
 import com.backend.devsecopsplatform_backend.configuration.JwtUtils;
-import com.backend.devsecopsplatform_backend.entity.AuditAction;
-import com.backend.devsecopsplatform_backend.entity.TwoFactorMethod;
-import com.backend.devsecopsplatform_backend.entity.User;
-import com.backend.devsecopsplatform_backend.repository.UserRepository;
+import com.backend.devsecopsplatform_backend.entity.admin.AuditAction;
+import com.backend.devsecopsplatform_backend.entity.auth.TwoFactorMethod;
+import com.backend.devsecopsplatform_backend.entity.user.User;
+import com.backend.devsecopsplatform_backend.repository.user.UserRepository;
 import com.backend.devsecopsplatform_backend.service.auth.LoginAuditService;
 import com.backend.devsecopsplatform_backend.service.auth.LoginFailureResult;
 import com.backend.devsecopsplatform_backend.service.auth.PendingLoginService;

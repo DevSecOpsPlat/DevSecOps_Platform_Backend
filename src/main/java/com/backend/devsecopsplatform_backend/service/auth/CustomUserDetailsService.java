@@ -1,7 +1,7 @@
 package com.backend.devsecopsplatform_backend.service.auth;
-import com.backend.devsecopsplatform_backend.entity.User;
+import com.backend.devsecopsplatform_backend.entity.user.User;
 import lombok.RequiredArgsConstructor;
-import com.backend.devsecopsplatform_backend.repository.UserRepository;
+import com.backend.devsecopsplatform_backend.repository.user.UserRepository;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.core.userdetails.UserDetails;
 import org.springframework.security.core.userdetails.UserDetailsService;

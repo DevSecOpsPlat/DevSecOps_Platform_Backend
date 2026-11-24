@@ -1,6 +1,6 @@
 package com.backend.devsecopsplatform_backend.service.deployment;
 
-import com.backend.devsecopsplatform_backend.entity.appmgmt.DbEngine;
+import com.backend.devsecopsplatform_backend.entity.application.DbEngine;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;

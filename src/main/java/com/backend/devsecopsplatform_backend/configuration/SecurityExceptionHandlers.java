@@ -1,8 +1,8 @@
 package com.backend.devsecopsplatform_backend.configuration;
 
-import com.backend.devsecopsplatform_backend.entity.AlertType;
-import com.backend.devsecopsplatform_backend.entity.User;
-import com.backend.devsecopsplatform_backend.repository.UserRepository;
+import com.backend.devsecopsplatform_backend.entity.admin.AlertType;
+import com.backend.devsecopsplatform_backend.entity.user.User;
+import com.backend.devsecopsplatform_backend.repository.user.UserRepository;
 import com.backend.devsecopsplatform_backend.service.security.SecurityEventService;
 import com.backend.devsecopsplatform_backend.util.IpAddressUtils;
 import jakarta.servlet.http.HttpServletRequest;

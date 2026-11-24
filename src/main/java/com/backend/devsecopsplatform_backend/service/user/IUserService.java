@@ -1,6 +1,6 @@
 package com.backend.devsecopsplatform_backend.service.user;
 
-import com.backend.devsecopsplatform_backend.entity.User;
+import com.backend.devsecopsplatform_backend.entity.user.User;
 
 import java.util.List;
 

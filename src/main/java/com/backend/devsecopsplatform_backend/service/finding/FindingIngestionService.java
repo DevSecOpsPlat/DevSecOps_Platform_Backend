@@ -1,11 +1,18 @@
 package com.backend.devsecopsplatform_backend.service.finding;
 
-import com.backend.devsecopsplatform_backend.entity.*;
-import com.backend.devsecopsplatform_backend.repository.FindingOccurrenceRepository;
-import com.backend.devsecopsplatform_backend.repository.FindingRepository;
-import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
-import com.backend.devsecopsplatform_backend.repository.SecurityScanRepository;
-import com.backend.devsecopsplatform_backend.repository.VulnerabilityRecommendationRepository;
+import com.backend.devsecopsplatform_backend.entity.finding.Finding;
+import com.backend.devsecopsplatform_backend.entity.finding.FindingOccurrence;
+import com.backend.devsecopsplatform_backend.entity.finding.FindingStatus;
+import com.backend.devsecopsplatform_backend.entity.pipeline.PipelineExecution;
+import com.backend.devsecopsplatform_backend.entity.finding.ScanType;
+import com.backend.devsecopsplatform_backend.entity.finding.SecurityScan;
+import com.backend.devsecopsplatform_backend.entity.finding.Severity;
+import com.backend.devsecopsplatform_backend.entity.finding.VulnerabilityRecommendation;
+import com.backend.devsecopsplatform_backend.repository.finding.FindingOccurrenceRepository;
+import com.backend.devsecopsplatform_backend.repository.finding.FindingRepository;
+import com.backend.devsecopsplatform_backend.repository.pipeline.PipelineExecutionRepository;
+import com.backend.devsecopsplatform_backend.repository.finding.SecurityScanRepository;
+import com.backend.devsecopsplatform_backend.repository.finding.VulnerabilityRecommendationRepository;
 import com.backend.devsecopsplatform_backend.service.gitlab.GitLabService;
 import com.backend.devsecopsplatform_backend.service.qualitygate.PipelineArtifactsIngestedEvent;
 import com.fasterxml.jackson.core.type.TypeReference;

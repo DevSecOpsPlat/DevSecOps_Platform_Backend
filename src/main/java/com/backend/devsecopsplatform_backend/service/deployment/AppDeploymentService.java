@@ -3,23 +3,23 @@ package com.backend.devsecopsplatform_backend.service.deployment;
 import com.backend.devsecopsplatform_backend.controller.application.dto.ClusterPruneResponse;
 import com.backend.devsecopsplatform_backend.controller.application.dto.RuntimeSyncResponse;
 import com.backend.devsecopsplatform_backend.controller.environment.dto.CiDeployRequest;
-import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
-import com.backend.devsecopsplatform_backend.entity.EnvironmentStatus;
-import com.backend.devsecopsplatform_backend.entity.User;
-import com.backend.devsecopsplatform_backend.entity.AppService;
-import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
-import com.backend.devsecopsplatform_backend.entity.PipelineExecutionKind;
-import com.backend.devsecopsplatform_backend.entity.PipelineStatus;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDatabase;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDeployment;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDeploymentStatus;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.ManagedApplication;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.ServiceEnvVar;
-import com.backend.devsecopsplatform_backend.repository.AppDatabaseRepository;
-import com.backend.devsecopsplatform_backend.repository.AppDeploymentRepository;
-import com.backend.devsecopsplatform_backend.repository.AppServiceRepository;
-import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
-import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
+import com.backend.devsecopsplatform_backend.entity.environment.EphemeralEnvironment;
+import com.backend.devsecopsplatform_backend.entity.environment.EnvironmentStatus;
+import com.backend.devsecopsplatform_backend.entity.user.User;
+import com.backend.devsecopsplatform_backend.entity.application.AppService;
+import com.backend.devsecopsplatform_backend.entity.pipeline.PipelineExecution;
+import com.backend.devsecopsplatform_backend.entity.pipeline.PipelineExecutionKind;
+import com.backend.devsecopsplatform_backend.entity.pipeline.PipelineStatus;
+import com.backend.devsecopsplatform_backend.entity.application.AppDatabase;
+import com.backend.devsecopsplatform_backend.entity.deployment.AppDeployment;
+import com.backend.devsecopsplatform_backend.entity.deployment.AppDeploymentStatus;
+import com.backend.devsecopsplatform_backend.entity.application.ManagedApplication;
+import com.backend.devsecopsplatform_backend.entity.application.ServiceEnvVar;
+import com.backend.devsecopsplatform_backend.repository.application.AppDatabaseRepository;
+import com.backend.devsecopsplatform_backend.repository.deployment.AppDeploymentRepository;
+import com.backend.devsecopsplatform_backend.repository.application.AppServiceRepository;
+import com.backend.devsecopsplatform_backend.repository.environment.EphemeralEnvironmentRepository;
+import com.backend.devsecopsplatform_backend.repository.pipeline.PipelineExecutionRepository;
 import com.backend.devsecopsplatform_backend.service.security.EncryptionService;
 import com.backend.devsecopsplatform_backend.service.environment.EnvironmentLifecycleService;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -2060,7 +2060,7 @@ public class AppDeploymentService {
                     .filter(service -> primary.getDependsOnServiceId().equals(service.getId()))
                     .filter(this::isExternallyExposedService)
                     .filter(service -> service.getRole()
-                            == com.backend.devsecopsplatform_backend.entity.appmgmt.AppServiceRole.BACKEND)
+                            == com.backend.devsecopsplatform_backend.entity.application.AppServiceRole.BACKEND)
                     .findFirst()
                     .orElse(null);
             if (declared != null) {
@@ -2070,7 +2070,7 @@ public class AppDeploymentService {
         return app.getServices().stream()
                 .filter(this::isExternallyExposedService)
                 .filter(service -> service.getRole()
-                        == com.backend.devsecopsplatform_backend.entity.appmgmt.AppServiceRole.BACKEND)
+                        == com.backend.devsecopsplatform_backend.entity.application.AppServiceRole.BACKEND)
                 .findFirst()
                 .orElse(null);
     }
@@ -2083,14 +2083,14 @@ public class AppDeploymentService {
             return null;
         }
         return exposed.stream()
-                .filter(s -> s.getRole() == com.backend.devsecopsplatform_backend.entity.appmgmt.AppServiceRole.FRONTEND)
+                .filter(s -> s.getRole() == com.backend.devsecopsplatform_backend.entity.application.AppServiceRole.FRONTEND)
                 .findFirst()
                 .orElse(exposed.get(0));
     }
 
     private boolean isExternallyExposedService(AppService svc) {
         return svc.getExposedPort() != null
-                && svc.getRole() != com.backend.devsecopsplatform_backend.entity.appmgmt.AppServiceRole.WORKER;
+                && svc.getRole() != com.backend.devsecopsplatform_backend.entity.application.AppServiceRole.WORKER;
     }
 
     private UUID parseUuid(String raw) {
@@ -2569,8 +2569,8 @@ public class AppDeploymentService {
                 Map<String, String> images = loadResolvedImages(deployment);
                 boolean anyExposed = remaining.stream()
                         .anyMatch(s -> s.getExposedPort() != null
-                                && (s.getRole() == com.backend.devsecopsplatform_backend.entity.appmgmt.AppServiceRole.FRONTEND
-                                || s.getRole() == com.backend.devsecopsplatform_backend.entity.appmgmt.AppServiceRole.BACKEND));
+                                && (s.getRole() == com.backend.devsecopsplatform_backend.entity.application.AppServiceRole.FRONTEND
+                                || s.getRole() == com.backend.devsecopsplatform_backend.entity.application.AppServiceRole.BACKEND));
 
                 if (!anyExposed || remaining.isEmpty()) {
                     List<String> ingressGone = k8sManifestApplyService.deleteSharedAppIngress(ns);

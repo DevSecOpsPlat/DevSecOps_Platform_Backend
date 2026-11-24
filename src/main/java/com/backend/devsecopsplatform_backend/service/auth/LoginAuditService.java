@@ -2,12 +2,12 @@ package com.backend.devsecopsplatform_backend.service.auth;
 
 import com.backend.devsecopsplatform_backend.configuration.DisplayTime;
 
-import com.backend.devsecopsplatform_backend.entity.AlertType;
-import com.backend.devsecopsplatform_backend.entity.AuditAction;
-import com.backend.devsecopsplatform_backend.entity.LoginAttempt;
-import com.backend.devsecopsplatform_backend.entity.User;
-import com.backend.devsecopsplatform_backend.repository.LoginAttemptRepository;
-import com.backend.devsecopsplatform_backend.repository.UserRepository;
+import com.backend.devsecopsplatform_backend.entity.admin.AlertType;
+import com.backend.devsecopsplatform_backend.entity.admin.AuditAction;
+import com.backend.devsecopsplatform_backend.entity.auth.LoginAttempt;
+import com.backend.devsecopsplatform_backend.entity.user.User;
+import com.backend.devsecopsplatform_backend.repository.auth.LoginAttemptRepository;
+import com.backend.devsecopsplatform_backend.repository.user.UserRepository;
 import com.backend.devsecopsplatform_backend.service.admin.dto.AdminFailedLoginEntry;
 import com.backend.devsecopsplatform_backend.service.admin.dto.AdminLoginDayStats;
 import com.backend.devsecopsplatform_backend.service.admin.dto.AdminSecurityAlert;

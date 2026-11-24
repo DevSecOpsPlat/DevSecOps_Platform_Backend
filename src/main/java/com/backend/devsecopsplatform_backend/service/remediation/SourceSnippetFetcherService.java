@@ -1,9 +1,9 @@
 package com.backend.devsecopsplatform_backend.service.remediation;
 
-import com.backend.devsecopsplatform_backend.entity.AppService;
-import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
-import com.backend.devsecopsplatform_backend.repository.AppServiceRepository;
-import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
+import com.backend.devsecopsplatform_backend.entity.application.AppService;
+import com.backend.devsecopsplatform_backend.entity.environment.EphemeralEnvironment;
+import com.backend.devsecopsplatform_backend.repository.application.AppServiceRepository;
+import com.backend.devsecopsplatform_backend.repository.environment.EphemeralEnvironmentRepository;
 import com.backend.devsecopsplatform_backend.service.application.ApplicationService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;

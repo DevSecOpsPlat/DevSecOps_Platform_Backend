@@ -2,15 +2,15 @@ package com.backend.devsecopsplatform_backend.service.deployment;
 
 import com.backend.devsecopsplatform_backend.configuration.DisplayTime;
 
-import com.backend.devsecopsplatform_backend.entity.Alert;
-import com.backend.devsecopsplatform_backend.entity.AlertStatus;
-import com.backend.devsecopsplatform_backend.entity.AlertType;
-import com.backend.devsecopsplatform_backend.entity.User;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDeployment;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDeploymentStatus;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.ManagedApplication;
-import com.backend.devsecopsplatform_backend.repository.AlertRepository;
-import com.backend.devsecopsplatform_backend.repository.AppDeploymentRepository;
+import com.backend.devsecopsplatform_backend.entity.admin.Alert;
+import com.backend.devsecopsplatform_backend.entity.admin.AlertStatus;
+import com.backend.devsecopsplatform_backend.entity.admin.AlertType;
+import com.backend.devsecopsplatform_backend.entity.user.User;
+import com.backend.devsecopsplatform_backend.entity.deployment.AppDeployment;
+import com.backend.devsecopsplatform_backend.entity.deployment.AppDeploymentStatus;
+import com.backend.devsecopsplatform_backend.entity.application.ManagedApplication;
+import com.backend.devsecopsplatform_backend.repository.admin.AlertRepository;
+import com.backend.devsecopsplatform_backend.repository.deployment.AppDeploymentRepository;
 import com.backend.devsecopsplatform_backend.service.security.EmailService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;

@@ -1,11 +1,11 @@
 package com.backend.devsecopsplatform_backend.service.complaint;
 
-import com.backend.devsecopsplatform_backend.entity.Complaint;
-import com.backend.devsecopsplatform_backend.entity.ComplaintMessage;
-import com.backend.devsecopsplatform_backend.entity.ComplaintStatus;
-import com.backend.devsecopsplatform_backend.entity.User;
-import com.backend.devsecopsplatform_backend.repository.ComplaintRepository;
-import com.backend.devsecopsplatform_backend.repository.UserRepository;
+import com.backend.devsecopsplatform_backend.entity.complaint.Complaint;
+import com.backend.devsecopsplatform_backend.entity.complaint.ComplaintMessage;
+import com.backend.devsecopsplatform_backend.entity.complaint.ComplaintStatus;
+import com.backend.devsecopsplatform_backend.entity.user.User;
+import com.backend.devsecopsplatform_backend.repository.complaint.ComplaintRepository;
+import com.backend.devsecopsplatform_backend.repository.user.UserRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;

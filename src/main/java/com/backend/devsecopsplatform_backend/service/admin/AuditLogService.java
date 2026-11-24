@@ -2,9 +2,9 @@ package com.backend.devsecopsplatform_backend.service.admin;
 
 import com.backend.devsecopsplatform_backend.configuration.DisplayTime;
 
-import com.backend.devsecopsplatform_backend.entity.AuditAction;
-import com.backend.devsecopsplatform_backend.entity.AuditLog;
-import com.backend.devsecopsplatform_backend.repository.AuditLogRepository;
+import com.backend.devsecopsplatform_backend.entity.admin.AuditAction;
+import com.backend.devsecopsplatform_backend.entity.admin.AuditLog;
+import com.backend.devsecopsplatform_backend.repository.admin.AuditLogRepository;
 import com.backend.devsecopsplatform_backend.service.admin.dto.AdminAuditAnalyticsResponse;
 import com.backend.devsecopsplatform_backend.service.admin.dto.AdminAuditDayCount;
 import com.backend.devsecopsplatform_backend.service.admin.dto.AdminAuditLogResponse;

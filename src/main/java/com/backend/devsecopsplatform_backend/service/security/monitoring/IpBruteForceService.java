@@ -1,9 +1,9 @@
 package com.backend.devsecopsplatform_backend.service.security.monitoring;
 
 import com.backend.devsecopsplatform_backend.configuration.SecurityMonitoringProperties;
-import com.backend.devsecopsplatform_backend.entity.AlertType;
-import com.backend.devsecopsplatform_backend.entity.User;
-import com.backend.devsecopsplatform_backend.repository.LoginAttemptRepository;
+import com.backend.devsecopsplatform_backend.entity.admin.AlertType;
+import com.backend.devsecopsplatform_backend.entity.user.User;
+import com.backend.devsecopsplatform_backend.repository.auth.LoginAttemptRepository;
 import com.backend.devsecopsplatform_backend.service.security.SecurityEventService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;

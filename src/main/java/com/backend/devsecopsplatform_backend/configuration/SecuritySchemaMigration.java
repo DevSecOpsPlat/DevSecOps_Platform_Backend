@@ -1,8 +1,8 @@
 package com.backend.devsecopsplatform_backend.configuration;
 
-import com.backend.devsecopsplatform_backend.entity.AlertType;
-import com.backend.devsecopsplatform_backend.entity.AuditAction;
-import com.backend.devsecopsplatform_backend.entity.TwoFactorMethod;
+import com.backend.devsecopsplatform_backend.entity.admin.AlertType;
+import com.backend.devsecopsplatform_backend.entity.admin.AuditAction;
+import com.backend.devsecopsplatform_backend.entity.auth.TwoFactorMethod;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.jdbc.core.JdbcTemplate;

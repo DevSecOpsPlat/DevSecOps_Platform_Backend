@@ -1,5 +1,5 @@
 package com.backend.devsecopsplatform_backend.configuration;
-import com.backend.devsecopsplatform_backend.entity.Role;
+import com.backend.devsecopsplatform_backend.entity.user.Role;
 
 import io.jsonwebtoken.*;
 import io.jsonwebtoken.io.Decoders;

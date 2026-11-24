@@ -1,8 +1,8 @@
 package com.backend.devsecopsplatform_backend.service.scan;
 
-import com.backend.devsecopsplatform_backend.entity.appmgmt.ScanBatch;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.ScanBatchStatus;
-import com.backend.devsecopsplatform_backend.repository.appmgmt.ScanBatchRepository;
+import com.backend.devsecopsplatform_backend.entity.scan.ScanBatch;
+import com.backend.devsecopsplatform_backend.entity.scan.ScanBatchStatus;
+import com.backend.devsecopsplatform_backend.repository.scan.ScanBatchRepository;
 import com.backend.devsecopsplatform_backend.service.gitlab.GitLabService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;

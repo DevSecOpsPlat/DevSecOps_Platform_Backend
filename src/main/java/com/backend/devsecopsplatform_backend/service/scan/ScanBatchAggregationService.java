@@ -1,11 +1,11 @@
 package com.backend.devsecopsplatform_backend.service.scan;
 
-import com.backend.devsecopsplatform_backend.entity.AppService;
-import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
-import com.backend.devsecopsplatform_backend.entity.QualityGateSnapshot;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.AppServiceRole;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.ScanBatch;
-import com.backend.devsecopsplatform_backend.repository.QualityGateSnapshotRepository;
+import com.backend.devsecopsplatform_backend.entity.application.AppService;
+import com.backend.devsecopsplatform_backend.entity.pipeline.PipelineExecution;
+import com.backend.devsecopsplatform_backend.entity.qualitygate.QualityGateSnapshot;
+import com.backend.devsecopsplatform_backend.entity.application.AppServiceRole;
+import com.backend.devsecopsplatform_backend.entity.scan.ScanBatch;
+import com.backend.devsecopsplatform_backend.repository.qualitygate.QualityGateSnapshotRepository;
 import com.backend.devsecopsplatform_backend.service.qualitygate.HardGateInput;
 import com.backend.devsecopsplatform_backend.service.qualitygate.SecurityScoreInput;
 import com.backend.devsecopsplatform_backend.service.qualitygate.SecurityScoringService;

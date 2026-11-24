@@ -1,6 +1,6 @@
 package com.backend.devsecopsplatform_backend.controller.user;
 
-import com.backend.devsecopsplatform_backend.entity.User;
+import com.backend.devsecopsplatform_backend.entity.user.User;
 import com.backend.devsecopsplatform_backend.service.user.IUserService;
 import io.swagger.v3.oas.annotations.Operation;
 import lombok.RequiredArgsConstructor;

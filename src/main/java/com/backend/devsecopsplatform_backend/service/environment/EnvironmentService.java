@@ -5,11 +5,20 @@ import com.backend.devsecopsplatform_backend.controller.environment.dto.DeployRe
 import com.backend.devsecopsplatform_backend.controller.environment.dto.EnvironmentSummaryResponse;
 import com.backend.devsecopsplatform_backend.controller.environment.dto.PipelineScanResponse;
 import com.backend.devsecopsplatform_backend.controller.environment.dto.SecuritySummaryResponse;
-import com.backend.devsecopsplatform_backend.entity.*;
-import com.backend.devsecopsplatform_backend.repository.CloudResourceRepository;
-import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
-import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
-import com.backend.devsecopsplatform_backend.repository.UserRepository;
+import com.backend.devsecopsplatform_backend.entity.application.AppService;
+import com.backend.devsecopsplatform_backend.entity.environment.CloudResource;
+import com.backend.devsecopsplatform_backend.entity.environment.EnvironmentStatus;
+import com.backend.devsecopsplatform_backend.entity.environment.EphemeralEnvironment;
+import com.backend.devsecopsplatform_backend.entity.pipeline.PipelineExecution;
+import com.backend.devsecopsplatform_backend.entity.pipeline.PipelineExecutionKind;
+import com.backend.devsecopsplatform_backend.entity.pipeline.PipelineStatus;
+import com.backend.devsecopsplatform_backend.entity.environment.ResourceType;
+import com.backend.devsecopsplatform_backend.entity.finding.Severity;
+import com.backend.devsecopsplatform_backend.entity.user.User;
+import com.backend.devsecopsplatform_backend.repository.environment.CloudResourceRepository;
+import com.backend.devsecopsplatform_backend.repository.environment.EphemeralEnvironmentRepository;
+import com.backend.devsecopsplatform_backend.repository.pipeline.PipelineExecutionRepository;
+import com.backend.devsecopsplatform_backend.repository.user.UserRepository;
 import com.backend.devsecopsplatform_backend.service.application.ApplicationService;
 import com.backend.devsecopsplatform_backend.service.security.EncryptionService;
 import com.backend.devsecopsplatform_backend.service.github.GitHubValidationService;
@@ -182,7 +191,7 @@ public class EnvironmentService {
         execution.setAppService(app);
         execution.setExecutionKind(PipelineExecutionKind.DEPLOY);
         execution.setGitBranch(request.getBranch() != null && !request.getBranch().isBlank() ? request.getBranch() : "main");
-        execution.setStatus(com.backend.devsecopsplatform_backend.entity.PipelineStatus
+        execution.setStatus(com.backend.devsecopsplatform_backend.entity.pipeline.PipelineStatus
                 .fromGitLabStatus(pipeline.getStatus() != null ? pipeline.getStatus().toString() : "running"));
         execution.setStartedAt(LocalDateTime.now());
 
@@ -238,7 +247,7 @@ public class EnvironmentService {
         execution.setAppService(application);
         execution.setExecutionKind(PipelineExecutionKind.SCAN);
         execution.setGitBranch(request.getBranch() != null && !request.getBranch().isBlank() ? request.getBranch() : "main");
-        execution.setStatus(com.backend.devsecopsplatform_backend.entity.PipelineStatus
+        execution.setStatus(com.backend.devsecopsplatform_backend.entity.pipeline.PipelineStatus
                 .fromGitLabStatus(pipeline.getStatus() != null ? pipeline.getStatus().toString() : "running"));
         execution.setStartedAt(LocalDateTime.now());
         pipelineExecutionRepository.save(execution);

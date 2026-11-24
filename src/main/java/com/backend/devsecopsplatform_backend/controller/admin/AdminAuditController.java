@@ -1,6 +1,6 @@
 package com.backend.devsecopsplatform_backend.controller.admin;
 
-import com.backend.devsecopsplatform_backend.entity.AuditAction;
+import com.backend.devsecopsplatform_backend.entity.admin.AuditAction;
 import com.backend.devsecopsplatform_backend.service.admin.AuditLogService;
 import com.backend.devsecopsplatform_backend.service.admin.dto.AdminAuditAnalyticsResponse;
 import com.backend.devsecopsplatform_backend.service.admin.dto.AdminAuditDashboardResponse;

@@ -1,9 +1,9 @@
 package com.backend.devsecopsplatform_backend.controller.environment;
 
-import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
-import com.backend.devsecopsplatform_backend.entity.User;
-import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
-import com.backend.devsecopsplatform_backend.repository.UserRepository;
+import com.backend.devsecopsplatform_backend.entity.environment.EphemeralEnvironment;
+import com.backend.devsecopsplatform_backend.entity.user.User;
+import com.backend.devsecopsplatform_backend.repository.environment.EphemeralEnvironmentRepository;
+import com.backend.devsecopsplatform_backend.repository.user.UserRepository;
 import com.backend.devsecopsplatform_backend.service.gitlab.GitLabService;
 import com.backend.devsecopsplatform_backend.service.environment.EnvironmentService;
 import com.fasterxml.jackson.databind.JsonNode;

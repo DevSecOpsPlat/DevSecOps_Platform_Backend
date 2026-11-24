@@ -1,8 +1,8 @@
 package com.backend.devsecopsplatform_backend.service.pipeline;
 
-import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
-import com.backend.devsecopsplatform_backend.entity.PipelineStatus;
-import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
+import com.backend.devsecopsplatform_backend.entity.pipeline.PipelineExecution;
+import com.backend.devsecopsplatform_backend.entity.pipeline.PipelineStatus;
+import com.backend.devsecopsplatform_backend.repository.pipeline.PipelineExecutionRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;

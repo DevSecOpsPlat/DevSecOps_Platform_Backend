@@ -1,12 +1,12 @@
 package com.backend.devsecopsplatform_backend.service.deployment;
 
-import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDatabase;
-import com.backend.devsecopsplatform_backend.entity.AppService;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.AppServiceRole;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.DbEngine;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.DbFamily;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.ManagedApplication;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.ServiceEnvVar;
+import com.backend.devsecopsplatform_backend.entity.application.AppDatabase;
+import com.backend.devsecopsplatform_backend.entity.application.AppService;
+import com.backend.devsecopsplatform_backend.entity.application.AppServiceRole;
+import com.backend.devsecopsplatform_backend.entity.application.DbEngine;
+import com.backend.devsecopsplatform_backend.entity.application.DbFamily;
+import com.backend.devsecopsplatform_backend.entity.application.ManagedApplication;
+import com.backend.devsecopsplatform_backend.entity.application.ServiceEnvVar;
 import lombok.Builder;
 import lombok.Value;
 import org.springframework.stereotype.Service;

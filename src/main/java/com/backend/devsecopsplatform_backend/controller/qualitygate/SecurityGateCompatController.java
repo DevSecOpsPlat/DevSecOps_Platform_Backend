@@ -1,6 +1,6 @@
 package com.backend.devsecopsplatform_backend.controller.qualitygate;
 
-import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
+import com.backend.devsecopsplatform_backend.entity.pipeline.PipelineExecution;
 import com.backend.devsecopsplatform_backend.service.pipeline.PipelineStageSyncService;
 import com.backend.devsecopsplatform_backend.service.scan.ScanBatchCompletionService;
 import com.backend.devsecopsplatform_backend.service.finding.FindingIngestionService;

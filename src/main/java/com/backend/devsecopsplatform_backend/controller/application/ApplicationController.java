@@ -6,11 +6,11 @@ import com.backend.devsecopsplatform_backend.service.environment.EnvironmentLife
 import com.backend.devsecopsplatform_backend.service.environment.EnvironmentService;
 import com.backend.devsecopsplatform_backend.service.environment.ServiceEnvironmentResolver;
 import com.backend.devsecopsplatform_backend.service.pipeline.PipelineStageSyncService;
-import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
-import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
-import com.backend.devsecopsplatform_backend.entity.PipelineStatus;
-import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
-import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
+import com.backend.devsecopsplatform_backend.entity.environment.EphemeralEnvironment;
+import com.backend.devsecopsplatform_backend.entity.pipeline.PipelineExecution;
+import com.backend.devsecopsplatform_backend.entity.pipeline.PipelineStatus;
+import com.backend.devsecopsplatform_backend.repository.environment.EphemeralEnvironmentRepository;
+import com.backend.devsecopsplatform_backend.repository.pipeline.PipelineExecutionRepository;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;

@@ -3,26 +3,26 @@ package com.backend.devsecopsplatform_backend.service.admin;
 import com.backend.devsecopsplatform_backend.controller.admin.dto.CreateUserRequest;
 import com.backend.devsecopsplatform_backend.controller.admin.dto.CreateUserResponse;
 import com.backend.devsecopsplatform_backend.controller.complaint.dto.ComplaintApiDto;
-import com.backend.devsecopsplatform_backend.entity.AccountStatus;
-import com.backend.devsecopsplatform_backend.entity.AppService;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.ManagedApplication;
-import com.backend.devsecopsplatform_backend.entity.EnvironmentStatus;
-import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
-import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
-import com.backend.devsecopsplatform_backend.entity.PipelineStatus;
-import com.backend.devsecopsplatform_backend.entity.Role;
-import com.backend.devsecopsplatform_backend.entity.User;
-import com.backend.devsecopsplatform_backend.entity.AuditAction;
-import com.backend.devsecopsplatform_backend.entity.UserActivityLog;
-import com.backend.devsecopsplatform_backend.entity.UserActivityType;
-import com.backend.devsecopsplatform_backend.repository.AppServiceRepository;
-import com.backend.devsecopsplatform_backend.repository.ComplaintRepository;
-import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
-import com.backend.devsecopsplatform_backend.repository.LoginAttemptRepository;
-import com.backend.devsecopsplatform_backend.repository.ManagedApplicationRepository;
-import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
-import com.backend.devsecopsplatform_backend.repository.UserActivityLogRepository;
-import com.backend.devsecopsplatform_backend.repository.UserRepository;
+import com.backend.devsecopsplatform_backend.entity.user.AccountStatus;
+import com.backend.devsecopsplatform_backend.entity.application.AppService;
+import com.backend.devsecopsplatform_backend.entity.application.ManagedApplication;
+import com.backend.devsecopsplatform_backend.entity.environment.EnvironmentStatus;
+import com.backend.devsecopsplatform_backend.entity.environment.EphemeralEnvironment;
+import com.backend.devsecopsplatform_backend.entity.pipeline.PipelineExecution;
+import com.backend.devsecopsplatform_backend.entity.pipeline.PipelineStatus;
+import com.backend.devsecopsplatform_backend.entity.user.Role;
+import com.backend.devsecopsplatform_backend.entity.user.User;
+import com.backend.devsecopsplatform_backend.entity.admin.AuditAction;
+import com.backend.devsecopsplatform_backend.entity.user.UserActivityLog;
+import com.backend.devsecopsplatform_backend.entity.user.UserActivityType;
+import com.backend.devsecopsplatform_backend.repository.application.AppServiceRepository;
+import com.backend.devsecopsplatform_backend.repository.complaint.ComplaintRepository;
+import com.backend.devsecopsplatform_backend.repository.environment.EphemeralEnvironmentRepository;
+import com.backend.devsecopsplatform_backend.repository.auth.LoginAttemptRepository;
+import com.backend.devsecopsplatform_backend.repository.application.ManagedApplicationRepository;
+import com.backend.devsecopsplatform_backend.repository.pipeline.PipelineExecutionRepository;
+import com.backend.devsecopsplatform_backend.repository.user.UserActivityLogRepository;
+import com.backend.devsecopsplatform_backend.repository.user.UserRepository;
 import com.backend.devsecopsplatform_backend.service.admin.dto.AdminAppServiceSummary;
 import com.backend.devsecopsplatform_backend.service.admin.dto.AdminEnvironmentStatusBreakdown;
 import com.backend.devsecopsplatform_backend.service.admin.dto.AdminPipelineCounts;
@@ -193,7 +193,7 @@ public class AdminUserService {
         }
 
         // 2. Projets (cascade → services liés, databases, deployments)
-        List<com.backend.devsecopsplatform_backend.entity.appmgmt.ManagedApplication> projects =
+        List<com.backend.devsecopsplatform_backend.entity.application.ManagedApplication> projects =
                 managedApplicationRepository.findByCreatedByOrderByCreatedAtDesc(user);
         if (!projects.isEmpty()) {
             managedApplicationRepository.deleteAll(projects);

@@ -1,8 +1,8 @@
 package com.backend.devsecopsplatform_backend.service.admin;
 
-import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDeployment;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDeploymentStatus;
-import com.backend.devsecopsplatform_backend.repository.AppDeploymentRepository;
+import com.backend.devsecopsplatform_backend.entity.deployment.AppDeployment;
+import com.backend.devsecopsplatform_backend.entity.deployment.AppDeploymentStatus;
+import com.backend.devsecopsplatform_backend.repository.deployment.AppDeploymentRepository;
 import com.backend.devsecopsplatform_backend.service.application.AppValidationException;
 import com.backend.devsecopsplatform_backend.service.deployment.K8sManifestApplyService;
 import lombok.RequiredArgsConstructor;

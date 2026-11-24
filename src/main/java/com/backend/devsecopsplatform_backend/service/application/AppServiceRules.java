@@ -1,6 +1,6 @@
 package com.backend.devsecopsplatform_backend.service.application;
 
-import com.backend.devsecopsplatform_backend.entity.appmgmt.AppServiceRole;
+import com.backend.devsecopsplatform_backend.entity.application.AppServiceRole;
 
 import java.util.Locale;
 import java.util.Set;

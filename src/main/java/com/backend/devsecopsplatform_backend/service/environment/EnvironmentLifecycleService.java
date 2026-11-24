@@ -1,8 +1,8 @@
 package com.backend.devsecopsplatform_backend.service.environment;
 
-import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
-import com.backend.devsecopsplatform_backend.entity.EnvironmentStatus;
-import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
+import com.backend.devsecopsplatform_backend.entity.environment.EphemeralEnvironment;
+import com.backend.devsecopsplatform_backend.entity.environment.EnvironmentStatus;
+import com.backend.devsecopsplatform_backend.repository.environment.EphemeralEnvironmentRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;

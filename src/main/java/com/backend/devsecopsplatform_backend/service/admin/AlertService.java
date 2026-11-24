@@ -2,10 +2,10 @@ package com.backend.devsecopsplatform_backend.service.admin;
 
 import com.backend.devsecopsplatform_backend.configuration.DisplayTime;
 
-import com.backend.devsecopsplatform_backend.entity.Alert;
-import com.backend.devsecopsplatform_backend.entity.AlertStatus;
-import com.backend.devsecopsplatform_backend.entity.AlertType;
-import com.backend.devsecopsplatform_backend.repository.AlertRepository;
+import com.backend.devsecopsplatform_backend.entity.admin.Alert;
+import com.backend.devsecopsplatform_backend.entity.admin.AlertStatus;
+import com.backend.devsecopsplatform_backend.entity.admin.AlertType;
+import com.backend.devsecopsplatform_backend.repository.admin.AlertRepository;
 import com.backend.devsecopsplatform_backend.service.admin.dto.AdminAlertPageResponse;
 import com.backend.devsecopsplatform_backend.service.admin.dto.AdminAlertResponse;
 import com.backend.devsecopsplatform_backend.service.admin.dto.AdminAlertStatsResponse;

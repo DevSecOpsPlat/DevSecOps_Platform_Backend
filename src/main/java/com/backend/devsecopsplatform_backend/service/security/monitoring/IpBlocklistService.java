@@ -1,9 +1,9 @@
 package com.backend.devsecopsplatform_backend.service.security.monitoring;
 
 import com.backend.devsecopsplatform_backend.configuration.SecurityMonitoringProperties;
-import com.backend.devsecopsplatform_backend.entity.BlockSource;
-import com.backend.devsecopsplatform_backend.entity.BlockedIp;
-import com.backend.devsecopsplatform_backend.repository.BlockedIpRepository;
+import com.backend.devsecopsplatform_backend.entity.security.BlockSource;
+import com.backend.devsecopsplatform_backend.entity.security.BlockedIp;
+import com.backend.devsecopsplatform_backend.repository.security.BlockedIpRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.context.event.ApplicationReadyEvent;

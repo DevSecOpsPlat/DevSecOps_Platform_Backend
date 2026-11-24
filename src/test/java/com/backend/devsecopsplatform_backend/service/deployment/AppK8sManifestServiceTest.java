@@ -1,9 +1,9 @@
 package com.backend.devsecopsplatform_backend.service.deployment;
 
-import com.backend.devsecopsplatform_backend.entity.AppService;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.AppServiceRole;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.ManagedApplication;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.ServiceEnvVar;
+import com.backend.devsecopsplatform_backend.entity.application.AppService;
+import com.backend.devsecopsplatform_backend.entity.application.AppServiceRole;
+import com.backend.devsecopsplatform_backend.entity.application.ManagedApplication;
+import com.backend.devsecopsplatform_backend.entity.application.ServiceEnvVar;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;

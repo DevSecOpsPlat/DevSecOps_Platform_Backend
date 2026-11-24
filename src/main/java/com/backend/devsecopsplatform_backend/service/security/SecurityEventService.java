@@ -1,13 +1,13 @@
 package com.backend.devsecopsplatform_backend.service.security;
 
-import com.backend.devsecopsplatform_backend.entity.Alert;
-import com.backend.devsecopsplatform_backend.entity.AlertStatus;
-import com.backend.devsecopsplatform_backend.entity.AlertType;
-import com.backend.devsecopsplatform_backend.entity.AuditAction;
-import com.backend.devsecopsplatform_backend.entity.AuditLog;
-import com.backend.devsecopsplatform_backend.entity.User;
-import com.backend.devsecopsplatform_backend.repository.AlertRepository;
-import com.backend.devsecopsplatform_backend.repository.AuditLogRepository;
+import com.backend.devsecopsplatform_backend.entity.admin.Alert;
+import com.backend.devsecopsplatform_backend.entity.admin.AlertStatus;
+import com.backend.devsecopsplatform_backend.entity.admin.AlertType;
+import com.backend.devsecopsplatform_backend.entity.admin.AuditAction;
+import com.backend.devsecopsplatform_backend.entity.admin.AuditLog;
+import com.backend.devsecopsplatform_backend.entity.user.User;
+import com.backend.devsecopsplatform_backend.repository.admin.AlertRepository;
+import com.backend.devsecopsplatform_backend.repository.admin.AuditLogRepository;
 import com.backend.devsecopsplatform_backend.util.IpAddressUtils;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;

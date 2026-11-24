@@ -1,7 +1,7 @@
 package com.backend.devsecopsplatform_backend.controller.admin;
 
-import com.backend.devsecopsplatform_backend.entity.AlertStatus;
-import com.backend.devsecopsplatform_backend.entity.AlertType;
+import com.backend.devsecopsplatform_backend.entity.admin.AlertStatus;
+import com.backend.devsecopsplatform_backend.entity.admin.AlertType;
 import com.backend.devsecopsplatform_backend.service.admin.AlertService;
 import com.backend.devsecopsplatform_backend.service.admin.dto.AdminAlertResponse;
 import com.backend.devsecopsplatform_backend.service.admin.dto.AdminAlertStatsResponse;

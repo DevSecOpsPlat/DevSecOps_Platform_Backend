@@ -1,6 +1,6 @@
 package com.backend.devsecopsplatform_backend.controller.finding.dto;
 
-import com.backend.devsecopsplatform_backend.entity.FindingStatus;
+import com.backend.devsecopsplatform_backend.entity.finding.FindingStatus;
 import jakarta.validation.constraints.NotNull;
 import lombok.Data;
 

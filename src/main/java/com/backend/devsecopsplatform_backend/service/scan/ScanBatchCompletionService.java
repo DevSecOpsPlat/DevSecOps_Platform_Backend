@@ -2,12 +2,12 @@ package com.backend.devsecopsplatform_backend.service.scan;
 
 import com.backend.devsecopsplatform_backend.configuration.DisplayTime;
 
-import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
-import com.backend.devsecopsplatform_backend.entity.PipelineStatus;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.ScanBatch;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.ScanBatchStatus;
-import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
-import com.backend.devsecopsplatform_backend.repository.appmgmt.ScanBatchRepository;
+import com.backend.devsecopsplatform_backend.entity.pipeline.PipelineExecution;
+import com.backend.devsecopsplatform_backend.entity.pipeline.PipelineStatus;
+import com.backend.devsecopsplatform_backend.entity.scan.ScanBatch;
+import com.backend.devsecopsplatform_backend.entity.scan.ScanBatchStatus;
+import com.backend.devsecopsplatform_backend.repository.pipeline.PipelineExecutionRepository;
+import com.backend.devsecopsplatform_backend.repository.scan.ScanBatchRepository;
 import com.backend.devsecopsplatform_backend.service.qualitygate.dto.SecurityGateIngestRequest;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;

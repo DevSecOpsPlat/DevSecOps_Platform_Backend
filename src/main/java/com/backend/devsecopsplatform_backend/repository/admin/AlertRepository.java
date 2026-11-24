@@ -1,0 +1,69 @@
+package com.backend.devsecopsplatform_backend.repository.admin;
+
+import com.backend.devsecopsplatform_backend.entity.admin.Alert;
+import com.backend.devsecopsplatform_backend.entity.admin.AlertStatus;
+import com.backend.devsecopsplatform_backend.entity.admin.AlertType;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.JpaSpecificationExecutor;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+
+import java.time.LocalDateTime;
+import java.util.Collection;
+import java.util.List;
+import java.util.UUID;
+
+public interface AlertRepository extends JpaRepository<Alert, UUID>, JpaSpecificationExecutor<Alert> {
+
+    List<Alert> findByDeletedFalseOrderByCreatedAtDesc();
+
+    /** Fenêtre bornée pour le fil d'activité admin (AdminActivityService) — évite de charger
+     * toute la table quand seules les N dernières alertes sont nécessaires. */
+    List<Alert> findByDeletedFalseOrderByCreatedAtDesc(Pageable pageable);
+
+    List<Alert> findByDeletedFalseAndStatusOrderByCreatedAtDesc(AlertStatus status);
+
+    List<Alert> findByDeletedFalseAndTypeOrderByCreatedAtDesc(AlertType type);
+
+    List<Alert> findByDeletedFalseAndStatusAndTypeOrderByCreatedAtDesc(AlertStatus status, AlertType type);
+
+    long countByDeletedFalseAndStatus(AlertStatus status);
+
+    long countByDeletedFalseAndStatusAndTypeNotIn(AlertStatus status, Collection<AlertType> types);
+
+    long countByDeletedFalseAndCreatedAtAfter(LocalDateTime since);
+
+    long countByDeletedFalseAndTypeAndCreatedAtAfter(AlertType type, LocalDateTime since);
+
+    @Query(value = """
+            SELECT date_trunc('hour', created_at) AS hr, COUNT(*)
+            FROM alerts
+            WHERE deleted = false AND created_at >= :since
+            GROUP BY hr
+            ORDER BY hr
+            """, nativeQuery = true)
+    List<Object[]> countByHourSince(@Param("since") LocalDateTime since);
+
+    @Query(value = """
+            SELECT ip_address, COUNT(*) AS cnt
+            FROM alerts
+            WHERE deleted = false AND created_at >= :since AND ip_address IS NOT NULL
+            GROUP BY ip_address
+            ORDER BY cnt DESC
+            LIMIT :limit
+            """, nativeQuery = true)
+    List<Object[]> topIpsSince(@Param("since") LocalDateTime since, @Param("limit") int limit);
+
+    List<Alert> findTop1ByDeletedFalseAndIpAddressAndCreatedAtAfterOrderByCreatedAtDesc(
+            String ipAddress, LocalDateTime since);
+
+    boolean existsByDeletedFalseAndTypeAndMessageAndCreatedAtAfter(
+            AlertType type, String message, LocalDateTime since);
+
+    List<Alert> findByDeletedFalseAndTypeInAndCreatedAtAfterOrderByCreatedAtDesc(
+            List<AlertType> types, LocalDateTime since);
+
+    List<Alert> findByDeletedFalseAndTypeInAndCreatedAtBetweenOrderByCreatedAtDesc(
+            List<AlertType> types, LocalDateTime from, LocalDateTime to);
+}

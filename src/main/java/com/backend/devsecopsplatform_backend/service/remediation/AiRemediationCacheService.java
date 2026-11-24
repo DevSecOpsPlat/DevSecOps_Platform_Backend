@@ -1,8 +1,8 @@
 package com.backend.devsecopsplatform_backend.service.remediation;
 
 import com.backend.devsecopsplatform_backend.controller.finding.dto.FindingAiRemediationResponse;
-import com.backend.devsecopsplatform_backend.entity.AiRemediationCache;
-import com.backend.devsecopsplatform_backend.repository.AiRemediationCacheRepository;
+import com.backend.devsecopsplatform_backend.entity.remediation.AiRemediationCache;
+import com.backend.devsecopsplatform_backend.repository.remediation.AiRemediationCacheRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;

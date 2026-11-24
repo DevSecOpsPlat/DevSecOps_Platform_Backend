@@ -1,18 +1,18 @@
 package com.backend.devsecopsplatform_backend.service.admin;
 
-import com.backend.devsecopsplatform_backend.entity.Alert;
-import com.backend.devsecopsplatform_backend.entity.AppService;
-import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
-import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
-import com.backend.devsecopsplatform_backend.entity.PipelineStatus;
-import com.backend.devsecopsplatform_backend.entity.User;
-import com.backend.devsecopsplatform_backend.entity.UserActivityLog;
-import com.backend.devsecopsplatform_backend.entity.UserActivityType;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.ManagedApplication;
-import com.backend.devsecopsplatform_backend.repository.AlertRepository;
-import com.backend.devsecopsplatform_backend.repository.ManagedApplicationRepository;
-import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
-import com.backend.devsecopsplatform_backend.repository.UserActivityLogRepository;
+import com.backend.devsecopsplatform_backend.entity.admin.Alert;
+import com.backend.devsecopsplatform_backend.entity.application.AppService;
+import com.backend.devsecopsplatform_backend.entity.environment.EphemeralEnvironment;
+import com.backend.devsecopsplatform_backend.entity.pipeline.PipelineExecution;
+import com.backend.devsecopsplatform_backend.entity.pipeline.PipelineStatus;
+import com.backend.devsecopsplatform_backend.entity.user.User;
+import com.backend.devsecopsplatform_backend.entity.user.UserActivityLog;
+import com.backend.devsecopsplatform_backend.entity.user.UserActivityType;
+import com.backend.devsecopsplatform_backend.entity.application.ManagedApplication;
+import com.backend.devsecopsplatform_backend.repository.admin.AlertRepository;
+import com.backend.devsecopsplatform_backend.repository.application.ManagedApplicationRepository;
+import com.backend.devsecopsplatform_backend.repository.pipeline.PipelineExecutionRepository;
+import com.backend.devsecopsplatform_backend.repository.user.UserActivityLogRepository;
 import com.backend.devsecopsplatform_backend.service.admin.dto.AdminActivityEvent;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
@@ -280,7 +280,7 @@ public class AdminActivityService {
             "LOGIN_FAILED", "FAILED_LOGIN_REPEATED"
     );
 
-    private String alertSeverity(com.backend.devsecopsplatform_backend.entity.AlertType type) {
+    private String alertSeverity(com.backend.devsecopsplatform_backend.entity.admin.AlertType type) {
         if (type == null) {
             return "INFO";
         }

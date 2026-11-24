@@ -1,6 +1,6 @@
 package com.backend.devsecopsplatform_backend.service.application;
 
-import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDatabase;
+import com.backend.devsecopsplatform_backend.entity.application.AppDatabase;
 import org.springframework.stereotype.Service;
 
 import java.net.URLEncoder;

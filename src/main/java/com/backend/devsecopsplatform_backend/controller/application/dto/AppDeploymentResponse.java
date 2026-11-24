@@ -1,6 +1,6 @@
 package com.backend.devsecopsplatform_backend.controller.application.dto;
 
-import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDeploymentStatus;
+import com.backend.devsecopsplatform_backend.entity.deployment.AppDeploymentStatus;
 import lombok.Builder;
 import lombok.Data;
 

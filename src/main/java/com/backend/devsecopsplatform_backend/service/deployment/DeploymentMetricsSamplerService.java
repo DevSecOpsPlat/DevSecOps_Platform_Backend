@@ -1,11 +1,11 @@
 package com.backend.devsecopsplatform_backend.service.deployment;
 
-import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDeployment;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.AppDeploymentStatus;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.DeploymentMetricSample;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.ManagedApplication;
-import com.backend.devsecopsplatform_backend.repository.AppDeploymentRepository;
-import com.backend.devsecopsplatform_backend.repository.DeploymentMetricSampleRepository;
+import com.backend.devsecopsplatform_backend.entity.deployment.AppDeployment;
+import com.backend.devsecopsplatform_backend.entity.deployment.AppDeploymentStatus;
+import com.backend.devsecopsplatform_backend.entity.deployment.DeploymentMetricSample;
+import com.backend.devsecopsplatform_backend.entity.application.ManagedApplication;
+import com.backend.devsecopsplatform_backend.repository.deployment.AppDeploymentRepository;
+import com.backend.devsecopsplatform_backend.repository.deployment.DeploymentMetricSampleRepository;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;

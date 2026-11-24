@@ -1,8 +1,8 @@
 package com.backend.devsecopsplatform_backend.service.scan.dto;
 
 import com.backend.devsecopsplatform_backend.controller.application.dto.SecurityPostureResponse;
-import com.backend.devsecopsplatform_backend.entity.PipelineStatus;
-import com.backend.devsecopsplatform_backend.entity.appmgmt.ScanBatchStatus;
+import com.backend.devsecopsplatform_backend.entity.pipeline.PipelineStatus;
+import com.backend.devsecopsplatform_backend.entity.scan.ScanBatchStatus;
 
 import java.time.LocalDateTime;
 import java.util.List;
@@ -10,7 +10,7 @@ import java.util.Map;
 import java.util.UUID;
 
 /**
- * État reconstruit d'un {@link com.backend.devsecopsplatform_backend.entity.appmgmt.ScanBatch}
+ * État reconstruit d'un {@link com.backend.devsecopsplatform_backend.entity.scan.ScanBatch}
  * à partir du lot + ses {@code PipelineExecution}.
  */
 public record ScanBatchStateDto(

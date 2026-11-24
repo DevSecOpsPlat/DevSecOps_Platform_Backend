@@ -1,8 +1,8 @@
 package com.backend.devsecopsplatform_backend.service.pipeline;
 
-import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
-import com.backend.devsecopsplatform_backend.entity.PipelineStatus;
-import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
+import com.backend.devsecopsplatform_backend.entity.pipeline.PipelineExecution;
+import com.backend.devsecopsplatform_backend.entity.pipeline.PipelineStatus;
+import com.backend.devsecopsplatform_backend.repository.pipeline.PipelineExecutionRepository;
 import com.backend.devsecopsplatform_backend.service.environment.EnvironmentLifecycleService;
 import com.backend.devsecopsplatform_backend.service.qualitygate.QualityGateService;
 import com.fasterxml.jackson.core.type.TypeReference;

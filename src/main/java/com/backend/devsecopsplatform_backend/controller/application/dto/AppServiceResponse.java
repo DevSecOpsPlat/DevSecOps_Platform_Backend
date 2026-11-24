@@ -1,6 +1,6 @@
 package com.backend.devsecopsplatform_backend.controller.application.dto;
 
-import com.backend.devsecopsplatform_backend.entity.appmgmt.AppServiceRole;
+import com.backend.devsecopsplatform_backend.entity.application.AppServiceRole;
 import lombok.Builder;
 import lombok.Data;
 

@@ -1,10 +1,10 @@
 package com.backend.devsecopsplatform_backend.controller.finding;
 
-import com.backend.devsecopsplatform_backend.entity.FindingStatus;
-import com.backend.devsecopsplatform_backend.entity.ScanType;
-import com.backend.devsecopsplatform_backend.entity.Severity;
-import com.backend.devsecopsplatform_backend.repository.FindingOccurrenceRepository;
-import com.backend.devsecopsplatform_backend.repository.FindingRepository;
+import com.backend.devsecopsplatform_backend.entity.finding.FindingStatus;
+import com.backend.devsecopsplatform_backend.entity.finding.ScanType;
+import com.backend.devsecopsplatform_backend.entity.finding.Severity;
+import com.backend.devsecopsplatform_backend.repository.finding.FindingOccurrenceRepository;
+import com.backend.devsecopsplatform_backend.repository.finding.FindingRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.http.ResponseEntity;

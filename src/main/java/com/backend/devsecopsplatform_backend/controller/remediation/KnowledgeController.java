@@ -1,7 +1,7 @@
 package com.backend.devsecopsplatform_backend.controller.remediation;
 
-import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
-import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
+import com.backend.devsecopsplatform_backend.entity.environment.EphemeralEnvironment;
+import com.backend.devsecopsplatform_backend.repository.environment.EphemeralEnvironmentRepository;
 import com.backend.devsecopsplatform_backend.service.remediation.PipelineKnowledgeService;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;

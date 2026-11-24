@@ -1,15 +1,15 @@
 package com.backend.devsecopsplatform_backend.controller.pipeline;
 
 import com.backend.devsecopsplatform_backend.controller.environment.dto.PipelineScanResponse;
-import com.backend.devsecopsplatform_backend.entity.EphemeralEnvironment;
-import com.backend.devsecopsplatform_backend.entity.PipelineExecution;
-import com.backend.devsecopsplatform_backend.entity.PipelineExecutionKind;
-import com.backend.devsecopsplatform_backend.entity.PipelineStatus;
-import com.backend.devsecopsplatform_backend.repository.AppServiceRepository;
-import com.backend.devsecopsplatform_backend.repository.ManagedApplicationRepository;
-import com.backend.devsecopsplatform_backend.repository.EphemeralEnvironmentRepository;
-import com.backend.devsecopsplatform_backend.repository.PipelineExecutionRepository;
-import com.backend.devsecopsplatform_backend.repository.UserRepository;
+import com.backend.devsecopsplatform_backend.entity.environment.EphemeralEnvironment;
+import com.backend.devsecopsplatform_backend.entity.pipeline.PipelineExecution;
+import com.backend.devsecopsplatform_backend.entity.pipeline.PipelineExecutionKind;
+import com.backend.devsecopsplatform_backend.entity.pipeline.PipelineStatus;
+import com.backend.devsecopsplatform_backend.repository.application.AppServiceRepository;
+import com.backend.devsecopsplatform_backend.repository.application.ManagedApplicationRepository;
+import com.backend.devsecopsplatform_backend.repository.environment.EphemeralEnvironmentRepository;
+import com.backend.devsecopsplatform_backend.repository.pipeline.PipelineExecutionRepository;
+import com.backend.devsecopsplatform_backend.repository.user.UserRepository;
 import com.backend.devsecopsplatform_backend.service.gitlab.GitLabService;
 import com.backend.devsecopsplatform_backend.service.pipeline.PipelineStageSyncService;
 import com.backend.devsecopsplatform_backend.service.scan.ScanBatchCompletionService;
@@ -49,7 +49,7 @@ public class PipelineController {
     private final PipelineStageSyncService pipelineStageSyncService;
     private final ScanBatchCompletionService scanBatchCompletionService;
 
-    private com.backend.devsecopsplatform_backend.entity.User getCurrentUser() {
+    private com.backend.devsecopsplatform_backend.entity.user.User getCurrentUser() {
         Authentication auth = SecurityContextHolder.getContext().getAuthentication();
         if (auth == null || auth.getName() == null) {
             throw new RuntimeException("Utilisateur non authentifié");
@@ -675,7 +675,7 @@ public class PipelineController {
                 .build();
     }
 
-    private boolean canAccessExecution(PipelineExecution execution, com.backend.devsecopsplatform_backend.entity.User user) {
+    private boolean canAccessExecution(PipelineExecution execution, com.backend.devsecopsplatform_backend.entity.user.User user) {
         if (execution == null || user == null) {
             return false;
         }
