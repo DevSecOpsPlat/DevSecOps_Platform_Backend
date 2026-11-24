@@ -28,52 +28,41 @@ public class PlaybookRagService {
 
     private record Rule(String id, int weight, String resourcePath, List<String> mustContainAny, List<String> boostsIfContainAny) {}
 
+    // Un playbook par outil réellement actif dans le pipeline (Semgrep, Trivy, Gitleaks, Grype, Checkov,
+    // Hadolint, SonarQube, ZAP). Le nom de l'outil figure toujours dans le contexte du finding
+    // (« Outil / scan: … »), ce qui suffit à ouvrir la porte du bon playbook.
+    // Poids commun 70. Deux priorités seulement, pour les findings qui ouvrent deux portes :
+    // Secrets (90) passe devant Semgrep, qui détecte aussi des secrets ; Trivy (95) passe devant Secrets.
     private final List<Rule> rules = List.of(
             new Rule(
                     "sast-semgrep",
-                    75,
+                    70,
                     "playbooks/sast_semgrep.md",
                     List.of("scantype: sast", "toolname: semgrep", "semgrep"),
                     List.of("ruleid:", "owasp", "xss", "sql", "ssrf", "path traversal",
-                            "deserial", "command injection", "crypto")
+                            "deserial", "command injection", "crypto", "integrity", "subresource")
             ),
             new Rule(
+                    // Trivy ne tourne qu'en mode vulnérabilités (--scanners vuln) : ses findings sont des
+                    // dépendances. Poids 95 > Secrets (90) : la description d'un CVE peut contenir « secret »
+                    // (ex. jsonwebtoken, argument secretOrPublicKey) sans être une fuite de secret.
                     "trivy-fs",
-                    60,
+                    95,
                     "playbooks/sca_trivy_fs.md",
                     List.of("toolname: trivy", "trivy", "artifactpath: reports/trivy"),
-                    List.of("vulnerability", "misconfig", "secret", "cve-", "package")
+                    List.of("vulnerability", "cve-", "package", "dependency", "fixed",
+                            "lock", "pom.xml", "package.json", "requirements")
             ),
             new Rule(
-                    "sri-missing-integrity",
-                    100,
-                    "playbooks/sri_missing_integrity.md",
-                    List.of("integrity", "subresource"),
-                    List.of("script", "stylesheet", "cdn", "link rel", "crossorigin",
-                            "sha-384", "sha384", "sha256")
-            ),
-            new Rule(
-                    "sca-dependency",
-                    80,
-                    "playbooks/sca_dependency.md",
-                    List.of("scantype: sca",
-                            "npm", "package-lock", "yarn.lock", "pnpm-lock", "node_modules",
-                            "maven", "pom.xml", "gradle", "groupid", "artifactid",
-                            "pip-audit", "safety", "requirements.txt", "pyproject.toml", "poetry.lock",
-                            "nuget", ".csproj", "packages.lock.json",
-                            "go.mod", "go.sum", "cargo.toml", "cargo.lock",
-                            "composer.json", "composer.lock"),
-                    List.of("packagename:", "installedversion:", "fixedversion:",
-                            "cve-", "osv", "npm audit", "dependency", "transitive", "spring")
-            ),
-            new Rule(
+                    // « token » seul n'ouvre plus ce playbook (bibliothèques jsonwebtoken, csrf-token…) :
+                    // il reste un mot bonus. Les règles Semgrep de secrets contiennent « secret » ou « hardcoded ».
                     "secrets",
                     90,
                     "playbooks/secrets_hardcoded.md",
                     List.of("scantype: secrets", "toolname: gitleaks", "gitleaks",
-                            "secret", "token", "api key", "hardcoded"),
+                            "secret", "api key", "hardcoded"),
                     List.of("cognito", "aws", "github", "gitlab", "react", "vite",
-                            "private key", "password")
+                            "private key", "password", "token")
             ),
             new Rule(
                     "container-grype",
@@ -92,25 +81,17 @@ public class PlaybookRagService {
                             "securitycontext", "privileged", "runasnonroot", "iam")
             ),
             new Rule(
-                    "license-compliance",
-                    70,
-                    "playbooks/license_compliance.md",
-                    List.of("scantype: license", "toolname: license", "license:", "licence:", "spdx"),
-                    List.of("gpl", "agpl", "lgpl", "copyleft", "proprietary", "unknown license",
-                            "incompatible", "forbidden", "blacklist", "whitelist", "notice")
-            ),
-            new Rule(
                     "dast-zap",
-                    75,
+                    70,
                     "playbooks/dast_zap.md",
                     List.of("scantype: dast", "toolname: zap", "owasp zap", "zap baseline", "zap scan"),
                     List.of("content-security-policy", "csp", "x-frame-options", "hsts",
                             "strict-transport", "x-content-type", "cookie", "header",
-                            "anti-csrf", "cors", "referrer-policy")
+                            "anti-csrf", "cors", "referrer-policy", "integrity", "subresource")
             ),
             new Rule(
                     "dockerfile-hadolint",
-                    75,
+                    70,
                     "playbooks/dockerfile_hadolint.md",
                     List.of("toolname: hadolint", "hadolint", "scantype: dockerfile"),
                     List.of("dockerfile", "dl3", "dl4", "sc2", "from ", "apt-get", "apk add",

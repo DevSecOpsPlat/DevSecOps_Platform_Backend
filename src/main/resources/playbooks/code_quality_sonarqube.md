@@ -1,4 +1,4 @@
-## Playbook: Qualité de code & hotspots (SonarQube)
+## Playbook pour guider le moteur IA lorsque il recoit des resultats prevenant de sonar: Qualité de code & hotspots (SonarQube)
 
 ### Quand ça arrive
 - Outil : `sonarqube` (analyse au stage code-analysis du pipeline).
