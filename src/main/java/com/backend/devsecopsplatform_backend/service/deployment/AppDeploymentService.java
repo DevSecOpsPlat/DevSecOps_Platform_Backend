@@ -1976,6 +1976,13 @@ public class AppDeploymentService {
         if (!isIngressApplied(deployment)) {
             return null;
         }
+        // Aucun FRONTEND/BACKEND exposé (ex. worker seul) : pas d'URL publique. Sans ce garde-fou,
+        // le repli path-based ci-dessous renvoyait quand même https://<slug>.<domaine> (404) ;
+        // le pipeline recevait APP_URL et deploy:zap-dast attendait ~100 s puis scannait la page 404.
+        // URL vide → le job ZAP s'arrête aussitôt (« APP_URL not set — skipping DAST »).
+        if (shadow != null && !shadow.getServices().isEmpty() && findPrimaryExposed(shadow) == null) {
+            return null;
+        }
         // Entrée publique = FRONTEND (ou premier service exposé), pas le BACKEND /api
         // (sinon le bandeau UI affiche l'API et le health sonde /api/api/…).
         if (ingressEnabled && deployment.getNamespace() != null && shadow != null) {
